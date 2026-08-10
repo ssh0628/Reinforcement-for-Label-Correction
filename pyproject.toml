@@ -1,0 +1,12 @@
+[project]
+name = "rlnlc"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0.0",
+    "timm>=1.0.0",
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
+]
