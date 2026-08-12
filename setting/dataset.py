@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
+import timm
 import torch
 from PIL import Image
 from timm.data import resolve_model_data_config
@@ -26,12 +27,57 @@ def _as_path(value: object) -> str:
     return str(value)
 
 
-def paths_fingerprint(paths: Iterable[object]) -> str:
-    digest = hashlib.sha256(b"global-knn-paths-v1\n")
-    for path in paths:
-        digest.update(_as_path(path).encode("utf-8"))
-        digest.update(b"\0")
+def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found while hashing: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(chunk_size):
+            digest.update(chunk)
     return digest.hexdigest()
+
+
+def structured_fingerprint(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def dataset_manifest_fingerprint(paths: Iterable[object]) -> str:
+    """Hash ordered image paths and change-sensitive file metadata."""
+    digest = hashlib.sha256(b"rlnlc-image-manifest-v1\n")
+    for value in paths:
+        path = Path(_as_path(value))
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            raise FileNotFoundError(
+                f"Image not found while fingerprinting dataset: {path}"
+            ) from exc
+        for field in (str(path), str(stat.st_size), str(stat.st_mtime_ns)):
+            digest.update(field.encode("utf-8"))
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def evaluation_preprocessing_signature(
+    data: DataConfig,
+    model_name: str,
+) -> dict[str, object]:
+    pretrained_cfg = timm.get_pretrained_cfg(model_name)
+    return {
+        "implementation": "aspect_letterbox-v1",
+        "image_size": data.image_size,
+        "letterbox_fill": data.letterbox_fill,
+        "resampling": "bicubic",
+        "normalization_mean": tuple(pretrained_cfg.mean),
+        "normalization_std": tuple(pretrained_cfg.std),
+        "timm_version": timm.__version__,
+    }
 
 
 class AspectLetterbox:
@@ -164,4 +210,3 @@ class NPYPathDataset(Dataset[tuple[Tensor, int, int]]):
         if self.transform is not None:
             image = self.transform(image)
         return image, label, index
-

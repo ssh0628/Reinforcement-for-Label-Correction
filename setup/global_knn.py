@@ -11,7 +11,10 @@ from setting.config import CFG, Config
 from setting.dataset import (
     NPYPathDataset,
     build_transforms,
-    paths_fingerprint,
+    dataset_manifest_fingerprint,
+    evaluation_preprocessing_signature,
+    file_sha256,
+    structured_fingerprint,
 )
 from setup.backbone import load_warmup_backbone
 from setup.warmup import (
@@ -23,7 +26,7 @@ from setup.warmup import (
 )
 
 
-ARTIFACT_VERSION = 1
+ARTIFACT_VERSION = 2
 
 
 def build_embedding_loader(
@@ -40,7 +43,7 @@ def build_embedding_loader(
     worker_options = loader_worker_options(cfg)
     loader = DataLoader(
         dataset,
-        batch_size=cfg.loader.batch_size,
+        batch_size=cfg.loader.global_knn_feature_batch_size,
         shuffle=False,
         num_workers=cfg.loader.num_workers,
         pin_memory=cfg.loader.pin_memory and device.type == "cuda",
@@ -255,7 +258,6 @@ def save_artifact(
     embeddings: Tensor,
     neighbor_indices: Tensor,
     neighbor_cosine: Tensor,
-    checkpoint: dict[str, object],
     cfg: Config,
 ) -> Path:
     output_path = cfg.global_knn.artifact_path
@@ -266,23 +268,37 @@ def save_artifact(
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    dataset_manifest_sha256 = dataset_manifest_fingerprint(dataset.paths)
+    checkpoint_sha256 = file_sha256(cfg.global_knn.checkpoint_path)
+    preprocessing = evaluation_preprocessing_signature(
+        cfg.data,
+        cfg.model.name,
+    )
+    provenance = {
+        "version": ARTIFACT_VERSION,
+        "split": cfg.global_knn.split,
+        "k": cfg.global_knn.k,
+        "model_name": cfg.model.name,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "checkpoint_sha256": checkpoint_sha256,
+        "preprocessing": preprocessing,
+    }
+
     artifact: dict[str, object] = {
         "version": ARTIFACT_VERSION,
         "split": cfg.global_knn.split,
         "k": cfg.global_knn.k,
-        "distance_metric": "euclidean",
-        "attention_similarity": "cosine",
         "neighbor_indices": neighbor_indices,
         "neighbor_cosine_similarities": neighbor_cosine,
         "labels": dataset.targets.clone(),
-        "paths_sha256": paths_fingerprint(dataset.paths),
+        "dataset_manifest_sha256": dataset_manifest_sha256,
         "sample_count": len(dataset),
         "feature_dim": embeddings.size(1),
         "class_names": cfg.data.class_names,
         "model_name": cfg.model.name,
-        "checkpoint_path": str(cfg.global_knn.checkpoint_path),
-        "checkpoint_epoch": checkpoint.get("epoch"),
-        "checkpoint_selection_metric": checkpoint.get("selection_metric"),
+        "checkpoint_sha256": checkpoint_sha256,
+        "preprocessing": preprocessing,
+        "provenance_sha256": structured_fingerprint(provenance),
         "embeddings": embeddings,
     }
 
@@ -306,7 +322,7 @@ def main(cfg: Config = CFG) -> None:
         )
 
     device = resolve_device(cfg)
-    model, checkpoint = load_warmup_backbone(
+    model = load_warmup_backbone(
         cfg,
         device,
         trainable=False,
@@ -334,7 +350,6 @@ def main(cfg: Config = CFG) -> None:
         embeddings,
         indices,
         cosine,
-        checkpoint,
         cfg,
     )
     print(f"[OK] Global KNN saved: {artifact_path}")

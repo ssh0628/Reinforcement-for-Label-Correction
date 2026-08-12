@@ -20,11 +20,11 @@ from rl.trainer import (
     build_rl_training_signature,
 )
 from setting.config import CFG, Config
-from setting.dataset import NPYPathDataset, paths_fingerprint
+from setting.dataset import NPYPathDataset, dataset_manifest_fingerprint
 from setup.warmup import resolve_device, seed_everything
 
 
-CLEANING_ARTIFACT_VERSION = 1
+CLEANING_ARTIFACT_VERSION = 2
 REQUIRED_POLICY_CHECKPOINT_KEYS = frozenset(
     {
         "version",
@@ -33,6 +33,7 @@ REQUIRED_POLICY_CHECKPOINT_KEYS = frozenset(
         "class_names",
         "model_name",
         "global_knn_cache",
+        "global_knn_provenance_sha256",
         "training_signature",
     }
 )
@@ -70,6 +71,7 @@ def validate_cleaning_destination(cfg: Config) -> None:
 def load_cleaning_checkpoint(
     cfg: Config,
     global_cache_path: Path,
+    global_cache_provenance_sha256: str,
 ) -> dict[str, object]:
     checkpoint_path = cfg.cleaning.checkpoint_path
     if not checkpoint_path.is_file():
@@ -107,6 +109,13 @@ def load_cleaning_checkpoint(
         raise ValueError(
             "RL cleaning checkpoint global KNN cache does not match config."
         )
+    if (
+        checkpoint["global_knn_provenance_sha256"]
+        != global_cache_provenance_sha256
+    ):
+        raise ValueError(
+            "RL cleaning checkpoint was trained with a different Global KNN cache."
+        )
     saved_signature = checkpoint["training_signature"]
     expected_signature = build_rl_training_signature(cfg)
     if not isinstance(saved_signature, Mapping):
@@ -137,6 +146,7 @@ class LabelCleaner:
         loader: DataLoader,
         checkpoint_path: Path,
         global_cache_path: Path,
+        global_cache_provenance_sha256: str,
         device: torch.device,
         cfg: Config,
     ) -> None:
@@ -151,6 +161,7 @@ class LabelCleaner:
         self.loader = loader
         self.checkpoint_path = checkpoint_path
         self.global_cache_path = global_cache_path
+        self.global_cache_provenance_sha256 = global_cache_provenance_sha256
         self.device = device
         self.cfg = cfg
 
@@ -186,7 +197,12 @@ class LabelCleaner:
             "model_name": self.cfg.model.name,
             "policy_checkpoint": str(self.checkpoint_path),
             "global_knn_cache": str(self.global_cache_path),
-            "paths_sha256": paths_fingerprint(self.dataset.paths),
+            "global_knn_provenance_sha256": (
+                self.global_cache_provenance_sha256
+            ),
+            "dataset_manifest_sha256": dataset_manifest_fingerprint(
+                self.dataset.paths
+            ),
             "label_state": state.state_dict(),
             "last_actions": last_actions.detach().cpu().clone(),
             "last_correction_probabilities": (
@@ -276,11 +292,16 @@ def build_label_cleaner(cfg: Config) -> LabelCleaner:
 
     global_cache = load_global_knn_cache(cfg)
     global_cache_path = global_cache.cache_path
+    global_cache_provenance_sha256 = global_cache.provenance_sha256
     cache_sample_count = global_cache.sample_count
     cache_labels = global_cache.labels
     del global_cache
 
-    checkpoint = load_cleaning_checkpoint(cfg, global_cache_path)
+    checkpoint = load_cleaning_checkpoint(
+        cfg,
+        global_cache_path,
+        global_cache_provenance_sha256,
+    )
     actor = load_policy_actor(cfg, device)
     actor.load_state_dict(checkpoint["actor"], strict=True)
     del checkpoint
@@ -298,6 +319,7 @@ def build_label_cleaner(cfg: Config) -> LabelCleaner:
         loader=loader,
         checkpoint_path=cfg.cleaning.checkpoint_path,
         global_cache_path=global_cache_path,
+        global_cache_provenance_sha256=global_cache_provenance_sha256,
         device=device,
         cfg=cfg,
     )

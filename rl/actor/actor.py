@@ -51,7 +51,7 @@ def load_policy_actor(
     cfg: Config,
     device: torch.device,
 ) -> PolicyActor:
-    feature_extractor, _ = load_warmup_backbone(
+    feature_extractor = load_warmup_backbone(
         cfg,
         device,
         trainable=True,

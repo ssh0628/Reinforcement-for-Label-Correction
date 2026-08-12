@@ -7,10 +7,16 @@ import torch
 from torch import Tensor
 
 from setting.config import Config
-from setting.dataset import NPYPathDataset, paths_fingerprint
+from setting.dataset import (
+    NPYPathDataset,
+    dataset_manifest_fingerprint,
+    evaluation_preprocessing_signature,
+    file_sha256,
+    structured_fingerprint,
+)
 
 
-SUPPORTED_ARTIFACT_VERSION = 1
+SUPPORTED_ARTIFACT_VERSION = 2
 VALIDATION_CHUNK_SIZE = 65_536
 REQUIRED_KEYS = frozenset(
     {
@@ -20,12 +26,14 @@ REQUIRED_KEYS = frozenset(
         "neighbor_indices",
         "neighbor_cosine_similarities",
         "labels",
-        "paths_sha256",
+        "dataset_manifest_sha256",
         "sample_count",
         "feature_dim",
         "class_names",
         "model_name",
-        "checkpoint_path",
+        "checkpoint_sha256",
+        "preprocessing",
+        "provenance_sha256",
         "embeddings",
     }
 )
@@ -34,6 +42,7 @@ REQUIRED_KEYS = frozenset(
 @dataclass(frozen=True, slots=True)
 class GlobalKNNCache:
     cache_path: Path
+    provenance_sha256: str
     fixed_embeddings: Tensor
     neighbor_indices: Tensor
     neighbor_cosine_similarities: Tensor
@@ -63,15 +72,16 @@ def _validate_metadata(
     artifact: dict[str, object],
     cfg: Config,
 ) -> None:
+    if artifact.get("version") != SUPPORTED_ARTIFACT_VERSION:
+        raise ValueError(
+            "Unsupported global KNN artifact version: "
+            f"{artifact.get('version')} != {SUPPORTED_ARTIFACT_VERSION}. "
+            "Rebuild the Global KNN cache."
+        )
     missing = REQUIRED_KEYS.difference(artifact)
     if missing:
         raise ValueError(
             f"Global KNN cache is missing fields: {sorted(missing)}."
-        )
-    if artifact["version"] != SUPPORTED_ARTIFACT_VERSION:
-        raise ValueError(
-            "Unsupported global KNN artifact version: "
-            f"{artifact['version']} != {SUPPORTED_ARTIFACT_VERSION}."
         )
     if artifact["split"] != cfg.global_knn.split:
         raise ValueError(
@@ -89,13 +99,31 @@ def _validate_metadata(
             f"Global KNN cache model mismatch: {artifact['model_name']} != {cfg.model.name}."
         )
 
-    stored_checkpoint = Path(str(artifact["checkpoint_path"])).resolve()
-    configured_checkpoint = cfg.global_knn.checkpoint_path.resolve()
-    if stored_checkpoint != configured_checkpoint:
+    checkpoint_sha256 = file_sha256(cfg.global_knn.checkpoint_path)
+    if artifact["checkpoint_sha256"] != checkpoint_sha256:
         raise ValueError(
-            "Global KNN cache checkpoint mismatch: "
-            f"{stored_checkpoint} != {configured_checkpoint}."
+            "Global KNN cache was built from different warmup weights. "
+            "Rebuild the cache with the current checkpoint."
         )
+    expected_preprocessing = evaluation_preprocessing_signature(
+        cfg.data,
+        cfg.model.name,
+    )
+    if artifact["preprocessing"] != expected_preprocessing:
+        raise ValueError(
+            "Global KNN cache preprocessing does not match the current config."
+        )
+    provenance = {
+        "version": SUPPORTED_ARTIFACT_VERSION,
+        "split": cfg.global_knn.split,
+        "k": cfg.global_knn.k,
+        "model_name": cfg.model.name,
+        "dataset_manifest_sha256": artifact["dataset_manifest_sha256"],
+        "checkpoint_sha256": checkpoint_sha256,
+        "preprocessing": expected_preprocessing,
+    }
+    if artifact["provenance_sha256"] != structured_fingerprint(provenance):
+        raise ValueError("Global KNN cache provenance metadata is inconsistent.")
 
 
 def _validate_tensors(
@@ -187,10 +215,10 @@ def load_global_knn_cache(cfg: Config) -> GlobalKNNCache:
     _validate_metadata(artifact, cfg)
 
     dataset = NPYPathDataset(cfg.data, cfg.global_knn.split)
-    current_fingerprint = paths_fingerprint(dataset.paths)
-    if artifact["paths_sha256"] != current_fingerprint:
+    current_fingerprint = dataset_manifest_fingerprint(dataset.paths)
+    if artifact["dataset_manifest_sha256"] != current_fingerprint:
         raise ValueError(
-            "Global KNN cache image path order does not match the current paths NPY."
+            "Global KNN cache dataset manifest does not match the current images."
         )
 
     embeddings = _require_tensor(artifact, "embeddings")
@@ -211,6 +239,7 @@ def load_global_knn_cache(cfg: Config) -> GlobalKNNCache:
     )
     return GlobalKNNCache(
         cache_path=artifact_path,
+        provenance_sha256=str(artifact["provenance_sha256"]),
         fixed_embeddings=embeddings.contiguous(),
         neighbor_indices=neighbor_indices.contiguous(),
         neighbor_cosine_similarities=neighbor_cosine.contiguous(),

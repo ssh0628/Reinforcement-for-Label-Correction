@@ -107,12 +107,24 @@ def build_dataloaders(
     val_dataset = NPYPathDataset(cfg.data, "val", transform=eval_transform)
     class_counts = get_class_counts(train_dataset.targets, cfg.num_classes)
     sampler = build_sqrt_sampler(train_dataset, class_counts, cfg)
+    train_sample_count = (
+        len(sampler) if sampler is not None else len(train_dataset)
+    )
+    if (
+        cfg.loader.train_drop_last
+        and train_sample_count < cfg.loader.warmup_batch_size
+    ):
+        raise ValueError(
+            "Warmup drop_last=True would discard the entire training set: "
+            f"{train_sample_count} samples < batch size "
+            f"{cfg.loader.warmup_batch_size}."
+        )
     worker_options = loader_worker_options(cfg)
     pin_memory = cfg.loader.pin_memory and device.type == "cuda"
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=cfg.loader.batch_size,
+        batch_size=cfg.loader.warmup_batch_size,
         sampler=sampler,
         shuffle=sampler is None,
         num_workers=cfg.loader.num_workers,
@@ -123,7 +135,7 @@ def build_dataloaders(
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=cfg.loader.batch_size,
+        batch_size=cfg.loader.warmup_batch_size,
         shuffle=False,
         num_workers=cfg.loader.num_workers,
         pin_memory=pin_memory,
@@ -371,8 +383,6 @@ def save_checkpoint(
     path: Path,
     epoch: int,
     model: nn.Module,
-    optimizer: Optimizer,
-    scheduler: CosineAnnealingLR | None,
     class_counts: Tensor,
     validation_metrics: dict[str, float],
     cfg: Config,
@@ -387,11 +397,6 @@ def save_checkpoint(
         "validation_metrics": validation_metrics,
         "selection_metric": selection_metric,
     }
-    if selection_metric is None:
-        checkpoint["optimizer"] = optimizer.state_dict()
-        checkpoint["scheduler"] = (
-            scheduler.state_dict() if scheduler is not None else None
-        )
     torch.save(checkpoint, path)
 
 
@@ -501,8 +506,6 @@ def main(cfg: Config = CFG) -> None:
                     cfg.runtime.output_dir / item.filename,
                     epoch,
                     model,
-                    optimizer,
-                    scheduler,
                     class_counts,
                     validation_metrics,
                     cfg,
@@ -513,8 +516,6 @@ def main(cfg: Config = CFG) -> None:
             cfg.runtime.output_dir / cfg.checkpoint.last_filename,
             epoch,
             model,
-            optimizer,
-            scheduler,
             class_counts,
             validation_metrics,
             cfg,

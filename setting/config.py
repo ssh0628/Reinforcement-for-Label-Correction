@@ -55,7 +55,6 @@ class TrainConfig:
     scheduler_name: str = "cosine_annealing"
     min_lr: float = 1e-6
 
-    loss_name: str = "weighted_cross_entropy"
     use_weighted_ce: bool = True
     label_smoothing: float = 0.0
 
@@ -70,7 +69,9 @@ class TrainConfig:
 
 @dataclass(frozen=True, slots=True)
 class LoaderConfig:
-    batch_size: int = 512
+    warmup_batch_size: int = 256
+    global_knn_feature_batch_size: int = 512
+    rl_feature_batch_size: int = 512
     num_workers: int = 20
     prefetch_factor: int = 2
     persistent_workers: bool = True
@@ -140,7 +141,7 @@ class RLTrainConfig:
     trajectory_length: int = 10
     discount_factor: float = 0.9
     critic_num_bins: int = 100
-    initial_state_randomization_rate: float | None = None
+    initial_state_randomization_rate: float = 0.10
 
     actor_optimizer_name: str = "adamw"
     actor_lr: float = 3e-5
@@ -157,7 +158,7 @@ class RLTrainConfig:
     lr_decay_fraction: float = 0.5
     lr_decay_factor: float = 0.1
 
-    use_policy_update_subset: bool = True
+    policy_update_mode: str = "subset"  # "full" or "subset"
     policy_update_subset_size: int = 10000
     policy_update_batch_size: int = 512
 
@@ -224,6 +225,28 @@ class Config:
             raise ValueError(
                 "data.letterbox_fill must contain three values in [0, 255]."
             )
+        if self.data.image_size <= 0:
+            raise ValueError("data.image_size must be positive.")
+        if not 0 <= self.data.horizontal_flip_p <= 1:
+            raise ValueError("data.horizontal_flip_p must be in [0, 1].")
+        if not 0 <= self.data.vertical_flip_p <= 1:
+            raise ValueError("data.vertical_flip_p must be in [0, 1].")
+        if self.data.rotation_degrees < 0:
+            raise ValueError("data.rotation_degrees must be non-negative.")
+        if len(self.data.color_jitter) != 4 or any(
+            value < 0 for value in self.data.color_jitter
+        ):
+            raise ValueError(
+                "data.color_jitter must contain four non-negative values."
+            )
+        if self.data.color_jitter[3] > 0.5:
+            raise ValueError("The color-jitter hue must not exceed 0.5.")
+        if not 0 <= self.model.drop_rate < 1:
+            raise ValueError("model.drop_rate must be in [0, 1).")
+        if not 0 <= self.model.drop_path_rate < 1:
+            raise ValueError("model.drop_path_rate must be in [0, 1).")
+        if self.train.epochs <= 0:
+            raise ValueError("train.epochs must be positive.")
         if not 0 <= self.train.backbone_freeze_epochs < self.train.epochs:
             raise ValueError("backbone_freeze_epochs must be in [0, epochs).")
         if self.train.optimizer_name.lower() != "adamw":
@@ -232,9 +255,44 @@ class Config:
             raise ValueError(
                 "Only cosine_annealing is supported by the warmup baseline."
             )
-        if self.train.loss_name != "weighted_cross_entropy":
+        if self.train.lr_head <= 0 or self.train.lr_unfrozen <= 0:
+            raise ValueError("Warmup learning rates must be positive.")
+        if self.train.weight_decay < 0:
+            raise ValueError("train.weight_decay must be non-negative.")
+        beta1, beta2 = self.train.adamw_betas
+        if not 0 <= beta1 < 1 or not 0 <= beta2 < 1:
+            raise ValueError("train.adamw_betas must be in [0, 1).")
+        if self.train.adamw_eps <= 0:
+            raise ValueError("train.adamw_eps must be positive.")
+        if not 0 <= self.train.min_lr <= self.train.lr_unfrozen:
+            raise ValueError("train.min_lr must be in [0, lr_unfrozen].")
+        if not 0 <= self.train.label_smoothing <= 1:
+            raise ValueError("train.label_smoothing must be in [0, 1].")
+        if (
+            self.train.sampler_num_samples is not None
+            and self.train.sampler_num_samples <= 0
+        ):
+            raise ValueError("train.sampler_num_samples must be positive.")
+
+        batch_sizes = {
+            "warmup_batch_size": self.loader.warmup_batch_size,
+            "global_knn_feature_batch_size": (
+                self.loader.global_knn_feature_batch_size
+            ),
+            "rl_feature_batch_size": self.loader.rl_feature_batch_size,
+        }
+        invalid_batch_sizes = [
+            name for name, value in batch_sizes.items() if value <= 0
+        ]
+        if invalid_batch_sizes:
             raise ValueError(
-                "Only weighted_cross_entropy is supported by the warmup baseline."
+                f"Loader batch sizes must be positive: {invalid_batch_sizes}."
+            )
+        if self.loader.num_workers < 0:
+            raise ValueError("loader.num_workers must be non-negative.")
+        if self.loader.num_workers > 0 and self.loader.prefetch_factor <= 0:
+            raise ValueError(
+                "loader.prefetch_factor must be positive when workers are used."
             )
 
         if self.global_knn.k <= 0:
@@ -265,11 +323,9 @@ class Config:
             raise ValueError("rl_train.discount_factor must be in [0, 1].")
         if self.rl_train.critic_num_bins < 2:
             raise ValueError("rl_train.critic_num_bins must be at least two.")
-        randomization_rate = self.rl_train.initial_state_randomization_rate
-        if randomization_rate is not None and not 0 < randomization_rate < 1:
+        if not 0 < self.rl_train.initial_state_randomization_rate < 1:
             raise ValueError(
-                "rl_train.initial_state_randomization_rate must be None "
-                "or in (0, 1)."
+                "rl_train.initial_state_randomization_rate must be in (0, 1)."
             )
         if self.rl_train.actor_optimizer_name.lower() != "adamw":
             raise ValueError("The RL actor optimizer must be AdamW.")
@@ -296,6 +352,10 @@ class Config:
             raise ValueError("rl_train.lr_decay_fraction must be in (0, 1).")
         if not 0 < self.rl_train.lr_decay_factor < 1:
             raise ValueError("rl_train.lr_decay_factor must be in (0, 1).")
+        if self.rl_train.policy_update_mode not in {"full", "subset"}:
+            raise ValueError(
+                "rl_train.policy_update_mode must be 'full' or 'subset'."
+            )
         if self.rl_train.policy_update_subset_size <= 0:
             raise ValueError(
                 "rl_train.policy_update_subset_size must be positive."
@@ -305,7 +365,7 @@ class Config:
                 "rl_train.policy_update_batch_size must be positive."
             )
         if (
-            self.rl_train.use_policy_update_subset
+            self.rl_train.policy_update_mode == "subset"
             and self.rl_train.policy_update_batch_size
             > self.rl_train.policy_update_subset_size
         ):

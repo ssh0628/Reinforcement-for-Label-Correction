@@ -33,7 +33,7 @@ from setup.warmup import (
 )
 
 
-TRAINER_CHECKPOINT_VERSION = 3
+TRAINER_CHECKPOINT_VERSION = 5
 REQUIRED_CHECKPOINT_KEYS = frozenset(
     {
         "version",
@@ -50,6 +50,7 @@ REQUIRED_CHECKPOINT_KEYS = frozenset(
         "class_names",
         "model_name",
         "global_knn_cache",
+        "global_knn_provenance_sha256",
         "training_signature",
         "cpu_rng_state",
         "cuda_rng_states",
@@ -127,7 +128,7 @@ def build_rl_loader(
     loader_generator = torch.Generator().manual_seed(cfg.runtime.seed)
     loader = DataLoader(
         dataset,
-        batch_size=cfg.loader.batch_size,
+        batch_size=cfg.loader.rl_feature_batch_size,
         sampler=sampler,
         num_workers=cfg.loader.num_workers,
         pin_memory=cfg.loader.pin_memory and device.type == "cuda",
@@ -184,7 +185,7 @@ def build_rl_training_signature(cfg: Config) -> dict[str, object]:
         "class_names": cfg.data.class_names,
         "image_size": cfg.data.image_size,
         "letterbox_fill": cfg.data.letterbox_fill,
-        "embedding_batch_size": cfg.loader.batch_size,
+        "rl_feature_batch_size": cfg.loader.rl_feature_batch_size,
         "global_k": cfg.global_knn.k,
         "global_query_chunk_size": cfg.global_knn.query_chunk_size,
         "global_reference_chunk_size": cfg.global_knn.reference_chunk_size,
@@ -212,8 +213,12 @@ def build_rl_training_signature(cfg: Config) -> dict[str, object]:
         "scheduler_name": train.scheduler_name,
         "lr_decay_fraction": train.lr_decay_fraction,
         "lr_decay_factor": train.lr_decay_factor,
-        "use_policy_update_subset": train.use_policy_update_subset,
-        "policy_update_subset_size": train.policy_update_subset_size,
+        "policy_update_mode": train.policy_update_mode,
+        "policy_update_subset_size": (
+            train.policy_update_subset_size
+            if train.policy_update_mode == "subset"
+            else None
+        ),
         "policy_update_batch_size": train.policy_update_batch_size,
     }
 
@@ -378,6 +383,13 @@ class RLTrainer:
             raise ValueError(
                 "RL checkpoint global KNN cache does not match the loaded cache."
             )
+        if (
+            checkpoint["global_knn_provenance_sha256"]
+            != self.cache.provenance_sha256
+        ):
+            raise ValueError(
+                "RL checkpoint was trained with a different Global KNN cache."
+            )
         saved_signature = checkpoint["training_signature"]
         expected_signature = build_rl_training_signature(self.cfg)
         if not isinstance(saved_signature, Mapping):
@@ -469,9 +481,6 @@ class RLTrainer:
             self.cfg.num_classes,
         )
         rate = self.cfg.rl_train.initial_state_randomization_rate
-        if rate is None:
-            return state
-
         random_count = min(
             state.sample_count,
             max(1, round(state.sample_count * rate)),
@@ -511,7 +520,7 @@ class RLTrainer:
 
     def _select_policy_samples(self) -> Tensor:
         dataset_size = len(self.dataset)
-        if not self.cfg.rl_train.use_policy_update_subset:
+        if self.cfg.rl_train.policy_update_mode == "full":
             return torch.arange(dataset_size)
         sample_count = min(
             dataset_size,
@@ -579,7 +588,7 @@ class RLTrainer:
         selected_neighbors = policy_neighbor_indices[selected]
         image_bank = (
             self._load_query_images(selected_cpu)
-            if self.cfg.rl_train.use_policy_update_subset
+            if self.cfg.rl_train.policy_update_mode == "subset"
             else None
         )
 
@@ -588,16 +597,46 @@ class RLTrainer:
         selected_count = selected.numel()
         batch_size = self.cfg.rl_train.policy_update_batch_size
         total_loss = torch.zeros((), device=self.device)
+
+        # The forward policy always sees the full cached KNN graph. Gradients
+        # are collected for every selected query and its neighbors, but only
+        # rows inside the chosen update set are propagated through the actor
+        # backbone. In subset mode this strictly bounds backbone backward to
+        # the subset while preserving neighbor-gradient contributions inside
+        # that subset.
+        embedding_leaf = policy_embeddings.detach().clone().requires_grad_(True)
         for start in range(0, selected_count, batch_size):
             end = min(start + batch_size, selected_count)
             batch_indices = selected[start:end]
             batch_neighbors = selected_neighbors[start:end]
+            policy_step = self.actor.policy(
+                embedding_leaf[batch_indices],
+                embedding_leaf[batch_neighbors],
+                state.current_labels[batch_indices],
+                state.current_labels[batch_neighbors],
+                actions=actions[batch_indices],
+            )
+            loss = -(
+                q_value.detach()
+                * policy_step.log_probabilities.sum()
+                / selected_count
+            )
+            loss.backward()
+            total_loss += loss.detach()
+
+        if embedding_leaf.grad is None:
+            raise RuntimeError("Policy loss produced no embedding gradient.")
+        selected_embedding_gradient = (
+            embedding_leaf.grad[selected].detach().clone()
+        )
+        del embedding_leaf
+
+        for start in range(0, selected_count, batch_size):
+            end = min(start + batch_size, selected_count)
             if image_bank is not None:
                 images = image_bank[start:end]
             else:
-                images = self._load_query_images(
-                    selected_cpu[start:end]
-                )
+                images = self._load_query_images(selected_cpu[start:end])
             images = images.to(
                 self.device,
                 non_blocking=self.device.type == "cuda",
@@ -606,24 +645,12 @@ class RLTrainer:
                 device_type=self.device.type,
                 enabled=self.amp_enabled,
             ):
-                query_embeddings = self.actor.encode(images)
-                neighbor_embeddings = policy_embeddings[
-                    batch_neighbors
-                ].detach()
-                policy_step = self.actor.policy(
-                    query_embeddings,
-                    neighbor_embeddings,
-                    state.current_labels[batch_indices],
-                    state.current_labels[batch_neighbors],
-                    actions=actions[batch_indices],
-                )
-                loss = -(
-                    q_value.detach()
-                    * policy_step.log_probabilities.sum()
-                    / selected_count
-                )
-            self.scaler.scale(loss).backward()
-            total_loss += loss.detach()
+                encoded = self.actor.encode(images)
+                surrogate = (
+                    encoded.float()
+                    * selected_embedding_gradient[start:end].float()
+                ).sum()
+            self.scaler.scale(surrogate).backward()
 
         self.scaler.step(self.actor_optimizer)
         self.scaler.update()
@@ -679,6 +706,9 @@ class RLTrainer:
                     "class_names": self.cfg.data.class_names,
                     "model_name": self.cfg.model.name,
                     "global_knn_cache": str(self.cache.cache_path),
+                    "global_knn_provenance_sha256": (
+                        self.cache.provenance_sha256
+                    ),
                     "training_signature": build_rl_training_signature(
                         self.cfg
                     ),

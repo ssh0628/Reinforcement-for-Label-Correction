@@ -15,7 +15,7 @@ def load_warmup_backbone(
     *,
     trainable: bool,
     remove_classifier: bool = False,
-) -> tuple[nn.Module, dict[str, object]]:
+) -> nn.Module:
     """Load the shared warmup initialization for f_omega or f_theta."""
     checkpoint_path = cfg.global_knn.checkpoint_path
     if not checkpoint_path.is_file():
@@ -56,4 +56,4 @@ def load_warmup_backbone(
         torch.backends.cudnn.benchmark = cfg.runtime.cudnn_benchmark
         if cfg.runtime.use_channels_last:
             model = model.to(memory_format=torch.channels_last)
-    return model, checkpoint
+    return model
