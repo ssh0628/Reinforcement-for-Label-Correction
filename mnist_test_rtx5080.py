@@ -1,4 +1,4 @@
-"""Paper-faithful MNIST RLNLC speed profile for an RTX 5080 (16 GiB).
+"""MNIST RLNLC actor-ablation speed profile for an RTX 5080 (16 GiB).
 
 Experiment setup
 ----------------
@@ -25,16 +25,15 @@ RLNLC:
     - Actor AdamW lr=3e-5, weight decay=0.1.
     - Critic SGD lr=1e-2, momentum=0.9.
     - Discount factor=0.9 and noisy-label-alignment weight=0.5.
-    - Every one of the 60,000 samples participates in each actor update.
-    - Policy gradients flow through both query and neighbor embeddings, as in
-      Eqs. (2), (3), and Algorithm 1 of the paper.
+    - Three selectable actor profiles isolate subset and gradient-path costs:
+      2,048 query-only, 60,000 query-only, and 60,000 query+neighbor.
     - Exact KNN is streamed in 2,048 x 32,768 query/reference chunks.
 
 Runtime:
     - CUDA BF16 autocast and channels-last memory format.
     - Feature extraction batch size=256.
     - Data: K:/rlnlc/data/mnist
-    - Outputs: K:/rlnlc/outputs/mnist_paper_speed_rtx5080
+    - Outputs are separated automatically by ACTOR_UPDATE_PROFILE.
 
 The constants immediately below are the executable source of truth. Keep this
 profile note synchronized whenever those values change.
@@ -76,7 +75,6 @@ from setting.config import Config
 # Keep data and generated reports inside this workspace so the run is portable.
 PROJECT_ROOT = Path(__file__).resolve().parent
 MNIST_ROOT = PROJECT_ROOT / "data" / "mnist"
-OUTPUT_DIR = PROJECT_ROOT / "outputs" / "mnist_paper_speed_rtx5080"
 RUN_LOG_FILENAME = "run.log"
 WARMUP_CSV_FILENAME = "warmup.csv"
 WARMUP_CHECKPOINT_FILENAME = "warmup_best.pt"
@@ -92,6 +90,30 @@ DIGITS = tuple(range(10))
 NUM_CLASSES = len(DIGITS)
 EXPECTED_SAMPLES = 60_000
 NOISE_RATE = 0.40
+
+# Change only this value between actor ablation runs.
+# - subset_query_only: optimized baseline already used in the prior run.
+# - full_query_only: isolates the cost of expanding 2,048 to all 60,000 queries.
+# - full_query_neighbor: additionally propagates gradients through neighbors.
+ACTOR_UPDATE_PROFILE = "full_query_neighbor"
+ACTOR_UPDATE_PROFILES: dict[str, tuple[int, bool]] = {
+    "subset_query_only": (2_048, False),
+    "full_query_only": (EXPECTED_SAMPLES, False),
+    "full_query_neighbor": (EXPECTED_SAMPLES, True),
+}
+if ACTOR_UPDATE_PROFILE not in ACTOR_UPDATE_PROFILES:
+    raise ValueError(
+        "ACTOR_UPDATE_PROFILE must be one of "
+        f"{tuple(ACTOR_UPDATE_PROFILES)}."
+    )
+POLICY_UPDATE_SAMPLES, NEIGHBOR_GRADIENT = ACTOR_UPDATE_PROFILES[
+    ACTOR_UPDATE_PROFILE
+]
+OUTPUT_DIR = (
+    PROJECT_ROOT
+    / "outputs"
+    / f"mnist_speed_rtx5080_{ACTOR_UPDATE_PROFILE}"
+)
 
 MODEL_NAME = "convnextv2_tiny.fcmae_ft_in22k_in1k"
 PRETRAINED = False
@@ -1291,42 +1313,64 @@ def evaluate_correction_split(
     return summary, per_class
 
 
-def compute_full_policy_embedding_gradient(
+def select_policy_queries(sample_count: int, step: int) -> Tensor:
+    if POLICY_UPDATE_SAMPLES == sample_count:
+        return torch.arange(sample_count)
+    generator = torch.Generator().manual_seed(SEED + step)
+    selected = torch.randperm(sample_count, generator=generator)[
+        :POLICY_UPDATE_SAMPLES
+    ]
+    return selected.sort().values
+
+
+def compute_policy_embedding_gradient(
     policy: LabelCorrectionPolicy,
     cached_embeddings: Tensor,
     label_state: Tensor,
     neighbor_indices: Tensor,
     actions: Tensor,
     q_value: Tensor,
+    query_indices_cpu: Tensor,
+    neighbor_gradient: bool,
     device: torch.device,
 ) -> tuple[Tensor, float]:
-    """Differentiate the full policy loss through queries and neighbors.
+    """Differentiate the selected policy loss through configured paths.
 
-    KNN indices are discrete and remain fixed within the current RL step. The
-    resulting gradient covers every occurrence as both a query and a neighbor.
+    KNN indices are discrete and fixed within the current RL step. Query
+    embeddings always receive gradients; neighbor embeddings receive them only
+    when ``neighbor_gradient`` is enabled.
     """
     sample_count = cached_embeddings.size(0)
     if cached_embeddings.ndim != 2 or sample_count != EXPECTED_SAMPLES:
         raise ValueError("cached_embeddings must have shape [N, D].")
     if neighbor_indices.size(0) != sample_count:
         raise ValueError("neighbor_indices must cover all N samples.")
+    if query_indices_cpu.ndim != 1 or query_indices_cpu.numel() == 0:
+        raise ValueError("query_indices_cpu must be a non-empty vector.")
+    if query_indices_cpu.device.type != "cpu":
+        raise ValueError("query_indices_cpu must remain on CPU.")
 
     # Embeddings extracted under inference_mode cannot directly participate in
     # autograd. Cloning creates a regular leaf while preserving their values.
     embedding_leaf = cached_embeddings.detach().clone().requires_grad_(True)
+    query_indices = query_indices_cpu.to(device=device, non_blocking=True)
+    query_count = query_indices.numel()
     total_loss = torch.zeros((), device=device)
-    total_batches = math.ceil(sample_count / POLICY_UPDATE_BATCH_SIZE)
+    total_batches = math.ceil(query_count / POLICY_UPDATE_BATCH_SIZE)
 
     for batch_number, start in enumerate(
-        range(0, sample_count, POLICY_UPDATE_BATCH_SIZE),
+        range(0, query_count, POLICY_UPDATE_BATCH_SIZE),
         start=1,
     ):
-        end = min(start + POLICY_UPDATE_BATCH_SIZE, sample_count)
-        batch_indices = torch.arange(start, end, device=device)
+        end = min(start + POLICY_UPDATE_BATCH_SIZE, query_count)
+        batch_indices = query_indices[start:end]
         batch_neighbors = neighbor_indices[batch_indices]
+        neighbor_embeddings = embedding_leaf[batch_neighbors]
+        if not neighbor_gradient:
+            neighbor_embeddings = neighbor_embeddings.detach()
         policy_step = policy(
             embedding_leaf[batch_indices],
-            embedding_leaf[batch_neighbors],
+            neighbor_embeddings,
             label_state[batch_indices],
             label_state[batch_neighbors],
             actions=actions[batch_indices],
@@ -1334,14 +1378,15 @@ def compute_full_policy_embedding_gradient(
         loss = -(
             q_value.detach()
             * policy_step.log_probabilities.sum()
-            / sample_count
+            / query_count
         )
         loss.backward()
         total_loss += loss.detach()
         if batch_number % 100 == 0 or batch_number == total_batches:
             print(
                 f"[ACTOR POLICY GRAD] batch={batch_number}/{total_batches} "
-                f"samples={end}/{sample_count}"
+                f"queries={end}/{query_count} "
+                f"neighbor_gradient={neighbor_gradient}"
             )
 
     embedding_gradient = embedding_leaf.grad
@@ -1358,6 +1403,7 @@ def update_backbone_from_embedding_gradient(
     scaler: torch.amp.GradScaler,
     raw_images: Tensor,
     embedding_gradient: Tensor,
+    update_indices_cpu: Tensor,
     device: torch.device,
     mean: Tensor,
     std: Tensor,
@@ -1376,14 +1422,27 @@ def update_backbone_from_embedding_gradient(
         or embedding_gradient.size(0) != sample_count
     ):
         raise ValueError("embedding_gradient must have shape [N, D].")
-    total_batches = math.ceil(sample_count / POLICY_UPDATE_BATCH_SIZE)
+    if update_indices_cpu.ndim != 1 or update_indices_cpu.numel() == 0:
+        raise ValueError("update_indices_cpu must be a non-empty vector.")
+    if update_indices_cpu.device.type != "cpu":
+        raise ValueError("update_indices_cpu must remain on CPU.")
+    update_count = update_indices_cpu.numel()
+    use_full_order = update_count == sample_count
+    selected_images = (
+        raw_images
+        if use_full_order
+        else pin_for_cuda(raw_images[update_indices_cpu])
+    )
+    update_indices = update_indices_cpu.to(device=device, non_blocking=True)
+    total_batches = math.ceil(update_count / POLICY_UPDATE_BATCH_SIZE)
 
     for batch_number, start in enumerate(
-        range(0, sample_count, POLICY_UPDATE_BATCH_SIZE),
+        range(0, update_count, POLICY_UPDATE_BATCH_SIZE),
         start=1,
     ):
-        end = min(start + POLICY_UPDATE_BATCH_SIZE, sample_count)
-        images = preprocess(raw_images[start:end], device, mean, std)
+        end = min(start + POLICY_UPDATE_BATCH_SIZE, update_count)
+        batch_indices = update_indices[start:end]
+        images = preprocess(selected_images[start:end], device, mean, std)
         with torch.autocast(
             device_type=device.type,
             dtype=AMP_DTYPE,
@@ -1391,13 +1450,13 @@ def update_backbone_from_embedding_gradient(
         ):
             current_embeddings = encode(model, images)
             surrogate = (
-                current_embeddings.float() * embedding_gradient[start:end]
+                current_embeddings.float() * embedding_gradient[batch_indices]
             ).sum()
         scaler.scale(surrogate).backward()
         if batch_number % 100 == 0 or batch_number == total_batches:
             print(
                 f"[ACTOR BACKBONE VJP] batch={batch_number}/{total_batches} "
-                f"samples={end}/{sample_count}"
+                f"samples={end}/{update_count}"
             )
 
     scaler.step(optimizer)
@@ -1465,8 +1524,10 @@ def build_benchmark_config() -> Config:
             critic_lr=CRITIC_LR,
             critic_momentum=CRITIC_MOMENTUM,
             critic_weight_decay=CRITIC_WEIGHT_DECAY,
-            use_policy_update_subset=False,
-            policy_update_subset_size=EXPECTED_SAMPLES,
+            use_policy_update_subset=(
+                POLICY_UPDATE_SAMPLES < EXPECTED_SAMPLES
+            ),
+            policy_update_subset_size=POLICY_UPDATE_SAMPLES,
             policy_update_batch_size=POLICY_UPDATE_BATCH_SIZE,
         ),
         runtime=replace(
@@ -1499,9 +1560,10 @@ def print_configuration(
     )
     print(f"rl_epochs={RL_EPOCHS} trajectory_length={TRAJECTORY_LENGTH}")
     print(
-        f"policy_update_mode=full samples={EXPECTED_SAMPLES} "
+        f"actor_update_profile={ACTOR_UPDATE_PROFILE} "
+        f"policy_update_samples={POLICY_UPDATE_SAMPLES} "
         f"policy_update_batch={POLICY_UPDATE_BATCH_SIZE} "
-        "neighbor_gradient=True"
+        f"neighbor_gradient={NEIGHBOR_GRADIENT}"
     )
     print(
         f"feature_batch={FEATURE_BATCH_SIZE} k={K} "
@@ -1565,6 +1627,14 @@ def build_timing_rows(timings: Timings) -> list[dict[str, object]]:
 def main() -> None:
     if RL_EPOCHS <= 0:
         raise ValueError("RL_EPOCHS must be positive.")
+    if not 0 < POLICY_UPDATE_SAMPLES <= EXPECTED_SAMPLES:
+        raise ValueError(
+            "POLICY_UPDATE_SAMPLES must be in [1, EXPECTED_SAMPLES]."
+        )
+    if POLICY_UPDATE_BATCH_SIZE > POLICY_UPDATE_SAMPLES:
+        raise ValueError(
+            "POLICY_UPDATE_BATCH_SIZE cannot exceed POLICY_UPDATE_SAMPLES."
+        )
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     warmup_csv_path = OUTPUT_DIR / WARMUP_CSV_FILENAME
     warmup_checkpoint_path = OUTPUT_DIR / WARMUP_CHECKPOINT_FILENAME
@@ -1831,23 +1901,34 @@ def main() -> None:
                 encode_critic_state,
                 step=global_step,
             )
+            query_indices_cpu = select_policy_queries(
+                EXPECTED_SAMPLES,
+                global_step,
+            )
             embedding_gradient, actor_loss = measure(
-                "full_actor_policy_gradient",
+                "actor_policy_gradient",
                 device,
                 timings,
-                lambda: compute_full_policy_embedding_gradient(
+                lambda: compute_policy_embedding_gradient(
                     policy,
                     policy_embeddings,
                     label_state,
                     policy_neighbors,
                     correction.actions,
                     q_value,
+                    query_indices_cpu,
+                    NEIGHBOR_GRADIENT,
                     device,
                 ),
                 step=global_step,
             )
+            backbone_indices_cpu = (
+                torch.arange(EXPECTED_SAMPLES)
+                if NEIGHBOR_GRADIENT
+                else query_indices_cpu
+            )
             measure(
-                "full_actor_backbone_update",
+                "actor_backbone_update",
                 device,
                 timings,
                 lambda: update_backbone_from_embedding_gradient(
@@ -1856,6 +1937,7 @@ def main() -> None:
                     scaler,
                     raw_images,
                     embedding_gradient,
+                    backbone_indices_cpu,
                     device,
                     mean,
                     std,
@@ -2120,10 +2202,10 @@ def main() -> None:
                 "rl_epochs": RL_EPOCHS,
                 "trajectory_length": TRAJECTORY_LENGTH,
                 "feature_batch_size": FEATURE_BATCH_SIZE,
-                "policy_update_mode": "full",
-                "policy_update_samples": EXPECTED_SAMPLES,
+                "policy_update_mode": ACTOR_UPDATE_PROFILE,
+                "policy_update_samples": POLICY_UPDATE_SAMPLES,
                 "policy_update_batch_size": POLICY_UPDATE_BATCH_SIZE,
-                "neighbor_gradient": True,
+                "neighbor_gradient": NEIGHBOR_GRADIENT,
                 "k": K,
                 "knn_query_chunk_size": KNN_QUERY_CHUNK_SIZE,
                 "knn_reference_chunk_size": KNN_REFERENCE_CHUNK_SIZE,
