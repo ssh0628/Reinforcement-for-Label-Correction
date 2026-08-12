@@ -1,4 +1,4 @@
-"""MNIST RLNLC experiment profile for the local RTX 5080 (16 GiB).
+"""Paper-faithful MNIST RLNLC speed profile for an RTX 5080 (16 GiB).
 
 Experiment setup
 ----------------
@@ -9,7 +9,7 @@ Data:
 
 Backbone and supervised warmup:
     - ConvNeXtV2 Tiny initialized without pretrained weights.
-    - 5 warmup epochs using only noisy labels for optimization.
+    - 1 warmup epoch using only noisy labels for optimization.
     - The randomly initialized backbone is trainable from epoch 1.
     - Backbone lr=1e-4 and head lr=5e-4.
     - Cosine decay to 1e-6, weight decay=0.05, label smoothing=0.1.
@@ -20,19 +20,21 @@ Backbone and supervised warmup:
     - RL does not start if best noisy-validation accuracy is below 45%.
 
 RLNLC:
-    - 50 outer epochs and trajectory length 10 (500 total RL steps).
+    - 1 timed outer epoch and trajectory length 10 (10 total RL steps).
     - Exact Euclidean KNN with k=10; cosine attention temperature=0.5.
     - Actor AdamW lr=3e-5, weight decay=0.1.
     - Critic SGD lr=1e-2, momentum=0.9.
     - Discount factor=0.9 and noisy-label-alignment weight=0.5.
-    - Actor update subset=2,048 with batch size=64.
+    - Every one of the 60,000 samples participates in each actor update.
+    - Policy gradients flow through both query and neighbor embeddings, as in
+      Eqs. (2), (3), and Algorithm 1 of the paper.
     - Exact KNN is streamed in 2,048 x 32,768 query/reference chunks.
 
 Runtime:
     - CUDA BF16 autocast and channels-last memory format.
     - Feature extraction batch size=256.
     - Data: K:/rlnlc/data/mnist
-    - Outputs: K:/rlnlc/outputs/mnist_local_rtx5080_warmup
+    - Outputs: K:/rlnlc/outputs/mnist_paper_speed_rtx5080
 
 The constants immediately below are the executable source of truth. Keep this
 profile note synchronized whenever those values change.
@@ -74,7 +76,7 @@ from setting.config import Config
 # Keep data and generated reports inside this workspace so the run is portable.
 PROJECT_ROOT = Path(__file__).resolve().parent
 MNIST_ROOT = PROJECT_ROOT / "data" / "mnist"
-OUTPUT_DIR = PROJECT_ROOT / "outputs" / "mnist_local_rtx5080_warmup"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "mnist_paper_speed_rtx5080"
 RUN_LOG_FILENAME = "run.log"
 WARMUP_CSV_FILENAME = "warmup.csv"
 WARMUP_CHECKPOINT_FILENAME = "warmup_best.pt"
@@ -97,7 +99,7 @@ IMAGE_SIZE = 224
 DROP_RATE = 0.1
 DROP_PATH_RATE = 0.2
 
-WARMUP_EPOCHS = 5
+WARMUP_EPOCHS = 1
 WARMUP_FREEZE_EPOCHS = 0
 WARMUP_BATCH_SIZE = 64
 WARMUP_EVAL_BATCH_SIZE = 256
@@ -110,10 +112,9 @@ WARMUP_LABEL_SMOOTHING = 0.1
 WARMUP_GRAD_CLIP_NORM = 1.0
 WARMUP_MIN_NOISY_VALIDATION_ACCURACY = 0.45
 
-RL_EPOCHS = 50
+RL_EPOCHS = 1
 TRAJECTORY_LENGTH = 10
 FEATURE_BATCH_SIZE = 256
-POLICY_UPDATE_SUBSET_SIZE = 2_048
 POLICY_UPDATE_BATCH_SIZE = 64
 
 K = 10
@@ -237,8 +238,10 @@ RUN_SUMMARY_FIELDS = (
     "rl_epochs",
     "trajectory_length",
     "feature_batch_size",
-    "policy_update_subset_size",
+    "policy_update_mode",
+    "policy_update_samples",
     "policy_update_batch_size",
+    "neighbor_gradient",
     "k",
     "knn_query_chunk_size",
     "knn_reference_chunk_size",
@@ -1205,14 +1208,6 @@ def build_global_graph(embeddings: Tensor) -> tuple[Tensor, Tensor]:
     return neighbor_indices, neighbor_cosines
 
 
-def select_policy_subset(sample_count: int, step: int) -> Tensor:
-    generator = torch.Generator().manual_seed(SEED + step)
-    selected = torch.randperm(sample_count, generator=generator)[
-        :POLICY_UPDATE_SUBSET_SIZE
-    ]
-    return selected.sort().values
-
-
 def evaluate_correction_split(
     *,
     split: str,
@@ -1296,76 +1291,117 @@ def evaluate_correction_split(
     return summary, per_class
 
 
-def update_query_only_actor(
-    model: nn.Module,
+def compute_full_policy_embedding_gradient(
     policy: LabelCorrectionPolicy,
-    optimizer: AdamW,
-    scaler: torch.amp.GradScaler,
-    raw_images: Tensor,
-    selected_cpu: Tensor,
     cached_embeddings: Tensor,
     label_state: Tensor,
     neighbor_indices: Tensor,
     actions: Tensor,
     q_value: Tensor,
     device: torch.device,
-    mean: Tensor,
-    std: Tensor,
-) -> float:
-    """Update query features only; neighbor features stay fixed for this step."""
-    model.eval()
-    optimizer.zero_grad(set_to_none=True)
-    selected = selected_cpu.to(device=device, non_blocking=True)
-    selected_images = pin_for_cuda(raw_images[selected_cpu])
-    selected_count = selected.numel()
+) -> tuple[Tensor, float]:
+    """Differentiate the full policy loss through queries and neighbors.
+
+    KNN indices are discrete and remain fixed within the current RL step. The
+    resulting gradient covers every occurrence as both a query and a neighbor.
+    """
+    sample_count = cached_embeddings.size(0)
+    if cached_embeddings.ndim != 2 or sample_count != EXPECTED_SAMPLES:
+        raise ValueError("cached_embeddings must have shape [N, D].")
+    if neighbor_indices.size(0) != sample_count:
+        raise ValueError("neighbor_indices must cover all N samples.")
+
+    # Embeddings extracted under inference_mode cannot directly participate in
+    # autograd. Cloning creates a regular leaf while preserving their values.
+    embedding_leaf = cached_embeddings.detach().clone().requires_grad_(True)
     total_loss = torch.zeros((), device=device)
-    total_batches = (
-        selected_count + POLICY_UPDATE_BATCH_SIZE - 1
-    ) // POLICY_UPDATE_BATCH_SIZE
+    total_batches = math.ceil(sample_count / POLICY_UPDATE_BATCH_SIZE)
 
     for batch_number, start in enumerate(
-        range(0, selected_count, POLICY_UPDATE_BATCH_SIZE),
+        range(0, sample_count, POLICY_UPDATE_BATCH_SIZE),
         start=1,
     ):
-        end = min(start + POLICY_UPDATE_BATCH_SIZE, selected_count)
-        batch_indices = selected[start:end]
+        end = min(start + POLICY_UPDATE_BATCH_SIZE, sample_count)
+        batch_indices = torch.arange(start, end, device=device)
         batch_neighbors = neighbor_indices[batch_indices]
-        images = preprocess(
-            selected_images[start:end],
-            device,
-            mean,
-            std,
+        policy_step = policy(
+            embedding_leaf[batch_indices],
+            embedding_leaf[batch_neighbors],
+            label_state[batch_indices],
+            label_state[batch_neighbors],
+            actions=actions[batch_indices],
         )
+        loss = -(
+            q_value.detach()
+            * policy_step.log_probabilities.sum()
+            / sample_count
+        )
+        loss.backward()
+        total_loss += loss.detach()
+        if batch_number % 100 == 0 or batch_number == total_batches:
+            print(
+                f"[ACTOR POLICY GRAD] batch={batch_number}/{total_batches} "
+                f"samples={end}/{sample_count}"
+            )
+
+    embedding_gradient = embedding_leaf.grad
+    if embedding_gradient is None:
+        raise RuntimeError("Policy loss did not produce an embedding gradient.")
+    embedding_gradient = embedding_gradient.detach()
+    del embedding_leaf
+    return embedding_gradient, float(total_loss)
+
+
+def update_backbone_from_embedding_gradient(
+    model: nn.Module,
+    optimizer: AdamW,
+    scaler: torch.amp.GradScaler,
+    raw_images: Tensor,
+    embedding_gradient: Tensor,
+    device: torch.device,
+    mean: Tensor,
+    std: Tensor,
+) -> None:
+    """Map the complete embedding gradient through the actor backbone.
+
+    This batched vector-Jacobian product is equivalent to retaining one
+    dataset-wide actor autograd graph, without requiring that graph to fit in
+    GPU memory.
+    """
+    model.eval()
+    optimizer.zero_grad(set_to_none=True)
+    sample_count = raw_images.size(0)
+    if (
+        embedding_gradient.ndim != 2
+        or embedding_gradient.size(0) != sample_count
+    ):
+        raise ValueError("embedding_gradient must have shape [N, D].")
+    total_batches = math.ceil(sample_count / POLICY_UPDATE_BATCH_SIZE)
+
+    for batch_number, start in enumerate(
+        range(0, sample_count, POLICY_UPDATE_BATCH_SIZE),
+        start=1,
+    ):
+        end = min(start + POLICY_UPDATE_BATCH_SIZE, sample_count)
+        images = preprocess(raw_images[start:end], device, mean, std)
         with torch.autocast(
-            device_type="cuda",
+            device_type=device.type,
             dtype=AMP_DTYPE,
             enabled=USE_AMP,
         ):
-            query_embeddings = encode(model, images)
-            neighbor_embeddings = cached_embeddings[batch_neighbors].detach()
-            policy_step = policy(
-                query_embeddings,
-                neighbor_embeddings,
-                label_state[batch_indices],
-                label_state[batch_neighbors],
-                actions=actions[batch_indices],
-            )
-            loss = -(
-                q_value.detach()
-                * policy_step.log_probabilities.sum()
-                / selected_count
-            )
-        scaler.scale(loss).backward()
-        total_loss += loss.detach()
-        if batch_number % 10 == 0 or batch_number == total_batches:
+            current_embeddings = encode(model, images)
+            surrogate = (
+                current_embeddings.float() * embedding_gradient[start:end]
+            ).sum()
+        scaler.scale(surrogate).backward()
+        if batch_number % 100 == 0 or batch_number == total_batches:
             print(
-                f"[ACTOR] batch={batch_number}/{total_batches} "
-                f"samples={end}/{selected_count}"
+                f"[ACTOR BACKBONE VJP] batch={batch_number}/{total_batches} "
+                f"samples={end}/{sample_count}"
             )
 
     scaler.step(optimizer)
     scaler.update()
-    return float(total_loss)
 
 
 def update_critic(
@@ -1429,8 +1465,8 @@ def build_benchmark_config() -> Config:
             critic_lr=CRITIC_LR,
             critic_momentum=CRITIC_MOMENTUM,
             critic_weight_decay=CRITIC_WEIGHT_DECAY,
-            use_policy_update_subset=True,
-            policy_update_subset_size=POLICY_UPDATE_SUBSET_SIZE,
+            use_policy_update_subset=False,
+            policy_update_subset_size=EXPECTED_SAMPLES,
             policy_update_batch_size=POLICY_UPDATE_BATCH_SIZE,
         ),
         runtime=replace(
@@ -1463,8 +1499,9 @@ def print_configuration(
     )
     print(f"rl_epochs={RL_EPOCHS} trajectory_length={TRAJECTORY_LENGTH}")
     print(
-        f"policy_update_subset={POLICY_UPDATE_SUBSET_SIZE} "
-        f"policy_update_batch={POLICY_UPDATE_BATCH_SIZE}"
+        f"policy_update_mode=full samples={EXPECTED_SAMPLES} "
+        f"policy_update_batch={POLICY_UPDATE_BATCH_SIZE} "
+        "neighbor_gradient=True"
     )
     print(
         f"feature_batch={FEATURE_BATCH_SIZE} k={K} "
@@ -1794,29 +1831,38 @@ def main() -> None:
                 encode_critic_state,
                 step=global_step,
             )
-            selected_cpu = select_policy_subset(EXPECTED_SAMPLES, global_step)
-            actor_loss = measure(
-                "query_only_actor_update",
+            embedding_gradient, actor_loss = measure(
+                "full_actor_policy_gradient",
                 device,
                 timings,
-                lambda: update_query_only_actor(
-                    model,
+                lambda: compute_full_policy_embedding_gradient(
                     policy,
-                    actor_optimizer,
-                    scaler,
-                    raw_images,
-                    selected_cpu,
                     policy_embeddings,
                     label_state,
                     policy_neighbors,
                     correction.actions,
                     q_value,
                     device,
+                ),
+                step=global_step,
+            )
+            measure(
+                "full_actor_backbone_update",
+                device,
+                timings,
+                lambda: update_backbone_from_embedding_gradient(
+                    model,
+                    actor_optimizer,
+                    scaler,
+                    raw_images,
+                    embedding_gradient,
+                    device,
                     mean,
                     std,
                 ),
                 step=global_step,
             )
+            del embedding_gradient
 
             step_critic_losses: list[float] = []
 
@@ -2074,8 +2120,10 @@ def main() -> None:
                 "rl_epochs": RL_EPOCHS,
                 "trajectory_length": TRAJECTORY_LENGTH,
                 "feature_batch_size": FEATURE_BATCH_SIZE,
-                "policy_update_subset_size": POLICY_UPDATE_SUBSET_SIZE,
+                "policy_update_mode": "full",
+                "policy_update_samples": EXPECTED_SAMPLES,
                 "policy_update_batch_size": POLICY_UPDATE_BATCH_SIZE,
+                "neighbor_gradient": True,
                 "k": K,
                 "knn_query_chunk_size": KNN_QUERY_CHUNK_SIZE,
                 "knn_reference_chunk_size": KNN_REFERENCE_CHUNK_SIZE,
