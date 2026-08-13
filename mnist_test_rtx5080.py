@@ -9,7 +9,7 @@ Data:
 
 Backbone and supervised warmup:
     - ConvNeXtV2 Tiny initialized without pretrained weights.
-    - 1 warmup epoch using only noisy labels for optimization.
+    - 3 warmup epochs using only noisy labels for optimization.
     - The randomly initialized backbone is trainable from epoch 1.
     - Backbone lr=1e-4 and head lr=5e-4.
     - Cosine decay to 1e-6, weight decay=0.05, label smoothing=0.1.
@@ -20,12 +20,14 @@ Backbone and supervised warmup:
     - RL does not start if best noisy-validation accuracy is below 45%.
 
 RLNLC:
-    - 1 timed outer epoch and trajectory length 10 (10 total RL steps).
+    - 3 outer epochs and trajectory length 5 (15 total RL steps).
+    - At each RL epoch, 10% of the initial noisy-label state is randomized.
     - Exact Euclidean KNN with k=10; cosine attention temperature=0.5.
     - Actor AdamW lr=3e-5, weight decay=0.1.
     - Critic SGD lr=1e-2, momentum=0.9.
     - Discount factor=0.9 and noisy-label-alignment weight=0.5.
     - Two selectable actor update modes: full or subset.
+    - The subset mode updates 10,000 samples per RL step.
     - The policy uses the full cached KNN graph in both modes. Backbone
       backward is restricted to the selected update set, including neighbor
       gradient contributions whose samples are inside that set.
@@ -95,7 +97,7 @@ NOISE_RATE = 0.40
 
 # Change only this value between the two actor-update runs.
 ACTOR_UPDATE_MODE = "full"  # "full" or "subset"
-POLICY_UPDATE_SUBSET_SIZE = 2_048
+POLICY_UPDATE_SUBSET_SIZE = 10_000
 if ACTOR_UPDATE_MODE not in {"full", "subset"}:
     raise ValueError("ACTOR_UPDATE_MODE must be 'full' or 'subset'.")
 POLICY_UPDATE_SAMPLES = (
@@ -130,6 +132,7 @@ WARMUP_MIN_NOISY_VALIDATION_ACCURACY = 0.45
 
 RL_EPOCHS = 3
 TRAJECTORY_LENGTH = 5
+INITIAL_STATE_RANDOMIZATION_RATE = 0.10
 FEATURE_BATCH_SIZE = 256
 POLICY_UPDATE_BATCH_SIZE = 64
 
@@ -253,6 +256,7 @@ RUN_SUMMARY_FIELDS = (
     "warmup_seconds",
     "rl_epochs",
     "trajectory_length",
+    "initial_state_randomization_rate",
     "feature_batch_size",
     "policy_update_mode",
     "policy_update_samples",
@@ -300,6 +304,54 @@ def seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def initialize_randomized_label_state(
+    noisy_labels: Tensor,
+    *,
+    num_classes: int,
+    randomization_rate: float,
+    epoch: int,
+) -> tuple[Tensor, int]:
+    """Create the paper-style randomized initial state for one RL epoch."""
+    if noisy_labels.ndim != 1 or noisy_labels.numel() == 0:
+        raise ValueError("noisy_labels must be a non-empty [N] tensor.")
+    if noisy_labels.dtype != torch.long:
+        raise TypeError("noisy_labels must use torch.long.")
+    if num_classes <= 1:
+        raise ValueError("num_classes must be at least two.")
+    if not 0 < randomization_rate < 1:
+        raise ValueError("randomization_rate must be in (0, 1).")
+    if epoch <= 0:
+        raise ValueError("epoch must be positive.")
+
+    random_count = min(
+        noisy_labels.numel(),
+        max(1, round(noisy_labels.numel() * randomization_rate)),
+    )
+    generator = torch.Generator(device=noisy_labels.device).manual_seed(
+        SEED + epoch - 1
+    )
+    selected = torch.randperm(
+        noisy_labels.numel(),
+        device=noisy_labels.device,
+        generator=generator,
+    )[:random_count]
+    randomized_labels = noisy_labels.clone()
+    original = randomized_labels[selected]
+    alternatives = torch.randint(
+        num_classes - 1,
+        (random_count,),
+        device=noisy_labels.device,
+        generator=generator,
+    )
+    alternatives += alternatives.ge(original)
+    randomized_labels[selected] = alternatives
+    label_state = F.one_hot(
+        randomized_labels,
+        num_classes=num_classes,
+    ).to(torch.float32)
+    return label_state, random_count
 
 
 def resolve_local_device() -> torch.device:
@@ -1481,6 +1533,9 @@ def build_benchmark_config() -> Config:
             cfg.rl_train,
             epochs=RL_EPOCHS,
             trajectory_length=TRAJECTORY_LENGTH,
+            initial_state_randomization_rate=(
+                INITIAL_STATE_RANDOMIZATION_RATE
+            ),
             discount_factor=DISCOUNT_FACTOR,
             actor_lr=ACTOR_LR,
             actor_weight_decay=ACTOR_WEIGHT_DECAY,
@@ -1521,7 +1576,11 @@ def print_configuration(
         f"noise_type=stratified_symmetric noise_rate={NOISE_RATE:.2f} "
         f"noise_seed={SEED} corrupted={int(noise_mask.sum())}"
     )
-    print(f"rl_epochs={RL_EPOCHS} trajectory_length={TRAJECTORY_LENGTH}")
+    print(
+        f"rl_epochs={RL_EPOCHS} trajectory_length={TRAJECTORY_LENGTH} "
+        "initial_state_randomization_rate="
+        f"{INITIAL_STATE_RANDOMIZATION_RATE:.2f}"
+    )
     print(
         f"actor_update_mode={ACTOR_UPDATE_MODE} "
         f"policy_update_samples={POLICY_UPDATE_SAMPLES} "
@@ -1782,10 +1841,23 @@ def main() -> None:
     for epoch in range(1, RL_EPOCHS + 1):
         synchronize(device)
         epoch_started = time.perf_counter()
-        label_state = F.one_hot(
-            initial_noisy_labels,
-            num_classes=NUM_CLASSES,
-        ).to(torch.float32)
+        label_state, randomized_count = measure(
+            "initial_state_randomization",
+            device,
+            timings,
+            lambda current_epoch=epoch: initialize_randomized_label_state(
+                initial_noisy_labels,
+                num_classes=NUM_CLASSES,
+                randomization_rate=INITIAL_STATE_RANDOMIZATION_RATE,
+                epoch=current_epoch,
+            ),
+            step=epoch,
+        )
+        print(
+            f"[STATE] epoch={epoch} randomized={randomized_count}/"
+            f"{EXPECTED_SAMPLES} "
+            f"rate={randomized_count / EXPECTED_SAMPLES:.4f}"
+        )
         previous_encoding: Tensor | None = None
         previous_reward: Tensor | None = None
         epoch_action_count = 0
@@ -2150,6 +2222,9 @@ def main() -> None:
                 "warmup_seconds": sum(timings["supervised_warmup"]),
                 "rl_epochs": RL_EPOCHS,
                 "trajectory_length": TRAJECTORY_LENGTH,
+                "initial_state_randomization_rate": (
+                    INITIAL_STATE_RANDOMIZATION_RATE
+                ),
                 "feature_batch_size": FEATURE_BATCH_SIZE,
                 "policy_update_mode": ACTOR_UPDATE_MODE,
                 "policy_update_samples": POLICY_UPDATE_SAMPLES,
