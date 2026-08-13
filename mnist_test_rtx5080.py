@@ -78,6 +78,8 @@ from setting.config import Config
 # Local RTX 5080 (16 GiB) validation profile.
 # Keep data and generated reports inside this workspace so the run is portable.
 PROJECT_ROOT = Path(__file__).resolve().parent
+DATASET_NAME = "MNIST"
+DATASET_STAGE_PREFIX = "mnist"
 MNIST_ROOT = PROJECT_ROOT / "data" / "mnist"
 RUN_LOG_FILENAME = "run.log"
 WARMUP_CSV_FILENAME = "warmup.csv"
@@ -96,8 +98,8 @@ EXPECTED_SAMPLES = 60_000
 NOISE_RATE = 0.40
 
 # Change only this value between the two actor-update runs.
-ACTOR_UPDATE_MODE = "full"  # "full" or "subset"
-POLICY_UPDATE_SUBSET_SIZE = 10_000
+ACTOR_UPDATE_MODE = "subset"  # "full" or "subset"
+POLICY_UPDATE_SUBSET_SIZE = 6_000
 if ACTOR_UPDATE_MODE not in {"full", "subset"}:
     raise ValueError("ACTOR_UPDATE_MODE must be 'full' or 'subset'.")
 POLICY_UPDATE_SAMPLES = (
@@ -117,7 +119,7 @@ IMAGE_SIZE = 224
 DROP_RATE = 0.1
 DROP_PATH_RATE = 0.2
 
-WARMUP_EPOCHS = 3
+WARMUP_EPOCHS = 1
 WARMUP_FREEZE_EPOCHS = 0
 WARMUP_BATCH_SIZE = 64
 WARMUP_EVAL_BATCH_SIZE = 256
@@ -130,8 +132,8 @@ WARMUP_LABEL_SMOOTHING = 0.1
 WARMUP_GRAD_CLIP_NORM = 1.0
 WARMUP_MIN_NOISY_VALIDATION_ACCURACY = 0.45
 
-RL_EPOCHS = 3
-TRAJECTORY_LENGTH = 5
+RL_EPOCHS = 1
+TRAJECTORY_LENGTH = 10
 INITIAL_STATE_RANDOMIZATION_RATE = 0.10
 FEATURE_BATCH_SIZE = 256
 POLICY_UPDATE_BATCH_SIZE = 64
@@ -241,6 +243,7 @@ TIMING_FIELDS = (
 )
 
 RUN_SUMMARY_FIELDS = (
+    "dataset",
     "seed",
     "noise_rate",
     "train_samples",
@@ -357,7 +360,8 @@ def initialize_randomized_label_state(
 def resolve_local_device() -> torch.device:
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "The local MNIST benchmark requires CUDA, but torch.cuda.is_available() "
+            f"The local {DATASET_NAME} benchmark requires CUDA, but "
+            "torch.cuda.is_available() "
             "is False. Check the NVIDIA driver and CUDA-enabled PyTorch build."
         )
     return torch.device("cuda", 0)
@@ -1566,10 +1570,10 @@ def print_configuration(
     noise_mask: Tensor,
 ) -> None:
     properties = torch.cuda.get_device_properties(device)
-    print("MNIST local RLNLC validation benchmark")
+    print(f"{DATASET_NAME} local RLNLC validation benchmark")
     print(f"device={device} ({properties.name})")
     print(f"device_memory_gib={properties.total_memory / 1024**3:.2f}")
-    print(f"samples={clean_labels.numel()} digits={DIGITS}")
+    print(f"samples={clean_labels.numel()} classes={DIGITS}")
     print(f"clean_class_counts={class_counts(clean_labels)}")
     print(f"noisy_class_counts={class_counts(noisy_labels)}")
     print(
@@ -1676,13 +1680,13 @@ def main() -> None:
     print(f"output_dir={OUTPUT_DIR}")
 
     raw_images, clean_labels_cpu = measure(
-        "mnist_load",
+        f"{DATASET_STAGE_PREFIX}_load",
         device,
         timings,
         load_full_mnist_train,
     )
     evaluation_splits = measure(
-        "mnist_eval_load",
+        f"{DATASET_STAGE_PREFIX}_eval_load",
         device,
         timings,
         load_mnist_validation_test,
@@ -2171,8 +2175,8 @@ def main() -> None:
     print_timing_summary(timings)
 
     setup_names = {
-        "mnist_load",
-        "mnist_eval_load",
+        f"{DATASET_STAGE_PREFIX}_load",
+        f"{DATASET_STAGE_PREFIX}_eval_load",
         "noise_injection",
         "val_noise_injection",
         "test_noise_injection",
@@ -2203,6 +2207,7 @@ def main() -> None:
         run_summary_path,
         [
             {
+                "dataset": DATASET_NAME,
                 "seed": SEED,
                 "noise_rate": NOISE_RATE,
                 "train_samples": EXPECTED_SAMPLES,
@@ -2261,6 +2266,7 @@ def main() -> None:
     )
 
     print("\n[RESULT]")
+    print(f"dataset={DATASET_NAME}")
     print(
         f"samples={EXPECTED_SAMPLES}, classes={NUM_CLASSES}, "
         f"rl_epochs={RL_EPOCHS}"
