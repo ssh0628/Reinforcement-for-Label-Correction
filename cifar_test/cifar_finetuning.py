@@ -14,6 +14,7 @@ import sys
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import timm
@@ -23,10 +24,12 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from cifar_test import cifar_test_rtx5080 as cifar
+if TYPE_CHECKING:
+    from cifar_test import cifar_test_rtx5080 as cifar
+else:
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    from cifar_test import cifar_test_rtx5080 as cifar
 
 
 # User-editable input. Both artifacts are derived from one full/subset run

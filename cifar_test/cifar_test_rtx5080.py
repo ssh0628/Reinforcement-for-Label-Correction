@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
@@ -34,10 +35,12 @@ from torchvision.datasets import CIFAR10
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-import mnist_test_rtx5080 as benchmark
+if TYPE_CHECKING:
+    import mnist_test_rtx5080 as benchmark
+else:
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    import mnist_test_rtx5080 as benchmark
 
 
 CIFAR10_ROOT = PROJECT_ROOT / "data" / "cifar10"
