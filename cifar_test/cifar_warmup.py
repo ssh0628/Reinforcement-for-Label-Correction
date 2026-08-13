@@ -82,7 +82,7 @@ def main() -> None:
     benchmark.seed_everything(cifar.SEED)
     torch.backends.cudnn.benchmark = benchmark.CUDNN_BENCHMARK
     torch.cuda.reset_peak_memory_stats()
-    timings: benchmark.Timings = {}
+    timings: dict[str, list[float]] = {}
 
     raw_images, clean_labels = benchmark.measure(
         "cifar10_load",
