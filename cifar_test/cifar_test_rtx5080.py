@@ -1,10 +1,9 @@
-"""CIFAR-10 RLNLC full-vs-subset performance benchmark for an RTX 5080.
+"""CIFAR-10 RLNLC full-vs-subset experiment for an RTX 5080.
 
-This entry point reuses the already validated RLNLC benchmark engine in
-``mnist_test_rtx5080.py`` and replaces only the dataset-specific loading and
-preprocessing functions.  Run it twice with ``ACTOR_UPDATE_MODE`` set to
-``"full"`` and ``"subset"``.  The two runs then differ only in the samples
-used for the actor-backbone update.
+Set the shared noisy-label and warmup-checkpoint paths below, then run this file
+twice with ``ACTOR_UPDATE_MODE`` set to ``"full"`` and ``"subset"``.  After
+restoring the best actor, each run performs 25-step cleaning over all 50,000
+training examples and saves the resulting hard labels for fine-tuning.
 
 Experiment profile
 ------------------
@@ -25,6 +24,7 @@ checkpointing, and timing cannot silently diverge between MNIST and CIFAR-10.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import torch
@@ -32,12 +32,35 @@ from torch import Tensor
 from torch.nn import functional as F
 from torchvision.datasets import CIFAR10
 
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import mnist_test_rtx5080 as benchmark
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
 CIFAR10_ROOT = PROJECT_ROOT / "data" / "cifar10"
 DOWNLOAD_CIFAR10 = True
+
+# User-editable shared input paths.
+NOISY_LABELS_PATH = (
+    PROJECT_ROOT
+    / "outputs"
+    / "cifar10_shared"
+    / "noise_40_seed0"
+    / "train_noisy_labels.npy"
+)
+NOISE_MASK_PATH = (
+    PROJECT_ROOT
+    / "outputs"
+    / "cifar10_shared"
+    / "noise_40_seed0"
+    / "train_noise_mask.npy"
+)
+WARMUP_CHECKPOINT_PATH = (
+    PROJECT_ROOT / "outputs" / "cifar10_shared" / "warmup" / "warmup_best.pt"
+)
 
 CLASSES = tuple(range(10))
 NUM_CLASSES = len(CLASSES)
@@ -48,6 +71,12 @@ SEED = 0
 # Change only this value between the two comparison runs.
 ACTOR_UPDATE_MODE = "full"  # "full" or "subset"
 POLICY_UPDATE_SUBSET_SIZE = 5_000
+OUTPUT_DIR = (
+    PROJECT_ROOT / "outputs" / f"cifar10_test_rtx5080_{ACTOR_UPDATE_MODE}"
+)
+CLEANING_TRAJECTORY_LENGTH = 25
+CORRECTED_LABELS_PATH = OUTPUT_DIR / "train_corrected_labels.npy"
+OVERWRITE = False
 
 MODEL_NAME = "convnextv2_tiny.fcmae_ft_in22k_in1k"
 PRETRAINED = False
@@ -94,6 +123,42 @@ DISCOUNT_FACTOR = 0.9
 NLA_WEIGHT = 0.5
 LR_DECAY_FACTOR = 0.1
 LR_DECAY_FRACTION = 0.5
+
+RL_OUTPUT_FILENAMES = (
+    benchmark.RUN_LOG_FILENAME,
+    benchmark.RL_BEST_CHECKPOINT_FILENAME,
+    benchmark.RL_LAST_CHECKPOINT_FILENAME,
+    benchmark.TRAIN_CSV_FILENAME,
+    benchmark.TEST_CSV_FILENAME,
+    benchmark.TEST_PER_CLASS_CSV_FILENAME,
+    benchmark.TIMING_CSV_FILENAME,
+    benchmark.RUN_SUMMARY_CSV_FILENAME,
+    benchmark.CLEANING_CSV_FILENAME,
+    benchmark.CLEANING_SUMMARY_FILENAME,
+    benchmark.CLEANING_PER_CLASS_FILENAME,
+)
+
+
+def validate_output_destination() -> None:
+    paths = [OUTPUT_DIR / filename for filename in RL_OUTPUT_FILENAMES]
+    paths.append(CORRECTED_LABELS_PATH)
+    existing = [path for path in paths if path.exists()]
+    if existing and not OVERWRITE:
+        raise FileExistsError(
+            f"RL outputs already exist: {existing}. Set OVERWRITE=True only "
+            "when replacement is intentional."
+        )
+
+
+def validate_input_artifacts() -> None:
+    paths = (
+        NOISY_LABELS_PATH,
+        NOISE_MASK_PATH,
+        WARMUP_CHECKPOINT_PATH,
+    )
+    missing = [path for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"RL inputs not found: {missing}")
 
 
 def _as_image_tensor(dataset: CIFAR10) -> Tensor:
@@ -207,11 +272,15 @@ def configure_benchmark() -> None:
     benchmark.ACTOR_UPDATE_MODE = ACTOR_UPDATE_MODE
     benchmark.POLICY_UPDATE_SUBSET_SIZE = POLICY_UPDATE_SUBSET_SIZE
     benchmark.POLICY_UPDATE_SAMPLES = policy_update_samples
-    benchmark.OUTPUT_DIR = (
-        PROJECT_ROOT
-        / "outputs"
-        / f"cifar10_test_rtx5080_{ACTOR_UPDATE_MODE}"
-    )
+    benchmark.OUTPUT_DIR = OUTPUT_DIR
+    benchmark.EXTERNAL_NOISY_LABELS_PATH = NOISY_LABELS_PATH
+    benchmark.EXTERNAL_NOISE_MASK_PATH = NOISE_MASK_PATH
+    benchmark.EXTERNAL_WARMUP_CHECKPOINT_PATH = WARMUP_CHECKPOINT_PATH
+    # Preserve the warmup classifier head so the RL checkpoint can be
+    # fine-tuned directly on the cleaned labels.
+    benchmark.REMOVE_CLASSIFIER_FOR_RL = False
+    benchmark.CLEANING_TRAJECTORY_LENGTH = CLEANING_TRAJECTORY_LENGTH
+    benchmark.CORRECTED_LABELS_OUTPUT_PATH = CORRECTED_LABELS_PATH
 
     benchmark.MODEL_NAME = MODEL_NAME
     benchmark.PRETRAINED = PRETRAINED
@@ -264,4 +333,6 @@ def configure_benchmark() -> None:
 
 if __name__ == "__main__":
     configure_benchmark()
+    validate_input_artifacts()
+    validate_output_destination()
     benchmark.run_with_file_logging()

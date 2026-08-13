@@ -97,6 +97,18 @@ NUM_CLASSES = len(DIGITS)
 EXPECTED_SAMPLES = 60_000
 NOISE_RATE = 0.40
 
+# Optional externally prepared artifacts. Dataset-specific entry points can
+# populate these while the original standalone MNIST behavior stays unchanged.
+EXTERNAL_NOISY_LABELS_PATH: Path | None = None
+EXTERNAL_NOISE_MASK_PATH: Path | None = None
+EXTERNAL_WARMUP_CHECKPOINT_PATH: Path | None = None
+REMOVE_CLASSIFIER_FOR_RL = True
+CLEANING_TRAJECTORY_LENGTH = 0
+CORRECTED_LABELS_OUTPUT_PATH: Path | None = None
+CLEANING_CSV_FILENAME = "cleaning.csv"
+CLEANING_SUMMARY_FILENAME = "cleaning_summary.csv"
+CLEANING_PER_CLASS_FILENAME = "cleaning_per_class.csv"
+
 # Change only this value between the two actor-update runs.
 ACTOR_UPDATE_MODE = "subset"  # "full" or "subset"
 POLICY_UPDATE_SUBSET_SIZE = 6_000
@@ -234,6 +246,15 @@ PER_CLASS_FIELDS = (
     "clean_preservation_rate",
 )
 
+CLEANING_FIELDS = (
+    "step",
+    "action_count",
+    "action_rate",
+    "cumulative_changed_count",
+    "cumulative_changed_rate",
+    "clean_accuracy",
+)
+
 TIMING_FIELDS = (
     "stage",
     "calls",
@@ -268,6 +289,11 @@ RUN_SUMMARY_FIELDS = (
     "knn_query_chunk_size",
     "knn_reference_chunk_size",
     "correction_chunk_size",
+    "cleaning_trajectory_length",
+    "corrected_labels_path",
+    "cleaning_accuracy",
+    "cleaning_noisy_recovery_rate",
+    "cleaning_false_correction_rate",
     "rl_best_epoch",
     "rl_best_validation_accuracy",
     "rl_best_validation_balanced_accuracy",
@@ -502,6 +528,60 @@ def inject_stratified_symmetric_noise(
     if int(noise_mask.sum()) != target_noise_count:
         raise RuntimeError("Noise injection did not reach the requested rate.")
     return pin_for_cuda(noisy_labels), pin_for_cuda(noise_mask)
+
+
+def load_noisy_label_artifacts(
+    clean_labels: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Load and validate one shared noisy-label artifact when configured."""
+    paths = (EXTERNAL_NOISY_LABELS_PATH, EXTERNAL_NOISE_MASK_PATH)
+    if paths == (None, None):
+        return inject_stratified_symmetric_noise(clean_labels)
+    if any(path is None for path in paths):
+        raise ValueError(
+            "EXTERNAL_NOISY_LABELS_PATH and EXTERNAL_NOISE_MASK_PATH must "
+            "either both be set or both be None."
+        )
+    noisy_path = Path(paths[0])
+    mask_path = Path(paths[1])
+    if not noisy_path.is_file():
+        raise FileNotFoundError(f"Noisy-label artifact not found: {noisy_path}")
+    if not mask_path.is_file():
+        raise FileNotFoundError(f"Noise-mask artifact not found: {mask_path}")
+
+    noisy_array = np.load(noisy_path, allow_pickle=False)
+    mask_array = np.load(mask_path, allow_pickle=False)
+    noisy_labels = torch.from_numpy(np.asarray(noisy_array)).to(torch.long)
+    noise_mask = torch.from_numpy(np.asarray(mask_array)).to(torch.bool)
+    expected_shape = tuple(clean_labels.shape)
+    if tuple(noisy_labels.shape) != expected_shape:
+        raise ValueError(
+            f"Noisy labels must have shape {expected_shape}, got "
+            f"{tuple(noisy_labels.shape)}."
+        )
+    if tuple(noise_mask.shape) != expected_shape:
+        raise ValueError(
+            f"Noise mask must have shape {expected_shape}, got "
+            f"{tuple(noise_mask.shape)}."
+        )
+    if noisy_labels.numel() and (
+        int(noisy_labels.min()) < 0 or int(noisy_labels.max()) >= NUM_CLASSES
+    ):
+        raise ValueError("Noisy labels contain an out-of-range class ID.")
+    if not torch.equal(noisy_labels.ne(clean_labels), noise_mask):
+        raise ValueError(
+            "Saved noise mask does not match clean/noisy label differences."
+        )
+    expected_noise_count = round(clean_labels.numel() * NOISE_RATE)
+    if int(noise_mask.sum()) != expected_noise_count:
+        raise ValueError(
+            "Saved noise count does not match NOISE_RATE: "
+            f"{int(noise_mask.sum())} != {expected_noise_count}."
+        )
+    return (
+        pin_for_cuda(noisy_labels.contiguous()),
+        pin_for_cuda(noise_mask.contiguous()),
+    )
 
 
 def safe_ratio(numerator: Tensor, denominator: Tensor) -> Tensor:
@@ -900,6 +980,62 @@ def _save_warmup_checkpoint(
         temporary_path.replace(path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def load_warmup_checkpoint(
+    model: nn.Module,
+    checkpoint_path: Path,
+    device: torch.device,
+) -> dict[str, float | int]:
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Warmup checkpoint not found: {checkpoint_path}"
+        )
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    if not isinstance(checkpoint, dict):
+        raise TypeError("Warmup checkpoint must contain a dictionary.")
+    required = {
+        "epoch",
+        "model",
+        "noisy_validation_accuracy",
+        "clean_validation_accuracy",
+        "noise_rate",
+        "pretrained",
+    }
+    missing = required.difference(checkpoint)
+    if missing:
+        raise KeyError(
+            f"Warmup checkpoint is missing fields: {sorted(missing)}"
+        )
+    if not math.isclose(float(checkpoint["noise_rate"]), NOISE_RATE):
+        raise ValueError("Warmup checkpoint noise rate does not match this run.")
+    if bool(checkpoint["pretrained"]) != PRETRAINED:
+        raise ValueError(
+            "Warmup checkpoint pretrained setting does not match this run."
+        )
+    model.load_state_dict(checkpoint["model"], strict=True)
+    model.to(
+        device=device,
+        memory_format=(
+            torch.channels_last
+            if USE_CHANNELS_LAST
+            else torch.contiguous_format
+        ),
+    )
+    model.eval()
+    return {
+        "best_epoch": int(checkpoint["epoch"]),
+        "best_noisy_validation_accuracy": float(
+            checkpoint["noisy_validation_accuracy"]
+        ),
+        "best_clean_validation_accuracy": float(
+            checkpoint["clean_validation_accuracy"]
+        ),
+    }
 
 
 def _rl_selection_key(
@@ -1339,6 +1475,139 @@ def evaluate_correction_split(
     return summary, per_class
 
 
+def clean_full_training_labels(
+    *,
+    model: nn.Module,
+    policy: LabelCorrectionPolicy,
+    raw_images: Tensor,
+    clean_labels_cpu: Tensor,
+    noisy_labels_cpu: Tensor,
+    noise_mask_cpu: Tensor,
+    device: torch.device,
+    mean: Tensor,
+    std: Tensor,
+    timings: Timings,
+    corrected_labels_path: Path,
+    cleaning_csv_path: Path,
+    cleaning_summary_path: Path,
+    cleaning_per_class_path: Path,
+    checkpoint_epoch: int,
+) -> dict[str, object]:
+    """Deploy the frozen best actor for T' steps over the full train split."""
+    if CLEANING_TRAJECTORY_LENGTH <= 0:
+        raise ValueError("CLEANING_TRAJECTORY_LENGTH must be positive.")
+    synchronize(device)
+    started = time.perf_counter()
+    device_index = device.index if device.index is not None else 0
+    with torch.random.fork_rng(devices=[device_index]):
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+        embeddings = measure(
+            "cleaning_feature_extraction",
+            device,
+            timings,
+            lambda: extract_all_embeddings(model, raw_images, device, mean, std),
+        )
+        neighbors = measure(
+            "cleaning_exact_knn",
+            device,
+            timings,
+            lambda: build_neighbor_indices(embeddings),
+        )
+        clean_labels = clean_labels_cpu.to(device, non_blocking=True)
+        initial_noisy_labels = noisy_labels_cpu.to(device, non_blocking=True)
+        noise_mask = noise_mask_cpu.to(device, non_blocking=True)
+        label_state = F.one_hot(
+            initial_noisy_labels,
+            num_classes=NUM_CLASSES,
+        ).to(torch.float32)
+        history: list[dict[str, object]] = []
+        total_action_count = 0
+
+        for cleaning_step in range(1, CLEANING_TRAJECTORY_LENGTH + 1):
+            correction = measure(
+                "cleaning_correction",
+                device,
+                timings,
+                lambda: policy.correct_all(
+                    embeddings,
+                    label_state,
+                    neighbors,
+                ),
+                step=cleaning_step,
+            )
+            step_action_count = int(correction.actions.sum())
+            total_action_count += step_action_count
+            label_state = correction.corrected_labels
+            hard_labels = label_state.argmax(dim=1)
+            cumulative_changed_count = int(
+                hard_labels.ne(initial_noisy_labels).sum()
+            )
+            row = {
+                "step": cleaning_step,
+                "action_count": step_action_count,
+                "action_rate": step_action_count / EXPECTED_SAMPLES,
+                "cumulative_changed_count": cumulative_changed_count,
+                "cumulative_changed_rate": (
+                    cumulative_changed_count / EXPECTED_SAMPLES
+                ),
+                "clean_accuracy": float(
+                    hard_labels.eq(clean_labels).float().mean()
+                ),
+            }
+            history.append(row)
+            print(
+                f"[CLEAN] step={cleaning_step}/"
+                f"{CLEANING_TRAJECTORY_LENGTH} "
+                f"action={float(row['action_rate']):.4f} "
+                f"changed={float(row['cumulative_changed_rate']):.4f} "
+                f"clean_accuracy={float(row['clean_accuracy']):.4f}"
+            )
+
+    synchronize(device)
+    elapsed = time.perf_counter() - started
+    summary = correction_summary(
+        label_state,
+        clean_labels,
+        initial_noisy_labels,
+        noise_mask,
+        epoch=checkpoint_epoch,
+        split="train_cleaning",
+        action_count=total_action_count,
+        action_rate=(
+            total_action_count
+            / (EXPECTED_SAMPLES * CLEANING_TRAJECTORY_LENGTH)
+        ),
+        elapsed_seconds=elapsed,
+    )
+    per_class = correction_per_class(
+        label_state,
+        clean_labels,
+        initial_noisy_labels,
+        noise_mask,
+        split="train_cleaning",
+    )
+    corrected_array = (
+        label_state.argmax(dim=1).detach().cpu().numpy().astype(np.int64)
+    )
+    corrected_labels_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = corrected_labels_path.with_suffix(
+        f"{corrected_labels_path.suffix}.tmp"
+    )
+    try:
+        with temporary_path.open("wb") as handle:
+            np.save(handle, corrected_array, allow_pickle=False)
+        temporary_path.replace(corrected_labels_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    write_csv(cleaning_csv_path, history, CLEANING_FIELDS)
+    write_csv(cleaning_summary_path, [summary], SUMMARY_FIELDS)
+    write_csv(cleaning_per_class_path, per_class, PER_CLASS_FIELDS)
+    print(f"[CLEAN] corrected_labels={corrected_labels_path}")
+    del embeddings, neighbors, label_state
+    return summary
+
+
 def select_policy_queries(sample_count: int, step: int) -> Tensor:
     if POLICY_UPDATE_SAMPLES == sample_count:
         return torch.arange(sample_count)
@@ -1670,6 +1939,14 @@ def main() -> None:
     test_per_class_path = OUTPUT_DIR / TEST_PER_CLASS_CSV_FILENAME
     timing_csv_path = OUTPUT_DIR / TIMING_CSV_FILENAME
     run_summary_path = OUTPUT_DIR / RUN_SUMMARY_CSV_FILENAME
+    corrected_labels_path = (
+        CORRECTED_LABELS_OUTPUT_PATH
+        if CORRECTED_LABELS_OUTPUT_PATH is not None
+        else OUTPUT_DIR / "train_corrected_labels.npy"
+    )
+    cleaning_csv_path = OUTPUT_DIR / CLEANING_CSV_FILENAME
+    cleaning_summary_path = OUTPUT_DIR / CLEANING_SUMMARY_FILENAME
+    cleaning_per_class_path = OUTPUT_DIR / CLEANING_PER_CLASS_FILENAME
     write_csv(train_csv_path, [], SUMMARY_FIELDS)
 
     device = resolve_local_device()
@@ -1692,10 +1969,14 @@ def main() -> None:
         load_mnist_validation_test,
     )
     noisy_labels_cpu, noise_mask_cpu = measure(
-        "noise_injection",
+        (
+            "noise_artifact_load"
+            if EXTERNAL_NOISY_LABELS_PATH is not None
+            else "noise_injection"
+        ),
         device,
         timings,
-        lambda: inject_stratified_symmetric_noise(clean_labels_cpu),
+        lambda: load_noisy_label_artifacts(clean_labels_cpu),
     )
     evaluation_data: dict[str, tuple[Tensor, Tensor, Tensor, Tensor]] = {}
     for split, (split_images, split_clean_labels) in evaluation_splits.items():
@@ -1754,29 +2035,43 @@ def main() -> None:
         lambda: warm_device_kernels(model, raw_images, device, mean, std),
     )
 
-    val_images, val_clean_labels, val_noisy_labels, _ = evaluation_data["val"]
-    warmup_result = measure(
-        "supervised_warmup",
-        device,
-        timings,
-        lambda: train_supervised_warmup(
-            model,
-            raw_images,
-            noisy_labels_cpu,
-            val_images,
-            val_noisy_labels,
-            val_clean_labels,
+    if EXTERNAL_WARMUP_CHECKPOINT_PATH is None:
+        val_images, val_clean_labels, val_noisy_labels, _ = evaluation_data["val"]
+        warmup_result = measure(
+            "supervised_warmup",
             device,
-            mean,
-            std,
-            warmup_csv_path,
-            warmup_checkpoint_path,
-        ),
-    )
-    reset_classifier = getattr(model, "reset_classifier", None)
-    if not callable(reset_classifier):
-        raise TypeError("The warmup model cannot remove its classifier.")
-    reset_classifier(0)
+            timings,
+            lambda: train_supervised_warmup(
+                model,
+                raw_images,
+                noisy_labels_cpu,
+                val_images,
+                val_noisy_labels,
+                val_clean_labels,
+                device,
+                mean,
+                std,
+                warmup_csv_path,
+                warmup_checkpoint_path,
+            ),
+        )
+    else:
+        warmup_checkpoint_path = EXTERNAL_WARMUP_CHECKPOINT_PATH
+        warmup_result = measure(
+            "warmup_checkpoint_load",
+            device,
+            timings,
+            lambda: load_warmup_checkpoint(
+                model,
+                warmup_checkpoint_path,
+                device,
+            ),
+        )
+    if REMOVE_CLASSIFIER_FOR_RL:
+        reset_classifier = getattr(model, "reset_classifier", None)
+        if not callable(reset_classifier):
+            raise TypeError("The warmup model cannot remove its classifier.")
+        reset_classifier(0)
     for parameter in model.parameters():
         parameter.requires_grad = True
     model.to(
@@ -2155,6 +2450,26 @@ def main() -> None:
         f"epoch={restored_epoch}"
     )
 
+    cleaning_summary: dict[str, object] | None = None
+    if CLEANING_TRAJECTORY_LENGTH > 0:
+        cleaning_summary = clean_full_training_labels(
+            model=model,
+            policy=policy,
+            raw_images=raw_images,
+            clean_labels_cpu=clean_labels_cpu,
+            noisy_labels_cpu=noisy_labels_cpu,
+            noise_mask_cpu=noise_mask_cpu,
+            device=device,
+            mean=mean,
+            std=std,
+            timings=timings,
+            corrected_labels_path=corrected_labels_path,
+            cleaning_csv_path=cleaning_csv_path,
+            cleaning_summary_path=cleaning_summary_path,
+            cleaning_per_class_path=cleaning_per_class_path,
+            checkpoint_epoch=best_rl_epoch,
+        )
+
     test_images, test_clean, test_noisy, test_noise_mask = evaluation_data["test"]
     test_summary, test_per_class = evaluate_correction_split(
         split="test",
@@ -2178,11 +2493,13 @@ def main() -> None:
         f"{DATASET_STAGE_PREFIX}_load",
         f"{DATASET_STAGE_PREFIX}_eval_load",
         "noise_injection",
+        "noise_artifact_load",
         "val_noise_injection",
         "test_noise_injection",
         "model_init",
         "kernel_warmup",
         "supervised_warmup",
+        "warmup_checkpoint_load",
         "global_cache_feature_extraction",
         "global_cache_exact_knn",
     }
@@ -2224,7 +2541,7 @@ def main() -> None:
                 "warmup_best_clean_validation_accuracy": warmup_result[
                     "best_clean_validation_accuracy"
                 ],
-                "warmup_seconds": sum(timings["supervised_warmup"]),
+                "warmup_seconds": sum(timings.get("supervised_warmup", ())),
                 "rl_epochs": RL_EPOCHS,
                 "trajectory_length": TRAJECTORY_LENGTH,
                 "initial_state_randomization_rate": (
@@ -2238,6 +2555,27 @@ def main() -> None:
                 "knn_query_chunk_size": KNN_QUERY_CHUNK_SIZE,
                 "knn_reference_chunk_size": KNN_REFERENCE_CHUNK_SIZE,
                 "correction_chunk_size": CORRECTION_CHUNK_SIZE,
+                "cleaning_trajectory_length": CLEANING_TRAJECTORY_LENGTH,
+                "corrected_labels_path": (
+                    str(corrected_labels_path)
+                    if CLEANING_TRAJECTORY_LENGTH > 0
+                    else ""
+                ),
+                "cleaning_accuracy": (
+                    cleaning_summary["accuracy"]
+                    if cleaning_summary is not None
+                    else ""
+                ),
+                "cleaning_noisy_recovery_rate": (
+                    cleaning_summary["noisy_recovery_rate"]
+                    if cleaning_summary is not None
+                    else ""
+                ),
+                "cleaning_false_correction_rate": (
+                    cleaning_summary["false_correction_rate"]
+                    if cleaning_summary is not None
+                    else ""
+                ),
                 "rl_best_epoch": best_rl_epoch,
                 "rl_best_validation_accuracy": best_validation_summary[
                     "accuracy"
@@ -2314,6 +2652,11 @@ def main() -> None:
     print(f"warmup_checkpoint={warmup_checkpoint_path}")
     print(f"rl_best_checkpoint={rl_best_checkpoint_path}")
     print(f"rl_last_checkpoint={rl_last_checkpoint_path}")
+    if cleaning_summary is not None:
+        print(f"corrected_labels={corrected_labels_path}")
+        print(f"cleaning_csv={cleaning_csv_path}")
+        print(f"cleaning_summary_csv={cleaning_summary_path}")
+        print(f"cleaning_per_class_csv={cleaning_per_class_path}")
     print(f"train_csv={train_csv_path}")
     print(f"test_csv={test_csv_path}")
     print(f"test_per_class_csv={test_per_class_path}")
