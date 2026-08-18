@@ -40,7 +40,7 @@ from cifar_test.config_resent18 import CONFIG
 from cifar_test.resnet import build_cifar_resnet18
 
 if TYPE_CHECKING:
-    import mnist_test_rtx5080 as benchmark
+    import mnist_test_rtx5080.mnist_test_rtx5080 as benchmark
 else:
     import mnist_test_rtx5080 as benchmark
 
