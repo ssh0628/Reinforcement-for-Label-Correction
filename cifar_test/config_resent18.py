@@ -164,11 +164,19 @@ class ResNet18CIFARConfig:
         return self.warmup_output_dir / self.output.warmup_checkpoint_name
 
     @property
-    def rl_output_dir(self) -> Path:
-        return self.output_root / (
-            f"cifar10_rl_{self.warmup.model_id}_"
+    def experiment_id(self) -> str:
+        return (
+            f"{self.warmup.model_id}_"
             f"{self.rl.update_mode}_noise{self.noise_tag}"
         )
+
+    @property
+    def experiment_output_dir(self) -> Path:
+        return self.output_root / self.experiment_id
+
+    @property
+    def rl_output_dir(self) -> Path:
+        return self.experiment_output_dir / "rl"
 
     @property
     def actor_update_samples(self) -> int:
@@ -198,17 +206,11 @@ class ResNet18CIFARConfig:
 
     @property
     def finetune_output_dir(self) -> Path:
-        return self.output_root / (
-            f"cifar10_finetune_{self.warmup.model_id}_"
-            f"{self.rl.update_mode}_noise{self.noise_tag}"
-        )
+        return self.experiment_output_dir / "finetune"
 
     @property
     def final_test_output_dir(self) -> Path:
-        return self.output_root / (
-            f"cifar10_final_test_{self.warmup.model_id}_"
-            f"{self.rl.update_mode}_noise{self.noise_tag}"
-        )
+        return self.experiment_output_dir / "final_test"
 
     @property
     def finetune_checkpoint_path(self) -> Path:
