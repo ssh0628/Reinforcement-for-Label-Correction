@@ -1,6 +1,6 @@
 """Create the fixed ``resnet18_cifar10_sn40_warmup50`` warm-up artifact.
 
-The Full RL run loads the checkpoint produced here.
+Both full and subset RL runs load the checkpoint produced here.
 """
 
 from __future__ import annotations
@@ -57,48 +57,48 @@ def _validate_output_destination(*, include_log: bool) -> None:
 def main() -> None:
     _validate_input_artifacts()
     _validate_output_destination(include_log=False)
-    cifar.configure_benchmark()
-    benchmark = cifar.benchmark
-    benchmark.EXTERNAL_NOISY_LABELS_PATH = NOISY_LABELS_PATH
-    benchmark.EXTERNAL_NOISE_MASK_PATH = NOISE_MASK_PATH
+    cifar.configure_engine()
+    engine = cifar.engine
+    engine.EXTERNAL_NOISY_LABELS_PATH = NOISY_LABELS_PATH
+    engine.EXTERNAL_NOISE_MASK_PATH = NOISE_MASK_PATH
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    device = benchmark.resolve_local_device()
-    benchmark.seed_everything(cifar.SEED)
-    torch.backends.cudnn.benchmark = benchmark.CUDNN_BENCHMARK
+    device = engine.resolve_local_device()
+    engine.seed_everything(cifar.SEED)
+    torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
     torch.cuda.reset_peak_memory_stats()
     timings: dict[str, list[float]] = {}
 
-    raw_images, clean_labels = benchmark.measure(
+    raw_images, clean_labels = engine.measure(
         "cifar10_load",
         device,
         timings,
         cifar.load_full_cifar10_train,
     )
-    noisy_labels, noise_mask = benchmark.measure(
+    noisy_labels, noise_mask = engine.measure(
         "noise_artifact_load",
         device,
         timings,
-        lambda: benchmark.load_noisy_label_artifacts(clean_labels),
+        lambda: engine.load_noisy_label_artifacts(clean_labels),
     )
-    evaluation_splits = benchmark.measure(
+    evaluation_splits = engine.measure(
         "cifar10_eval_load",
         device,
         timings,
         cifar.load_cifar10_validation_test,
     )
     val_images, val_clean_labels = evaluation_splits["val"]
-    val_noisy_labels, _ = benchmark.measure(
+    val_noisy_labels, _ = engine.measure(
         "val_noise_injection",
         device,
         timings,
-        lambda: benchmark.inject_stratified_symmetric_noise(
+        lambda: engine.inject_stratified_symmetric_noise(
             val_clean_labels
         ),
     )
 
-    benchmark.print_configuration(
+    engine.print_configuration(
         device,
         clean_labels,
         noisy_labels,
@@ -108,7 +108,7 @@ def main() -> None:
     print(f"noise_mask_path={NOISE_MASK_PATH}")
     print(f"warmup_output={WARMUP_CHECKPOINT_PATH}")
 
-    model = benchmark.measure(
+    model = engine.measure(
         "model_init",
         device,
         timings,
@@ -116,7 +116,7 @@ def main() -> None:
             device=device,
             memory_format=(
                 torch.channels_last
-                if benchmark.USE_CHANNELS_LAST
+                if engine.USE_CHANNELS_LAST
                 else torch.contiguous_format
             ),
         ),
@@ -129,11 +129,11 @@ def main() -> None:
         cifar.CIFAR10_STD,
         device=device,
     ).reshape(1, 3, 1, 1)
-    benchmark.measure(
+    engine.measure(
         "kernel_warmup",
         device,
         timings,
-        lambda: benchmark.warm_device_kernels(
+        lambda: engine.warm_device_kernels(
             model,
             raw_images,
             device,
@@ -141,11 +141,11 @@ def main() -> None:
             std,
         ),
     )
-    result = benchmark.measure(
+    result = engine.measure(
         "supervised_warmup",
         device,
         timings,
-        lambda: benchmark.train_supervised_warmup(
+        lambda: engine.train_supervised_warmup(
             model,
             raw_images,
             noisy_labels,
@@ -159,12 +159,12 @@ def main() -> None:
             WARMUP_CHECKPOINT_PATH,
         ),
     )
-    benchmark.write_csv(
+    engine.write_csv(
         TIMING_CSV_PATH,
-        benchmark.build_timing_rows(timings),
-        benchmark.TIMING_FIELDS,
+        engine.build_timing_rows(timings),
+        engine.TIMING_FIELDS,
     )
-    benchmark.print_timing_summary(timings)
+    engine.print_timing_summary(timings)
     print(
         f"[OK] deployment={result['deployment_mode']} "
         f"deployment_epoch={result['deployment_epoch']} "
@@ -180,8 +180,8 @@ def run_with_file_logging() -> None:
     _validate_output_destination(include_log=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with RUN_LOG_PATH.open("w", encoding="utf-8", buffering=1) as handle:
-        stdout = cifar.benchmark.TeeStream(sys.stdout, handle)
-        stderr = cifar.benchmark.TeeStream(sys.stderr, handle)
+        stdout = cifar.engine.TeeStream(sys.stdout, handle)
+        stderr = cifar.engine.TeeStream(sys.stderr, handle)
         with redirect_stdout(stdout), redirect_stderr(stderr):
             print(f"run_log={RUN_LOG_PATH}")
             main()

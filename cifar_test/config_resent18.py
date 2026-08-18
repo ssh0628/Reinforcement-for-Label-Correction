@@ -1,8 +1,8 @@
 """Single source of truth for the CIFAR-10 ResNet-18 experiment.
 
-Edit this file before moving the project to another machine.  The fixed
-warm-up artifact is identified by ``resnet18_cifar10_sn40_warmup50``; change
-that identifier whenever settings that affect warm-up training are changed.
+Edit this file before moving the project to another machine. In particular,
+``DataConfig.root`` and ``OutputConfig.root`` may be changed to absolute paths
+on the training machine. No output path is tied to the repository location.
 """
 
 from __future__ import annotations
@@ -11,12 +11,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-
 @dataclass(frozen=True, slots=True)
 class DataConfig:
-    root: Path = PROJECT_ROOT / "data" / "cifar10"
+    # Change to an absolute path on the training machine if desired.
+    root: Path = Path("data/cifar10")
     download: bool = True
     classes: tuple[int, ...] = tuple(range(10))
     train_samples: int = 50_000
@@ -31,27 +29,20 @@ class DataConfig:
 class ModelConfig:
     name: str = "cifar_resnet18"
     pretrained: bool = False
-    drop_rate: float = 0.0
-    drop_path_rate: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
 class WarmupConfig:
     model_id: str = "resnet18_cifar10_sn40_warmup50"
     epochs: int = 50
-    freeze_epochs: int = 0
     batch_size: int = 128
-    eval_batch_size: int = 1024 #256
+    eval_batch_size: int = 1_024
     optimizer: str = "sgd"
     learning_rate: float = 1e-2
     momentum: float = 0.9
     weight_decay: float = 5e-4
-    label_smoothing: float = 0.0
-    grad_clip_norm: float | None = None
-    scheduler: str = "step_halfway"
     lr_decay_fraction: float = 0.5
     lr_decay_factor: float = 0.1
-    deployment_checkpoint: str = "best"
     min_noisy_validation_accuracy: float = 0.0
 
 
@@ -59,8 +50,8 @@ class WarmupConfig:
 class KNNConfig:
     k: int = 10
     temperature: float = 0.5
-    query_chunk_size: int = 4096 #2_048
-    reference_chunk_size: int = 65536 #32_768
+    query_chunk_size: int = 4_096
+    reference_chunk_size: int = 65_536
     correction_chunk_size: int = 16_384
 
 
@@ -70,9 +61,10 @@ class RLConfig:
     trajectory_length: int = 10
     cleaning_trajectory_length: int = 25
     initial_state_randomization_rate: float = 0.10
-    feature_batch_size: int = 1024 #128
-    update_mode: str = "full"
-    update_batch_size: int = 512 #128
+    feature_batch_size: int = 1_024
+    update_mode: str = "full"  # "full" or "subset"
+    subset_size: int = 5_000
+    update_batch_size: int = 512
 
     actor_optimizer: str = "sgd"
     actor_learning_rate: float = 1e-2
@@ -89,7 +81,21 @@ class RLConfig:
     reward_nla_weight: float = 0.5
     lr_decay_fraction: float = 0.5
     lr_decay_factor: float = 0.1
-    deployment_checkpoint: str = "last"
+
+
+@dataclass(frozen=True, slots=True)
+class OutputConfig:
+    # This is intentionally not based on PROJECT_ROOT. Set an absolute path
+    # here when running on another machine, e.g. Path("/mnt/results/rlnlc").
+    root: Path = Path("outputs")
+
+    warmup_checkpoint_name: str = "resnet18_cifar10_sn40_warmup50.pt"
+    actor_best_checkpoint_name: str = "actor_best.pt"
+    actor_last_checkpoint_name: str = "actor_last.pt"
+    critic_best_checkpoint_name: str = "critic_best.pt"
+    critic_last_checkpoint_name: str = "critic_last.pt"
+    corrected_labels_name: str = "train_corrected_labels.npy"
+    finetune_checkpoint_name: str = "finetune_last.pt"
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +108,6 @@ class FineTuneConfig:
     weight_decay: float = 5e-4
     lr_decay_fraction: float = 0.5
     lr_decay_factor: float = 0.1
-    label_smoothing: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +116,7 @@ class RuntimeConfig:
     amp_dtype: str = "bfloat16"
     use_channels_last: bool = True
     cudnn_benchmark: bool = True
-    final_test_batch_size: int = 1024 #256
+    final_test_batch_size: int = 1_024
     overwrite_noise: bool = False
     overwrite_warmup: bool = False
     overwrite_rl: bool = False
@@ -121,14 +126,18 @@ class RuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class ResNet18CIFARConfig:
-    output_root: Path = PROJECT_ROOT / "outputs"
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     warmup: WarmupConfig = field(default_factory=WarmupConfig)
     knn: KNNConfig = field(default_factory=KNNConfig)
     rl: RLConfig = field(default_factory=RLConfig)
     finetune: FineTuneConfig = field(default_factory=FineTuneConfig)
+    output: OutputConfig = field(default_factory=OutputConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+
+    @property
+    def output_root(self) -> Path:
+        return self.output.root.expanduser()
 
     @property
     def noise_tag(self) -> int:
@@ -153,7 +162,7 @@ class ResNet18CIFARConfig:
 
     @property
     def warmup_checkpoint_path(self) -> Path:
-        return self.warmup_output_dir / f"{self.warmup.model_id}.pt"
+        return self.warmup_output_dir / self.output.warmup_checkpoint_name
 
     @property
     def rl_output_dir(self) -> Path:
@@ -163,16 +172,48 @@ class ResNet18CIFARConfig:
         )
 
     @property
+    def actor_update_samples(self) -> int:
+        if self.rl.update_mode == "full":
+            return self.data.train_samples
+        return self.rl.subset_size
+
+    @property
+    def actor_best_checkpoint_path(self) -> Path:
+        return self.rl_output_dir / self.output.actor_best_checkpoint_name
+
+    @property
+    def actor_last_checkpoint_path(self) -> Path:
+        return self.rl_output_dir / self.output.actor_last_checkpoint_name
+
+    @property
+    def critic_best_checkpoint_path(self) -> Path:
+        return self.rl_output_dir / self.output.critic_best_checkpoint_name
+
+    @property
+    def critic_last_checkpoint_path(self) -> Path:
+        return self.rl_output_dir / self.output.critic_last_checkpoint_name
+
+    @property
+    def corrected_labels_path(self) -> Path:
+        return self.rl_output_dir / self.output.corrected_labels_name
+
+    @property
     def finetune_output_dir(self) -> Path:
         return self.output_root / (
-            f"cifar10_finetune_{self.warmup.model_id}_noise{self.noise_tag}"
+            f"cifar10_finetune_{self.warmup.model_id}_"
+            f"{self.rl.update_mode}_noise{self.noise_tag}"
         )
 
     @property
     def final_test_output_dir(self) -> Path:
         return self.output_root / (
-            f"cifar10_final_test_{self.warmup.model_id}_noise{self.noise_tag}"
+            f"cifar10_final_test_{self.warmup.model_id}_"
+            f"{self.rl.update_mode}_noise{self.noise_tag}"
         )
+
+    @property
+    def finetune_checkpoint_path(self) -> Path:
+        return self.finetune_output_dir / self.output.finetune_checkpoint_name
 
     def validate(self) -> None:
         if self.model.pretrained:
@@ -189,17 +230,35 @@ class ResNet18CIFARConfig:
             raise ValueError("This paper-style baseline requires SGD.")
         if self.rl.critic_optimizer != "sgd" or self.finetune.optimizer != "sgd":
             raise ValueError("Critic and fine-tuning optimizers must be SGD.")
-        if self.rl.update_mode != "full":
-            raise ValueError("This baseline requires full actor updates.")
-        if self.warmup.deployment_checkpoint != "best":
-            raise ValueError("Warm-up deployment must use the best checkpoint.")
-        if self.rl.deployment_checkpoint != "last":
-            raise ValueError("RL deployment must use the last checkpoint.")
+        if self.rl.update_mode not in {"full", "subset"}:
+            raise ValueError("rl.update_mode must be 'full' or 'subset'.")
+        if not 0 < self.rl.subset_size <= self.data.train_samples:
+            raise ValueError(
+                "rl.subset_size must be in [1, data.train_samples]."
+            )
+        if self.rl.update_batch_size > self.actor_update_samples:
+            raise ValueError(
+                "rl.update_batch_size cannot exceed actor_update_samples."
+            )
+        if self.knn.k >= self.data.train_samples:
+            raise ValueError("knn.k must be smaller than data.train_samples.")
+        output_names = (
+            self.output.warmup_checkpoint_name,
+            self.output.actor_best_checkpoint_name,
+            self.output.actor_last_checkpoint_name,
+            self.output.critic_best_checkpoint_name,
+            self.output.critic_last_checkpoint_name,
+            self.output.corrected_labels_name,
+            self.output.finetune_checkpoint_name,
+        )
+        if not all(name and Path(name).name == name for name in output_names):
+            raise ValueError("Output artifact names must be non-empty filenames.")
         positive_values = (
             self.warmup.epochs,
             self.warmup.batch_size,
             self.rl.epochs,
             self.rl.trajectory_length,
+            self.rl.feature_batch_size,
             self.rl.update_batch_size,
             self.knn.k,
             self.knn.temperature,

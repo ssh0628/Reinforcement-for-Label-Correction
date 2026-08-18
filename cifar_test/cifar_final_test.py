@@ -23,8 +23,7 @@ else:
 
 
 CONFIG = cifar.CONFIG
-SOURCE_FINETUNE_OUTPUT_DIR = CONFIG.finetune_output_dir
-FINETUNE_CHECKPOINT_PATH = SOURCE_FINETUNE_OUTPUT_DIR / "finetune_last.pt"
+FINETUNE_CHECKPOINT_PATH = CONFIG.finetune_checkpoint_path
 OUTPUT_DIR = CONFIG.final_test_output_dir
 
 TEST_BATCH_SIZE = CONFIG.runtime.final_test_batch_size
@@ -107,7 +106,7 @@ def _load_model(device: torch.device) -> nn.Module:
         device=device,
         memory_format=(
             torch.channels_last
-            if cifar.benchmark.USE_CHANNELS_LAST
+            if cifar.engine.USE_CHANNELS_LAST
             else torch.contiguous_format
         ),
     )
@@ -156,7 +155,7 @@ def _evaluate(
     device: torch.device,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     model.eval()
-    benchmark = cifar.benchmark
+    engine = cifar.engine
     mean = torch.tensor(cifar.CIFAR10_MEAN, device=device).reshape(
         1, 3, 1, 1
     )
@@ -182,8 +181,8 @@ def _evaluate(
         targets = labels[start:end].to(device, non_blocking=True)
         with torch.autocast(
             device_type="cuda",
-            dtype=benchmark.AMP_DTYPE,
-            enabled=benchmark.USE_AMP,
+            dtype=engine.AMP_DTYPE,
+            enabled=engine.USE_AMP,
         ):
             logits = model(batch_images)
             loss = criterion(logits, targets)
@@ -212,11 +211,11 @@ def main() -> None:
     _validate_paths(include_log=False)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    cifar.configure_benchmark()
-    benchmark = cifar.benchmark
-    device = benchmark.resolve_local_device()
-    benchmark.seed_everything(SEED)
-    torch.backends.cudnn.benchmark = benchmark.CUDNN_BENCHMARK
+    cifar.configure_engine()
+    engine = cifar.engine
+    device = engine.resolve_local_device()
+    engine.seed_everything(SEED)
+    torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
 
     test_images, test_labels = cifar.load_full_cifar10_test()
     if test_images.size(0) != 10_000 or test_labels.size(0) != 10_000:
@@ -226,7 +225,7 @@ def main() -> None:
     print(f"device={device} ({torch.cuda.get_device_name(device)})")
     print(f"checkpoint={FINETUNE_CHECKPOINT_PATH}")
     print(f"official_test_samples={test_labels.numel()}")
-    benchmark.synchronize(device)
+    engine.synchronize(device)
     started = time.perf_counter()
     summary, per_class = _evaluate(
         model,
@@ -234,7 +233,7 @@ def main() -> None:
         test_labels,
         device,
     )
-    benchmark.synchronize(device)
+    engine.synchronize(device)
     elapsed = time.perf_counter() - started
     summary["elapsed_seconds"] = elapsed
     if not math.isfinite(float(summary["loss"])):
@@ -258,8 +257,8 @@ def run_with_file_logging() -> None:
     _validate_paths(include_log=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with RUN_LOG_PATH.open("w", encoding="utf-8", buffering=1) as handle:
-        stdout = cifar.benchmark.TeeStream(sys.stdout, handle)
-        stderr = cifar.benchmark.TeeStream(sys.stderr, handle)
+        stdout = cifar.engine.TeeStream(sys.stdout, handle)
+        stderr = cifar.engine.TeeStream(sys.stderr, handle)
         with redirect_stdout(stdout), redirect_stderr(stderr):
             print(f"run_log={RUN_LOG_PATH}")
             main()

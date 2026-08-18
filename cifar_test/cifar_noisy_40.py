@@ -26,7 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from cifar_test.config_resent18 import CONFIG
 
 
-CIFAR10_ROOT = CONFIG.data.root
+CIFAR10_ROOT = CONFIG.data.root.expanduser()
 OUTPUT_DIR = CONFIG.noise_output_dir
 NOISE_RATE = CONFIG.data.noise_rate
 SEED = CONFIG.data.seed

@@ -1,8 +1,8 @@
-"""Paper-aligned CIFAR-10 symmetric-noise RLNLC baseline.
+"""Paper-aligned CIFAR-10 symmetric-noise RLNLC experiment.
 
 The actor is a CIFAR-stem ResNet-18 trained with the optimizer and schedule
-reported by the paper.  Every policy update uses all 50,000 training samples.
-After 500 RL epochs, the last actor performs 25-step label cleaning.
+reported by the paper. Actor updates can use either the full training set or
+a configured subset. After training, the last actor performs label cleaning.
 
 Experiment profile
 ------------------
@@ -12,21 +12,18 @@ Experiment profile
 - CIFAR-stem ResNet-18 without pretrained weights; native 32x32 inputs.
 - 50 supervised warmup epochs with SGD.
 - 500 RL epochs x 10 trajectory steps.
-- Full actor update: all 50,000 samples per RL step.
+- Actor update mode and sample count are selected in ``config_resent18.py``.
 - The best checkpoint is retained for diagnostics, but the last actor is used
   for cleaning and held-out evaluation to avoid clean-validation selection.
 
-The common engine is imported rather than copied so fixes to RL, KNN, metrics,
-checkpointing, and timing cannot silently diverge between MNIST and CIFAR-10.
-All experiment values and output paths come from ``config_resent18.py``.
+The CIFAR-only engine lives beside this entry point. All experiment values and
+output paths come from ``config_resent18.py``.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
-
 import torch
 from torch import Tensor, nn
 from torchvision.datasets import CIFAR10
@@ -37,15 +34,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from cifar_test.config_resent18 import CONFIG
+from cifar_test import rl_engine as engine
 from cifar_test.resnet import build_cifar_resnet18
 
-if TYPE_CHECKING:
-    import mnist_test_rtx5080.mnist_test_rtx5080 as benchmark
-else:
-    import mnist_test_rtx5080 as benchmark
 
-
-CIFAR10_ROOT = CONFIG.data.root
+CIFAR10_ROOT = CONFIG.data.root.expanduser()
 DOWNLOAD_CIFAR10 = CONFIG.data.download
 NOISY_LABELS_PATH = CONFIG.noise_output_dir / "train_noisy_labels.npy"
 NOISE_MASK_PATH = CONFIG.noise_output_dir / "train_noise_mask.npy"
@@ -60,7 +53,7 @@ SEED = CONFIG.data.seed
 ACTOR_UPDATE_MODE = CONFIG.rl.update_mode
 OUTPUT_DIR = CONFIG.rl_output_dir
 CLEANING_TRAJECTORY_LENGTH = CONFIG.rl.cleaning_trajectory_length
-CORRECTED_LABELS_PATH = OUTPUT_DIR / "train_corrected_labels.npy"
+CORRECTED_LABELS_PATH = CONFIG.corrected_labels_path
 OVERWRITE = CONFIG.runtime.overwrite_rl
 
 MODEL_NAME = CONFIG.model.name
@@ -70,13 +63,10 @@ CIFAR10_MEAN = CONFIG.data.mean
 CIFAR10_STD = CONFIG.data.std
 
 WARMUP_EPOCHS = CONFIG.warmup.epochs
-WARMUP_FREEZE_EPOCHS = CONFIG.warmup.freeze_epochs
 WARMUP_BATCH_SIZE = CONFIG.warmup.batch_size
 WARMUP_EVAL_BATCH_SIZE = CONFIG.warmup.eval_batch_size
 WARMUP_LR = CONFIG.warmup.learning_rate
 WARMUP_WEIGHT_DECAY = CONFIG.warmup.weight_decay
-WARMUP_LABEL_SMOOTHING = CONFIG.warmup.label_smoothing
-WARMUP_GRAD_CLIP_NORM = CONFIG.warmup.grad_clip_norm
 WARMUP_MIN_NOISY_VALIDATION_ACCURACY = (
     CONFIG.warmup.min_noisy_validation_accuracy
 )
@@ -108,22 +98,27 @@ LR_DECAY_FACTOR = CONFIG.rl.lr_decay_factor
 LR_DECAY_FRACTION = CONFIG.rl.lr_decay_fraction
 
 RL_OUTPUT_FILENAMES = (
-    benchmark.RUN_LOG_FILENAME,
-    benchmark.RL_BEST_CHECKPOINT_FILENAME,
-    benchmark.RL_LAST_CHECKPOINT_FILENAME,
-    benchmark.TRAIN_CSV_FILENAME,
-    benchmark.TEST_CSV_FILENAME,
-    benchmark.TEST_PER_CLASS_CSV_FILENAME,
-    benchmark.TIMING_CSV_FILENAME,
-    benchmark.RUN_SUMMARY_CSV_FILENAME,
-    benchmark.CLEANING_CSV_FILENAME,
-    benchmark.CLEANING_SUMMARY_FILENAME,
-    benchmark.CLEANING_PER_CLASS_FILENAME,
+    engine.RUN_LOG_FILENAME,
+    engine.TRAIN_CSV_FILENAME,
+    engine.TEST_CSV_FILENAME,
+    engine.TEST_PER_CLASS_CSV_FILENAME,
+    engine.TIMING_CSV_FILENAME,
+    engine.RUN_SUMMARY_CSV_FILENAME,
+    engine.CLEANING_CSV_FILENAME,
+    engine.CLEANING_SUMMARY_FILENAME,
+    engine.CLEANING_PER_CLASS_FILENAME,
+)
+RL_CHECKPOINT_PATHS = (
+    CONFIG.actor_best_checkpoint_path,
+    CONFIG.actor_last_checkpoint_path,
+    CONFIG.critic_best_checkpoint_path,
+    CONFIG.critic_last_checkpoint_path,
 )
 
 
 def validate_output_destination() -> None:
     paths = [OUTPUT_DIR / filename for filename in RL_OUTPUT_FILENAMES]
+    paths.extend(RL_CHECKPOINT_PATHS)
     paths.append(CORRECTED_LABELS_PATH)
     existing = [path for path in paths if path.exists()]
     if existing and not OVERWRITE:
@@ -146,7 +141,7 @@ def validate_input_artifacts() -> None:
 
 def _as_image_tensor(dataset: CIFAR10) -> Tensor:
     """Convert torchvision's NHWC uint8 array to pinned NCHW storage."""
-    return benchmark.pin_for_cuda(
+    return engine.pin_for_cuda(
         torch.from_numpy(dataset.data).permute(0, 3, 1, 2).contiguous()
     )
 
@@ -158,7 +153,7 @@ def load_full_cifar10_train() -> tuple[Tensor, Tensor]:
         download=DOWNLOAD_CIFAR10,
     )
     images = _as_image_tensor(dataset)
-    labels = benchmark.pin_for_cuda(
+    labels = engine.pin_for_cuda(
         torch.tensor(dataset.targets, dtype=torch.long).contiguous()
     )
     if images.size(0) != EXPECTED_SAMPLES or labels.size(0) != EXPECTED_SAMPLES:
@@ -194,8 +189,8 @@ def load_cifar10_validation_test() -> dict[str, tuple[Tensor, Tensor]]:
     for split, chunks in split_indices.items():
         indices = torch.cat(chunks)
         indices = indices[torch.randperm(indices.numel(), generator=generator)]
-        images = benchmark.pin_for_cuda(all_images[indices].contiguous())
-        split_labels = benchmark.pin_for_cuda(labels[indices].contiguous())
+        images = engine.pin_for_cuda(all_images[indices].contiguous())
+        split_labels = engine.pin_for_cuda(labels[indices].contiguous())
         if set(split_labels.tolist()) != set(CLASSES):
             raise RuntimeError(f"CIFAR-10 {split} split is missing a class.")
         result[split] = (images, split_labels)
@@ -213,7 +208,7 @@ def load_full_cifar10_test() -> tuple[Tensor, Tensor]:
         download=DOWNLOAD_CIFAR10,
     )
     images = _as_image_tensor(dataset)
-    labels = benchmark.pin_for_cuda(
+    labels = engine.pin_for_cuda(
         torch.tensor(dataset.targets, dtype=torch.long).contiguous()
     )
     if images.size(0) != 10_000 or labels.size(0) != 10_000:
@@ -249,102 +244,96 @@ def preprocess_cifar10(
     images = images.contiguous(
         memory_format=(
             torch.channels_last
-            if benchmark.USE_CHANNELS_LAST
+            if engine.USE_CHANNELS_LAST
             else torch.contiguous_format
         )
     )
     return (images - mean) / std
 
 
-def configure_benchmark() -> None:
-    benchmark.DATASET_NAME = "CIFAR-10"
-    benchmark.DATASET_STAGE_PREFIX = "cifar10"
-    benchmark.DIGITS = CLASSES
-    benchmark.NUM_CLASSES = NUM_CLASSES
-    benchmark.EXPECTED_SAMPLES = EXPECTED_SAMPLES
-    benchmark.NOISE_RATE = NOISE_RATE
-    benchmark.SEED = SEED
-    benchmark.ACTOR_UPDATE_MODE = ACTOR_UPDATE_MODE
-    benchmark.POLICY_UPDATE_SUBSET_SIZE = EXPECTED_SAMPLES
-    benchmark.POLICY_UPDATE_SAMPLES = EXPECTED_SAMPLES
-    benchmark.OUTPUT_DIR = OUTPUT_DIR
-    benchmark.EXTERNAL_NOISY_LABELS_PATH = NOISY_LABELS_PATH
-    benchmark.EXTERNAL_NOISE_MASK_PATH = NOISE_MASK_PATH
-    benchmark.EXTERNAL_WARMUP_CHECKPOINT_PATH = WARMUP_CHECKPOINT_PATH
-    # Preserve the warmup classifier head so the RL checkpoint can be
-    # fine-tuned directly on the cleaned labels.
-    benchmark.REMOVE_CLASSIFIER_FOR_RL = False
-    benchmark.CLEANING_TRAJECTORY_LENGTH = CLEANING_TRAJECTORY_LENGTH
-    benchmark.CORRECTED_LABELS_OUTPUT_PATH = CORRECTED_LABELS_PATH
-
-    benchmark.MODEL_NAME = MODEL_NAME
-    benchmark.WARMUP_MODEL_ID = CONFIG.warmup.model_id
-    benchmark.MODEL_FACTORY = build_cifar_resnet18
-    benchmark.PRETRAINED = PRETRAINED
-    benchmark.IMAGE_SIZE = IMAGE_SIZE
-    benchmark.DROP_RATE = CONFIG.model.drop_rate
-    benchmark.DROP_PATH_RATE = CONFIG.model.drop_path_rate
-    benchmark.IMAGENET_MEAN = CIFAR10_MEAN
-    benchmark.IMAGENET_STD = CIFAR10_STD
-    benchmark.WARMUP_EPOCHS = WARMUP_EPOCHS
-    benchmark.WARMUP_FREEZE_EPOCHS = WARMUP_FREEZE_EPOCHS
-    benchmark.WARMUP_BATCH_SIZE = WARMUP_BATCH_SIZE
-    benchmark.WARMUP_EVAL_BATCH_SIZE = WARMUP_EVAL_BATCH_SIZE
-    benchmark.WARMUP_HEAD_LR = WARMUP_LR
-    benchmark.WARMUP_BACKBONE_LR = WARMUP_LR
-    benchmark.WARMUP_UNFROZEN_HEAD_LR = WARMUP_LR
-    benchmark.WARMUP_WEIGHT_DECAY = WARMUP_WEIGHT_DECAY
-    benchmark.WARMUP_LABEL_SMOOTHING = WARMUP_LABEL_SMOOTHING
-    benchmark.WARMUP_GRAD_CLIP_NORM = WARMUP_GRAD_CLIP_NORM
-    benchmark.WARMUP_OPTIMIZER_NAME = CONFIG.warmup.optimizer
-    benchmark.WARMUP_MOMENTUM = CONFIG.warmup.momentum
-    benchmark.WARMUP_SCHEDULER_NAME = CONFIG.warmup.scheduler
-    benchmark.WARMUP_LR_DECAY_FRACTION = CONFIG.warmup.lr_decay_fraction
-    benchmark.WARMUP_LR_DECAY_FACTOR = CONFIG.warmup.lr_decay_factor
-    benchmark.WARMUP_DEPLOY_CHECKPOINT = (
-        CONFIG.warmup.deployment_checkpoint
+def configure_engine() -> None:
+    engine.DATASET_NAME = "CIFAR-10"
+    engine.DATASET_STAGE_PREFIX = "cifar10"
+    engine.CLASS_IDS = CLASSES
+    engine.NUM_CLASSES = NUM_CLASSES
+    engine.EXPECTED_SAMPLES = EXPECTED_SAMPLES
+    engine.NOISE_RATE = NOISE_RATE
+    engine.SEED = SEED
+    engine.ACTOR_UPDATE_MODE = ACTOR_UPDATE_MODE
+    engine.POLICY_UPDATE_SUBSET_SIZE = CONFIG.rl.subset_size
+    engine.POLICY_UPDATE_SAMPLES = CONFIG.actor_update_samples
+    engine.OUTPUT_DIR = OUTPUT_DIR
+    engine.ACTOR_BEST_CHECKPOINT_FILENAME = (
+        CONFIG.output.actor_best_checkpoint_name
     )
-    benchmark.WARMUP_MIN_NOISY_VALIDATION_ACCURACY = (
+    engine.ACTOR_LAST_CHECKPOINT_FILENAME = (
+        CONFIG.output.actor_last_checkpoint_name
+    )
+    engine.CRITIC_BEST_CHECKPOINT_FILENAME = (
+        CONFIG.output.critic_best_checkpoint_name
+    )
+    engine.CRITIC_LAST_CHECKPOINT_FILENAME = (
+        CONFIG.output.critic_last_checkpoint_name
+    )
+    engine.EXTERNAL_NOISY_LABELS_PATH = NOISY_LABELS_PATH
+    engine.EXTERNAL_NOISE_MASK_PATH = NOISE_MASK_PATH
+    engine.EXTERNAL_WARMUP_CHECKPOINT_PATH = WARMUP_CHECKPOINT_PATH
+    engine.CLEANING_TRAJECTORY_LENGTH = CLEANING_TRAJECTORY_LENGTH
+    engine.CORRECTED_LABELS_OUTPUT_PATH = CORRECTED_LABELS_PATH
+
+    engine.MODEL_NAME = MODEL_NAME
+    engine.WARMUP_MODEL_ID = CONFIG.warmup.model_id
+    engine.MODEL_FACTORY = build_cifar_resnet18
+    engine.PRETRAINED = PRETRAINED
+    engine.IMAGE_SIZE = IMAGE_SIZE
+    engine.DATA_MEAN = CIFAR10_MEAN
+    engine.DATA_STD = CIFAR10_STD
+    engine.WARMUP_EPOCHS = WARMUP_EPOCHS
+    engine.WARMUP_BATCH_SIZE = WARMUP_BATCH_SIZE
+    engine.WARMUP_EVAL_BATCH_SIZE = WARMUP_EVAL_BATCH_SIZE
+    engine.WARMUP_LR = WARMUP_LR
+    engine.WARMUP_WEIGHT_DECAY = WARMUP_WEIGHT_DECAY
+    engine.WARMUP_MOMENTUM = CONFIG.warmup.momentum
+    engine.WARMUP_LR_DECAY_FRACTION = CONFIG.warmup.lr_decay_fraction
+    engine.WARMUP_LR_DECAY_FACTOR = CONFIG.warmup.lr_decay_factor
+    engine.WARMUP_MIN_NOISY_VALIDATION_ACCURACY = (
         WARMUP_MIN_NOISY_VALIDATION_ACCURACY
     )
-    benchmark.RL_EPOCHS = RL_EPOCHS
-    benchmark.TRAJECTORY_LENGTH = TRAJECTORY_LENGTH
-    benchmark.INITIAL_STATE_RANDOMIZATION_RATE = (
+    engine.RL_EPOCHS = RL_EPOCHS
+    engine.TRAJECTORY_LENGTH = TRAJECTORY_LENGTH
+    engine.INITIAL_STATE_RANDOMIZATION_RATE = (
         INITIAL_STATE_RANDOMIZATION_RATE
     )
-    benchmark.FEATURE_BATCH_SIZE = FEATURE_BATCH_SIZE
-    benchmark.POLICY_UPDATE_BATCH_SIZE = POLICY_UPDATE_BATCH_SIZE
-    benchmark.K = K
-    benchmark.TEMPERATURE = TEMPERATURE
-    benchmark.KNN_QUERY_CHUNK_SIZE = KNN_QUERY_CHUNK_SIZE
-    benchmark.KNN_REFERENCE_CHUNK_SIZE = KNN_REFERENCE_CHUNK_SIZE
-    benchmark.CORRECTION_CHUNK_SIZE = CORRECTION_CHUNK_SIZE
-    benchmark.ACTOR_OPTIMIZER_NAME = CONFIG.rl.actor_optimizer
-    benchmark.ACTOR_LR = ACTOR_LR
-    benchmark.ACTOR_MOMENTUM = ACTOR_MOMENTUM
-    benchmark.ACTOR_WEIGHT_DECAY = ACTOR_WEIGHT_DECAY
-    benchmark.CRITIC_LR = CRITIC_LR
-    benchmark.CRITIC_MOMENTUM = CRITIC_MOMENTUM
-    benchmark.CRITIC_WEIGHT_DECAY = CRITIC_WEIGHT_DECAY
-    benchmark.CRITIC_NUM_BINS = CRITIC_NUM_BINS
-    benchmark.DISCOUNT_FACTOR = DISCOUNT_FACTOR
-    benchmark.NLA_WEIGHT = NLA_WEIGHT
-    benchmark.LR_DECAY_FACTOR = LR_DECAY_FACTOR
-    benchmark.LR_DECAY_FRACTION = LR_DECAY_FRACTION
-    benchmark.RL_DEPLOY_CHECKPOINT = CONFIG.rl.deployment_checkpoint
-    benchmark.USE_AMP = CONFIG.runtime.use_amp
-    benchmark.AMP_DTYPE = getattr(torch, CONFIG.runtime.amp_dtype)
-    benchmark.USE_CHANNELS_LAST = CONFIG.runtime.use_channels_last
-    benchmark.CUDNN_BENCHMARK = CONFIG.runtime.cudnn_benchmark
+    engine.FEATURE_BATCH_SIZE = FEATURE_BATCH_SIZE
+    engine.POLICY_UPDATE_BATCH_SIZE = POLICY_UPDATE_BATCH_SIZE
+    engine.K = K
+    engine.TEMPERATURE = TEMPERATURE
+    engine.KNN_QUERY_CHUNK_SIZE = KNN_QUERY_CHUNK_SIZE
+    engine.KNN_REFERENCE_CHUNK_SIZE = KNN_REFERENCE_CHUNK_SIZE
+    engine.CORRECTION_CHUNK_SIZE = CORRECTION_CHUNK_SIZE
+    engine.ACTOR_LR = ACTOR_LR
+    engine.ACTOR_MOMENTUM = ACTOR_MOMENTUM
+    engine.ACTOR_WEIGHT_DECAY = ACTOR_WEIGHT_DECAY
+    engine.CRITIC_LR = CRITIC_LR
+    engine.CRITIC_MOMENTUM = CRITIC_MOMENTUM
+    engine.CRITIC_WEIGHT_DECAY = CRITIC_WEIGHT_DECAY
+    engine.CRITIC_NUM_BINS = CRITIC_NUM_BINS
+    engine.DISCOUNT_FACTOR = DISCOUNT_FACTOR
+    engine.NLA_WEIGHT = NLA_WEIGHT
+    engine.LR_DECAY_FACTOR = LR_DECAY_FACTOR
+    engine.LR_DECAY_FRACTION = LR_DECAY_FRACTION
+    engine.USE_AMP = CONFIG.runtime.use_amp
+    engine.AMP_DTYPE = getattr(torch, CONFIG.runtime.amp_dtype)
+    engine.USE_CHANNELS_LAST = CONFIG.runtime.use_channels_last
+    engine.CUDNN_BENCHMARK = CONFIG.runtime.cudnn_benchmark
 
-    # main() resolves these names in the imported engine module at runtime.
-    benchmark.load_full_mnist_train = load_full_cifar10_train
-    benchmark.load_mnist_validation_test = load_cifar10_validation_test
-    benchmark.preprocess = preprocess_cifar10
+    engine.TRAIN_DATA_LOADER = load_full_cifar10_train
+    engine.EVALUATION_DATA_LOADER = load_cifar10_validation_test
+    engine.PREPROCESS_FUNCTION = preprocess_cifar10
 
 
 if __name__ == "__main__":
-    configure_benchmark()
+    configure_engine()
     validate_input_artifacts()
     validate_output_destination()
-    benchmark.run_with_file_logging()
+    engine.run_with_file_logging()

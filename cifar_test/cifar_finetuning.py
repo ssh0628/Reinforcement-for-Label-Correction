@@ -28,11 +28,9 @@ else:
     from cifar_test import cifar_rl as cifar
 
 
-# Both artifacts come from the same paper-aligned Full run.
 CONFIG = cifar.CONFIG
-SOURCE_RL_OUTPUT_DIR = CONFIG.rl_output_dir
-RL_CHECKPOINT_PATH = SOURCE_RL_OUTPUT_DIR / "rl_last.pt"
-CORRECTED_LABELS_PATH = SOURCE_RL_OUTPUT_DIR / "train_corrected_labels.npy"
+ACTOR_CHECKPOINT_PATH = CONFIG.actor_last_checkpoint_path
+CORRECTED_LABELS_PATH = CONFIG.corrected_labels_path
 OUTPUT_DIR = CONFIG.finetune_output_dir
 
 FINETUNE_EPOCHS = CONFIG.finetune.epochs
@@ -44,13 +42,12 @@ LR_DECAY_EPOCH = round(
     FINETUNE_EPOCHS * CONFIG.finetune.lr_decay_fraction
 )
 LR_DECAY_FACTOR = CONFIG.finetune.lr_decay_factor
-LABEL_SMOOTHING = CONFIG.finetune.label_smoothing
 SEED = CONFIG.data.seed
 OVERWRITE = CONFIG.runtime.overwrite_finetune
 
 RUN_LOG_PATH = OUTPUT_DIR / "run.log"
 TRAIN_CSV_PATH = OUTPUT_DIR / "train.csv"
-FINAL_CHECKPOINT_PATH = OUTPUT_DIR / "finetune_last.pt"
+FINAL_CHECKPOINT_PATH = CONFIG.finetune_checkpoint_path
 
 TRAIN_FIELDS = (
     "epoch",
@@ -80,18 +77,18 @@ def _validate_output_destination(*, include_log: bool) -> None:
 def _validate_input_artifacts() -> None:
     missing = [
         path
-        for path in (RL_CHECKPOINT_PATH, CORRECTED_LABELS_PATH)
+        for path in (ACTOR_CHECKPOINT_PATH, CORRECTED_LABELS_PATH)
         if not path.is_file()
     ]
     if missing:
         raise FileNotFoundError(f"Fine-tuning inputs not found: {missing}")
     if (
-        RL_CHECKPOINT_PATH.parent.resolve()
+        ACTOR_CHECKPOINT_PATH.parent.resolve()
         != CORRECTED_LABELS_PATH.parent.resolve()
     ):
         raise ValueError(
-            "RL_CHECKPOINT_PATH and CORRECTED_LABELS_PATH must come from "
-            "the same Full RL output directory."
+            "ACTOR_CHECKPOINT_PATH and CORRECTED_LABELS_PATH must come from "
+            "the same RL output directory."
         )
 
 
@@ -123,41 +120,42 @@ def _load_corrected_labels(clean_labels: Tensor) -> Tensor:
         int(labels.min()) < 0 or int(labels.max()) >= cifar.NUM_CLASSES
     ):
         raise ValueError("Corrected labels contain an out-of-range class ID.")
-    return cifar.benchmark.pin_for_cuda(labels)
+    return cifar.engine.pin_for_cuda(labels)
 
 
-def _load_rl_model(device: torch.device) -> nn.Module:
-    if not RL_CHECKPOINT_PATH.is_file():
-        raise FileNotFoundError(f"RL checkpoint not found: {RL_CHECKPOINT_PATH}")
+def _load_actor(device: torch.device) -> nn.Module:
+    if not ACTOR_CHECKPOINT_PATH.is_file():
+        raise FileNotFoundError(
+            f"Actor checkpoint not found: {ACTOR_CHECKPOINT_PATH}"
+        )
     checkpoint = torch.load(
-        RL_CHECKPOINT_PATH,
+        ACTOR_CHECKPOINT_PATH,
         map_location="cpu",
         weights_only=True,
     )
     if not isinstance(checkpoint, dict):
-        raise TypeError("RL checkpoint must contain a dictionary.")
+        raise TypeError("Actor checkpoint must contain a dictionary.")
     required = {"model", "model_name", "num_classes", "epoch"}
     missing = required.difference(checkpoint)
     if missing:
-        raise KeyError(f"RL checkpoint is missing fields: {sorted(missing)}")
+        raise KeyError(f"Actor checkpoint is missing fields: {sorted(missing)}")
     if checkpoint["model_name"] != cifar.MODEL_NAME:
-        raise ValueError("RL checkpoint model name does not match CIFAR config.")
+        raise ValueError("Actor checkpoint model name does not match CIFAR config.")
     if int(checkpoint["num_classes"]) != cifar.NUM_CLASSES:
-        raise ValueError("RL checkpoint class count does not match CIFAR-10.")
+        raise ValueError("Actor checkpoint class count does not match CIFAR-10.")
 
     model = cifar.build_model()
     try:
         model.load_state_dict(checkpoint["model"], strict=True)
     except RuntimeError as error:
         raise RuntimeError(
-            "The RL checkpoint does not contain the warmup classifier head. "
-            "Run CIFAR RL with REMOVE_CLASSIFIER_FOR_RL=False."
+            "The actor checkpoint does not contain the classifier head."
         ) from error
     model.to(
         device=device,
         memory_format=(
             torch.channels_last
-            if cifar.benchmark.USE_CHANNELS_LAST
+            if cifar.engine.USE_CHANNELS_LAST
             else torch.contiguous_format
         ),
     )
@@ -172,7 +170,7 @@ def _save_checkpoint(model: nn.Module) -> None:
         "epoch": FINETUNE_EPOCHS,
         "model_name": cifar.MODEL_NAME,
         "num_classes": cifar.NUM_CLASSES,
-        "source_rl_checkpoint": str(RL_CHECKPOINT_PATH),
+        "source_actor_checkpoint": str(ACTOR_CHECKPOINT_PATH),
         "corrected_labels": str(CORRECTED_LABELS_PATH),
         "optimizer": CONFIG.finetune.optimizer,
         "learning_rate": LEARNING_RATE,
@@ -194,16 +192,16 @@ def main() -> None:
     _validate_output_destination(include_log=False)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    cifar.configure_benchmark()
-    benchmark = cifar.benchmark
-    device = benchmark.resolve_local_device()
-    benchmark.seed_everything(SEED)
-    torch.backends.cudnn.benchmark = benchmark.CUDNN_BENCHMARK
+    cifar.configure_engine()
+    engine = cifar.engine
+    device = engine.resolve_local_device()
+    engine.seed_everything(SEED)
+    torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
     torch.cuda.reset_peak_memory_stats()
 
     train_images, clean_train_labels = cifar.load_full_cifar10_train()
     corrected_labels = _load_corrected_labels(clean_train_labels)
-    model = _load_rl_model(device)
+    model = _load_actor(device)
     mean = torch.tensor(cifar.CIFAR10_MEAN, device=device).reshape(
         1, 3, 1, 1
     )
@@ -221,17 +219,17 @@ def main() -> None:
         milestones=[LR_DECAY_EPOCH],
         gamma=LR_DECAY_FACTOR,
     )
-    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=(
-            benchmark.USE_AMP and benchmark.AMP_DTYPE == torch.float16
+            engine.USE_AMP and engine.AMP_DTYPE == torch.float16
         ),
     )
     history: list[dict[str, object]] = []
 
     print(f"device={device} ({torch.cuda.get_device_name(device)})")
-    print(f"rl_checkpoint={RL_CHECKPOINT_PATH}")
+    print(f"actor_checkpoint={ACTOR_CHECKPOINT_PATH}")
     print(f"corrected_labels={CORRECTED_LABELS_PATH}")
     print(f"epochs={FINETUNE_EPOCHS} batch_size={TRAIN_BATCH_SIZE}")
     print(
@@ -245,7 +243,7 @@ def main() -> None:
     )
 
     for epoch in range(1, FINETUNE_EPOCHS + 1):
-        benchmark.synchronize(device)
+        engine.synchronize(device)
         started = time.perf_counter()
         model.train()
         learning_rate = float(optimizer.param_groups[0]["lr"])
@@ -275,8 +273,8 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type="cuda",
-                dtype=benchmark.AMP_DTYPE,
-                enabled=benchmark.USE_AMP,
+                dtype=engine.AMP_DTYPE,
+                enabled=engine.USE_AMP,
             ):
                 logits = model(images)
                 loss = criterion(logits, targets)
@@ -290,7 +288,7 @@ def main() -> None:
             clean_count += predictions.eq(clean_targets).sum()
 
         scheduler.step()
-        benchmark.synchronize(device)
+        engine.synchronize(device)
         elapsed = time.perf_counter() - started
         row: dict[str, object] = {
             "epoch": epoch,
@@ -325,8 +323,8 @@ def run_with_file_logging() -> None:
     _validate_output_destination(include_log=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with RUN_LOG_PATH.open("w", encoding="utf-8", buffering=1) as handle:
-        stdout = cifar.benchmark.TeeStream(sys.stdout, handle)
-        stderr = cifar.benchmark.TeeStream(sys.stderr, handle)
+        stdout = cifar.engine.TeeStream(sys.stdout, handle)
+        stderr = cifar.engine.TeeStream(sys.stderr, handle)
         with redirect_stdout(stdout), redirect_stderr(stderr):
             print(f"run_log={RUN_LOG_PATH}")
             main()
