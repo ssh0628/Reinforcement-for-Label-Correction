@@ -38,7 +38,7 @@ from cifar_test import rl_engine as engine
 from cifar_test.resnet import build_cifar_resnet18
 
 
-CIFAR10_ROOT = CONFIG.data.root.expanduser()
+CIFAR10_ROOT = CONFIG.data_root
 DOWNLOAD_CIFAR10 = CONFIG.data.download
 NOISY_LABELS_PATH = CONFIG.noise_output_dir / "train_noisy_labels.npy"
 NOISE_MASK_PATH = CONFIG.noise_output_dir / "train_noise_mask.npy"

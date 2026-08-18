@@ -13,7 +13,6 @@ from pathlib import Path
 
 @dataclass(frozen=True, slots=True)
 class DataConfig:
-    # Change to an absolute path on the training machine if desired.
     root: Path = Path("data/cifar10")
     download: bool = True
     classes: tuple[int, ...] = tuple(range(10))
@@ -85,8 +84,6 @@ class RLConfig:
 
 @dataclass(frozen=True, slots=True)
 class OutputConfig:
-    # This is intentionally not based on PROJECT_ROOT. Set an absolute path
-    # here when running on another machine, e.g. Path("/mnt/results/rlnlc").
     root: Path = Path("outputs")
 
     warmup_checkpoint_name: str = "resnet18_cifar10_sn40_warmup50.pt"
@@ -136,6 +133,10 @@ class ResNet18CIFARConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     @property
+    def data_root(self) -> Path:
+        return self.data.root.expanduser()
+
+    @property
     def output_root(self) -> Path:
         return self.output.root.expanduser()
 
@@ -145,10 +146,8 @@ class ResNet18CIFARConfig:
 
     @property
     def noise_output_dir(self) -> Path:
-        return (
-            self.output_root
-            / "cifar10_shared"
-            / f"noise_{self.noise_tag}_seed{self.data.seed}"
+        return self.data_root / (
+            f"cifar10_noise_{self.noise_tag}_seed{self.data.seed}"
         )
 
     @property
