@@ -1,25 +1,24 @@
-"""CIFAR-10 RLNLC full-vs-subset experiment for an RTX 5080.
+"""Paper-aligned CIFAR-10 symmetric-noise RLNLC baseline.
 
-Set the shared noisy-label and warmup-checkpoint paths below, then run this file
-twice with ``ACTOR_UPDATE_MODE`` set to ``"full"`` and ``"subset"``.  After
-restoring the best actor, each run performs 25-step cleaning over all 50,000
-training examples and saves the resulting hard labels for fine-tuning.
+The actor is a CIFAR-stem ResNet-18 trained with the optimizer and schedule
+reported by the paper.  Every policy update uses all 50,000 training samples.
+After 500 RL epochs, the last actor performs 25-step label cleaning.
 
 Experiment profile
 ------------------
 - CIFAR-10 train: all 50,000 images and all ten classes.
 - Validation/test: stratified 50/50 split of the official 10,000 test images.
 - 40% stratified symmetric label noise, seed 0.
-- ConvNeXtV2 Tiny without pretrained weights.
-- Three supervised warmup epochs.
-- Three RL epochs x five trajectory steps (15 RL steps).
-- Full actor update: 50,000 samples per RL step.
-- Subset actor update: 5,000 samples per RL step (10%).
-- Validation selects the best checkpoint; the held-out test half is evaluated
-  only after restoring the best actor.
+- CIFAR-stem ResNet-18 without pretrained weights; native 32x32 inputs.
+- 50 supervised warmup epochs with SGD.
+- 500 RL epochs x 10 trajectory steps.
+- Full actor update: all 50,000 samples per RL step.
+- The best checkpoint is retained for diagnostics, but the last actor is used
+  for cleaning and held-out evaluation to avoid clean-validation selection.
 
 The common engine is imported rather than copied so fixes to RL, KNN, metrics,
 checkpointing, and timing cannot silently diverge between MNIST and CIFAR-10.
+All experiment values and output paths come from ``config_resent18.py``.
 """
 
 from __future__ import annotations
@@ -29,103 +28,84 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
-from torch import Tensor
-from torch.nn import functional as F
+from torch import Tensor, nn
 from torchvision.datasets import CIFAR10
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from cifar_test.config_resent18 import CONFIG
+from cifar_test.resnet import build_cifar_resnet18
+
 if TYPE_CHECKING:
     import mnist_test_rtx5080 as benchmark
 else:
-    if str(PROJECT_ROOT) not in sys.path:
-        sys.path.insert(0, str(PROJECT_ROOT))
     import mnist_test_rtx5080 as benchmark
 
 
-CIFAR10_ROOT = PROJECT_ROOT / "data" / "cifar10"
-DOWNLOAD_CIFAR10 = True
+CIFAR10_ROOT = CONFIG.data.root
+DOWNLOAD_CIFAR10 = CONFIG.data.download
+NOISY_LABELS_PATH = CONFIG.noise_output_dir / "train_noisy_labels.npy"
+NOISE_MASK_PATH = CONFIG.noise_output_dir / "train_noise_mask.npy"
+WARMUP_CHECKPOINT_PATH = CONFIG.warmup_checkpoint_path
 
-# User-editable shared input paths.
-NOISY_LABELS_PATH = (
-    PROJECT_ROOT
-    / "outputs"
-    / "cifar10_shared"
-    / "noise_40_seed0"
-    / "train_noisy_labels.npy"
-)
-NOISE_MASK_PATH = (
-    PROJECT_ROOT
-    / "outputs"
-    / "cifar10_shared"
-    / "noise_40_seed0"
-    / "train_noise_mask.npy"
-)
-WARMUP_CHECKPOINT_PATH = (
-    PROJECT_ROOT / "outputs" / "cifar10_shared" / "warmup" / "warmup_best.pt"
-)
-
-CLASSES = tuple(range(10))
+CLASSES = CONFIG.data.classes
 NUM_CLASSES = len(CLASSES)
-EXPECTED_SAMPLES = 50_000
-NOISE_RATE = 0.40
-SEED = 0
+EXPECTED_SAMPLES = CONFIG.data.train_samples
+NOISE_RATE = CONFIG.data.noise_rate
+SEED = CONFIG.data.seed
 
-# Change only this value between the two comparison runs.
-ACTOR_UPDATE_MODE = "full"  # "full" or "subset"
-POLICY_UPDATE_SUBSET_SIZE = 5_000
-OUTPUT_DIR = (
-    PROJECT_ROOT / "outputs" / f"cifar10_test_rtx5080_{ACTOR_UPDATE_MODE}"
-)
-CLEANING_TRAJECTORY_LENGTH = 25
+ACTOR_UPDATE_MODE = CONFIG.rl.update_mode
+OUTPUT_DIR = CONFIG.rl_output_dir
+CLEANING_TRAJECTORY_LENGTH = CONFIG.rl.cleaning_trajectory_length
 CORRECTED_LABELS_PATH = OUTPUT_DIR / "train_corrected_labels.npy"
-OVERWRITE = False
+OVERWRITE = CONFIG.runtime.overwrite_rl
 
-MODEL_NAME = "convnextv2_tiny.fcmae_ft_in22k_in1k"
-PRETRAINED = False
-IMAGE_SIZE = 224
-DROP_RATE = 0.1
-DROP_PATH_RATE = 0.2
+MODEL_NAME = CONFIG.model.name
+PRETRAINED = CONFIG.model.pretrained
+IMAGE_SIZE = CONFIG.data.image_size
+CIFAR10_MEAN = CONFIG.data.mean
+CIFAR10_STD = CONFIG.data.std
 
-WARMUP_EPOCHS = 3
-WARMUP_FREEZE_EPOCHS = 0
-WARMUP_BATCH_SIZE = 64
-WARMUP_EVAL_BATCH_SIZE = 256
-WARMUP_HEAD_LR = 1e-3
-WARMUP_BACKBONE_LR = 1e-4
-WARMUP_UNFROZEN_HEAD_LR = 5e-4
-WARMUP_MIN_LR = 1e-6
-WARMUP_WEIGHT_DECAY = 0.05
-# Plain cross entropy keeps this baseline free of label-smoothing heuristics.
-WARMUP_LABEL_SMOOTHING = 0.0
-WARMUP_GRAD_CLIP_NORM = 1.0
-# A sanity guard against a completely failed warmup. Clean labels are not used
-# for this gate or for checkpoint selection.
-WARMUP_MIN_NOISY_VALIDATION_ACCURACY = 0.20
+WARMUP_EPOCHS = CONFIG.warmup.epochs
+WARMUP_FREEZE_EPOCHS = CONFIG.warmup.freeze_epochs
+WARMUP_BATCH_SIZE = CONFIG.warmup.batch_size
+WARMUP_EVAL_BATCH_SIZE = CONFIG.warmup.eval_batch_size
+WARMUP_LR = CONFIG.warmup.learning_rate
+WARMUP_WEIGHT_DECAY = CONFIG.warmup.weight_decay
+WARMUP_LABEL_SMOOTHING = CONFIG.warmup.label_smoothing
+WARMUP_GRAD_CLIP_NORM = CONFIG.warmup.grad_clip_norm
+WARMUP_MIN_NOISY_VALIDATION_ACCURACY = (
+    CONFIG.warmup.min_noisy_validation_accuracy
+)
 
-RL_EPOCHS = 3
-TRAJECTORY_LENGTH = 5
-INITIAL_STATE_RANDOMIZATION_RATE = 0.10
-FEATURE_BATCH_SIZE = 256
-POLICY_UPDATE_BATCH_SIZE = 64
+RL_EPOCHS = CONFIG.rl.epochs
+TRAJECTORY_LENGTH = CONFIG.rl.trajectory_length
+INITIAL_STATE_RANDOMIZATION_RATE = (
+    CONFIG.rl.initial_state_randomization_rate
+)
+FEATURE_BATCH_SIZE = CONFIG.rl.feature_batch_size
+POLICY_UPDATE_BATCH_SIZE = CONFIG.rl.update_batch_size
 
-K = 10
-TEMPERATURE = 0.5
-KNN_QUERY_CHUNK_SIZE = 2_048
-KNN_REFERENCE_CHUNK_SIZE = 32_768
-CORRECTION_CHUNK_SIZE = 16_384
+K = CONFIG.knn.k
+TEMPERATURE = CONFIG.knn.temperature
+KNN_QUERY_CHUNK_SIZE = CONFIG.knn.query_chunk_size
+KNN_REFERENCE_CHUNK_SIZE = CONFIG.knn.reference_chunk_size
+CORRECTION_CHUNK_SIZE = CONFIG.knn.correction_chunk_size
 
-ACTOR_LR = 3e-5
-ACTOR_WEIGHT_DECAY = 0.1
-ACTOR_BETAS = (0.9, 0.999)
-ACTOR_EPS = 1e-8
-CRITIC_LR = 1e-2
-CRITIC_MOMENTUM = 0.9
-CRITIC_WEIGHT_DECAY = 5e-4
-DISCOUNT_FACTOR = 0.9
-NLA_WEIGHT = 0.5
-LR_DECAY_FACTOR = 0.1
-LR_DECAY_FRACTION = 0.5
+ACTOR_LR = CONFIG.rl.actor_learning_rate
+ACTOR_MOMENTUM = CONFIG.rl.actor_momentum
+ACTOR_WEIGHT_DECAY = CONFIG.rl.actor_weight_decay
+CRITIC_LR = CONFIG.rl.critic_learning_rate
+CRITIC_MOMENTUM = CONFIG.rl.critic_momentum
+CRITIC_WEIGHT_DECAY = CONFIG.rl.critic_weight_decay
+CRITIC_NUM_BINS = CONFIG.rl.critic_num_bins
+DISCOUNT_FACTOR = CONFIG.rl.discount_factor
+NLA_WEIGHT = CONFIG.rl.reward_nla_weight
+LR_DECAY_FACTOR = CONFIG.rl.lr_decay_factor
+LR_DECAY_FRACTION = CONFIG.rl.lr_decay_fraction
 
 RL_OUTPUT_FILENAMES = (
     benchmark.RUN_LOG_FILENAME,
@@ -225,6 +205,29 @@ def load_cifar10_validation_test() -> dict[str, tuple[Tensor, Tensor]]:
     return result
 
 
+def load_full_cifar10_test() -> tuple[Tensor, Tensor]:
+    """Load the official 10,000-image clean test split for final reporting."""
+    dataset = CIFAR10(
+        root=CIFAR10_ROOT,
+        train=False,
+        download=DOWNLOAD_CIFAR10,
+    )
+    images = _as_image_tensor(dataset)
+    labels = benchmark.pin_for_cuda(
+        torch.tensor(dataset.targets, dtype=torch.long).contiguous()
+    )
+    if images.size(0) != 10_000 or labels.size(0) != 10_000:
+        raise RuntimeError("Unexpected CIFAR-10 official test size.")
+    return images, labels
+
+
+def build_model(
+    pretrained: bool = PRETRAINED,
+    num_classes: int = NUM_CLASSES,
+) -> nn.Module:
+    return build_cifar_resnet18(pretrained, num_classes)
+
+
 def preprocess_cifar10(
     images: Tensor,
     device: torch.device,
@@ -238,13 +241,11 @@ def preprocess_cifar10(
         )
     images = images.to(device=device, dtype=torch.float32, non_blocking=True)
     images = images.div_(255.0)
-    images = F.interpolate(
-        images,
-        size=(IMAGE_SIZE, IMAGE_SIZE),
-        mode="bicubic",
-        align_corners=False,
-        antialias=True,
-    )
+    if images.shape[-2:] != (IMAGE_SIZE, IMAGE_SIZE):
+        raise ValueError(
+            f"Expected native {IMAGE_SIZE}x{IMAGE_SIZE} CIFAR images, got "
+            f"{tuple(images.shape[-2:])}."
+        )
     images = images.contiguous(
         memory_format=(
             torch.channels_last
@@ -256,15 +257,6 @@ def preprocess_cifar10(
 
 
 def configure_benchmark() -> None:
-    if ACTOR_UPDATE_MODE not in {"full", "subset"}:
-        raise ValueError("ACTOR_UPDATE_MODE must be 'full' or 'subset'.")
-
-    policy_update_samples = (
-        EXPECTED_SAMPLES
-        if ACTOR_UPDATE_MODE == "full"
-        else min(EXPECTED_SAMPLES, POLICY_UPDATE_SUBSET_SIZE)
-    )
-
     benchmark.DATASET_NAME = "CIFAR-10"
     benchmark.DATASET_STAGE_PREFIX = "cifar10"
     benchmark.DIGITS = CLASSES
@@ -273,8 +265,8 @@ def configure_benchmark() -> None:
     benchmark.NOISE_RATE = NOISE_RATE
     benchmark.SEED = SEED
     benchmark.ACTOR_UPDATE_MODE = ACTOR_UPDATE_MODE
-    benchmark.POLICY_UPDATE_SUBSET_SIZE = POLICY_UPDATE_SUBSET_SIZE
-    benchmark.POLICY_UPDATE_SAMPLES = policy_update_samples
+    benchmark.POLICY_UPDATE_SUBSET_SIZE = EXPECTED_SAMPLES
+    benchmark.POLICY_UPDATE_SAMPLES = EXPECTED_SAMPLES
     benchmark.OUTPUT_DIR = OUTPUT_DIR
     benchmark.EXTERNAL_NOISY_LABELS_PATH = NOISY_LABELS_PATH
     benchmark.EXTERNAL_NOISE_MASK_PATH = NOISE_MASK_PATH
@@ -286,21 +278,32 @@ def configure_benchmark() -> None:
     benchmark.CORRECTED_LABELS_OUTPUT_PATH = CORRECTED_LABELS_PATH
 
     benchmark.MODEL_NAME = MODEL_NAME
+    benchmark.WARMUP_MODEL_ID = CONFIG.warmup.model_id
+    benchmark.MODEL_FACTORY = build_cifar_resnet18
     benchmark.PRETRAINED = PRETRAINED
     benchmark.IMAGE_SIZE = IMAGE_SIZE
-    benchmark.DROP_RATE = DROP_RATE
-    benchmark.DROP_PATH_RATE = DROP_PATH_RATE
+    benchmark.DROP_RATE = CONFIG.model.drop_rate
+    benchmark.DROP_PATH_RATE = CONFIG.model.drop_path_rate
+    benchmark.IMAGENET_MEAN = CIFAR10_MEAN
+    benchmark.IMAGENET_STD = CIFAR10_STD
     benchmark.WARMUP_EPOCHS = WARMUP_EPOCHS
     benchmark.WARMUP_FREEZE_EPOCHS = WARMUP_FREEZE_EPOCHS
     benchmark.WARMUP_BATCH_SIZE = WARMUP_BATCH_SIZE
     benchmark.WARMUP_EVAL_BATCH_SIZE = WARMUP_EVAL_BATCH_SIZE
-    benchmark.WARMUP_HEAD_LR = WARMUP_HEAD_LR
-    benchmark.WARMUP_BACKBONE_LR = WARMUP_BACKBONE_LR
-    benchmark.WARMUP_UNFROZEN_HEAD_LR = WARMUP_UNFROZEN_HEAD_LR
-    benchmark.WARMUP_MIN_LR = WARMUP_MIN_LR
+    benchmark.WARMUP_HEAD_LR = WARMUP_LR
+    benchmark.WARMUP_BACKBONE_LR = WARMUP_LR
+    benchmark.WARMUP_UNFROZEN_HEAD_LR = WARMUP_LR
     benchmark.WARMUP_WEIGHT_DECAY = WARMUP_WEIGHT_DECAY
     benchmark.WARMUP_LABEL_SMOOTHING = WARMUP_LABEL_SMOOTHING
     benchmark.WARMUP_GRAD_CLIP_NORM = WARMUP_GRAD_CLIP_NORM
+    benchmark.WARMUP_OPTIMIZER_NAME = CONFIG.warmup.optimizer
+    benchmark.WARMUP_MOMENTUM = CONFIG.warmup.momentum
+    benchmark.WARMUP_SCHEDULER_NAME = CONFIG.warmup.scheduler
+    benchmark.WARMUP_LR_DECAY_FRACTION = CONFIG.warmup.lr_decay_fraction
+    benchmark.WARMUP_LR_DECAY_FACTOR = CONFIG.warmup.lr_decay_factor
+    benchmark.WARMUP_DEPLOY_CHECKPOINT = (
+        CONFIG.warmup.deployment_checkpoint
+    )
     benchmark.WARMUP_MIN_NOISY_VALIDATION_ACCURACY = (
         WARMUP_MIN_NOISY_VALIDATION_ACCURACY
     )
@@ -316,17 +319,23 @@ def configure_benchmark() -> None:
     benchmark.KNN_QUERY_CHUNK_SIZE = KNN_QUERY_CHUNK_SIZE
     benchmark.KNN_REFERENCE_CHUNK_SIZE = KNN_REFERENCE_CHUNK_SIZE
     benchmark.CORRECTION_CHUNK_SIZE = CORRECTION_CHUNK_SIZE
+    benchmark.ACTOR_OPTIMIZER_NAME = CONFIG.rl.actor_optimizer
     benchmark.ACTOR_LR = ACTOR_LR
+    benchmark.ACTOR_MOMENTUM = ACTOR_MOMENTUM
     benchmark.ACTOR_WEIGHT_DECAY = ACTOR_WEIGHT_DECAY
-    benchmark.ACTOR_BETAS = ACTOR_BETAS
-    benchmark.ACTOR_EPS = ACTOR_EPS
     benchmark.CRITIC_LR = CRITIC_LR
     benchmark.CRITIC_MOMENTUM = CRITIC_MOMENTUM
     benchmark.CRITIC_WEIGHT_DECAY = CRITIC_WEIGHT_DECAY
+    benchmark.CRITIC_NUM_BINS = CRITIC_NUM_BINS
     benchmark.DISCOUNT_FACTOR = DISCOUNT_FACTOR
     benchmark.NLA_WEIGHT = NLA_WEIGHT
     benchmark.LR_DECAY_FACTOR = LR_DECAY_FACTOR
     benchmark.LR_DECAY_FRACTION = LR_DECAY_FRACTION
+    benchmark.RL_DEPLOY_CHECKPOINT = CONFIG.rl.deployment_checkpoint
+    benchmark.USE_AMP = CONFIG.runtime.use_amp
+    benchmark.AMP_DTYPE = getattr(torch, CONFIG.runtime.amp_dtype)
+    benchmark.USE_CHANNELS_LAST = CONFIG.runtime.use_channels_last
+    benchmark.CUDNN_BENCHMARK = CONFIG.runtime.cudnn_benchmark
 
     # main() resolves these names in the imported engine module at runtime.
     benchmark.load_full_mnist_train = load_full_cifar10_train

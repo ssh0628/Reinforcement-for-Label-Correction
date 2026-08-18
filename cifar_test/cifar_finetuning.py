@@ -14,40 +14,39 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import timm
 import torch
 from torch import Tensor, nn
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim import SGD
+from torch.optim.lr_scheduler import MultiStepLR
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if TYPE_CHECKING:
-    from cifar_test import cifar_test_rtx5080 as cifar
+    from cifar_test import cifar_rl as cifar
 else:
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
-    from cifar_test import cifar_test_rtx5080 as cifar
+    from cifar_test import cifar_rl as cifar
 
 
-# User-editable input. Both artifacts are derived from one full/subset run
-# directory so a checkpoint cannot be accidentally paired with other labels.
-SOURCE_RL_OUTPUT_DIR = (
-    PROJECT_ROOT / "outputs" / "cifar10_test_rtx5080_full"
-)
-RL_CHECKPOINT_PATH = SOURCE_RL_OUTPUT_DIR / "rl_best.pt"
+# Both artifacts come from the same paper-aligned Full run.
+CONFIG = cifar.CONFIG
+SOURCE_RL_OUTPUT_DIR = CONFIG.rl_output_dir
+RL_CHECKPOINT_PATH = SOURCE_RL_OUTPUT_DIR / "rl_last.pt"
 CORRECTED_LABELS_PATH = SOURCE_RL_OUTPUT_DIR / "train_corrected_labels.npy"
-OUTPUT_DIR = PROJECT_ROOT / "outputs" / "cifar10_finetuning_full"
+OUTPUT_DIR = CONFIG.finetune_output_dir
 
-FINETUNE_EPOCHS = 100
-TRAIN_BATCH_SIZE = 64
-LEARNING_RATE = 3e-5
-MIN_LR = 1e-6
-WEIGHT_DECAY = 0.1
-ADAMW_BETAS = (0.9, 0.999)
-ADAMW_EPS = 1e-8
-LABEL_SMOOTHING = 0.0
-SEED = 0
-OVERWRITE = False
+FINETUNE_EPOCHS = CONFIG.finetune.epochs
+TRAIN_BATCH_SIZE = CONFIG.finetune.batch_size
+LEARNING_RATE = CONFIG.finetune.learning_rate
+MOMENTUM = CONFIG.finetune.momentum
+WEIGHT_DECAY = CONFIG.finetune.weight_decay
+LR_DECAY_EPOCH = round(
+    FINETUNE_EPOCHS * CONFIG.finetune.lr_decay_fraction
+)
+LR_DECAY_FACTOR = CONFIG.finetune.lr_decay_factor
+LABEL_SMOOTHING = CONFIG.finetune.label_smoothing
+SEED = CONFIG.data.seed
+OVERWRITE = CONFIG.runtime.overwrite_finetune
 
 RUN_LOG_PATH = OUTPUT_DIR / "run.log"
 TRAIN_CSV_PATH = OUTPUT_DIR / "train.csv"
@@ -92,7 +91,7 @@ def _validate_input_artifacts() -> None:
     ):
         raise ValueError(
             "RL_CHECKPOINT_PATH and CORRECTED_LABELS_PATH must come from "
-            "the same Full/Subset RL output directory."
+            "the same Full RL output directory."
         )
 
 
@@ -146,13 +145,7 @@ def _load_rl_model(device: torch.device) -> nn.Module:
     if int(checkpoint["num_classes"]) != cifar.NUM_CLASSES:
         raise ValueError("RL checkpoint class count does not match CIFAR-10.")
 
-    model = timm.create_model(
-        cifar.MODEL_NAME,
-        pretrained=False,
-        num_classes=cifar.NUM_CLASSES,
-        drop_rate=cifar.DROP_RATE,
-        drop_path_rate=cifar.DROP_PATH_RATE,
-    )
+    model = cifar.build_model()
     try:
         model.load_state_dict(checkpoint["model"], strict=True)
     except RuntimeError as error:
@@ -181,6 +174,10 @@ def _save_checkpoint(model: nn.Module) -> None:
         "num_classes": cifar.NUM_CLASSES,
         "source_rl_checkpoint": str(RL_CHECKPOINT_PATH),
         "corrected_labels": str(CORRECTED_LABELS_PATH),
+        "optimizer": CONFIG.finetune.optimizer,
+        "learning_rate": LEARNING_RATE,
+        "momentum": MOMENTUM,
+        "weight_decay": WEIGHT_DECAY,
         "model": model.state_dict(),
     }
     try:
@@ -207,23 +204,22 @@ def main() -> None:
     train_images, clean_train_labels = cifar.load_full_cifar10_train()
     corrected_labels = _load_corrected_labels(clean_train_labels)
     model = _load_rl_model(device)
-    mean = torch.tensor(benchmark.IMAGENET_MEAN, device=device).reshape(
+    mean = torch.tensor(cifar.CIFAR10_MEAN, device=device).reshape(
         1, 3, 1, 1
     )
-    std = torch.tensor(benchmark.IMAGENET_STD, device=device).reshape(
+    std = torch.tensor(cifar.CIFAR10_STD, device=device).reshape(
         1, 3, 1, 1
     )
-    optimizer = AdamW(
+    optimizer = SGD(
         model.parameters(),
         lr=LEARNING_RATE,
+        momentum=MOMENTUM,
         weight_decay=WEIGHT_DECAY,
-        betas=ADAMW_BETAS,
-        eps=ADAMW_EPS,
     )
-    scheduler = CosineAnnealingLR(
+    scheduler = MultiStepLR(
         optimizer,
-        T_max=FINETUNE_EPOCHS,
-        eta_min=MIN_LR,
+        milestones=[LR_DECAY_EPOCH],
+        gamma=LR_DECAY_FACTOR,
     )
     criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
     scaler = torch.amp.GradScaler(
@@ -238,6 +234,11 @@ def main() -> None:
     print(f"rl_checkpoint={RL_CHECKPOINT_PATH}")
     print(f"corrected_labels={CORRECTED_LABELS_PATH}")
     print(f"epochs={FINETUNE_EPOCHS} batch_size={TRAIN_BATCH_SIZE}")
+    print(
+        f"optimizer={CONFIG.finetune.optimizer.upper()} "
+        f"lr={LEARNING_RATE} momentum={MOMENTUM} "
+        f"weight_decay={WEIGHT_DECAY} lr_decay_epoch={LR_DECAY_EPOCH}"
+    )
     print(
         "initial_corrected_label_accuracy="
         f"{float(corrected_labels.eq(clean_train_labels).float().mean()):.6f}"

@@ -1,8 +1,8 @@
 """Create one reusable 40% symmetric-noise artifact for CIFAR-10.
 
-Edit ``OUTPUT_DIR`` when the artifact must be written elsewhere.  Full and
-subset RL experiments must load the same saved labels and mask instead of
-generating noise independently.
+All paths and generation settings come from ``config_resent18.py``. Every
+baseline loads the same saved labels and mask instead of generating noise
+independently.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -19,15 +20,20 @@ from torchvision.datasets import CIFAR10
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CIFAR10_ROOT = PROJECT_ROOT / "data" / "cifar10"
-OUTPUT_DIR = PROJECT_ROOT / "outputs" / "cifar10_shared" / "noise_40_seed0"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-NOISE_RATE = 0.40
-SEED = 0
-NUM_CLASSES = 10
-EXPECTED_SAMPLES = 50_000
-DOWNLOAD_CIFAR10 = True
-OVERWRITE = False
+from cifar_test.config_resent18 import CONFIG
+
+
+CIFAR10_ROOT = CONFIG.data.root
+OUTPUT_DIR = CONFIG.noise_output_dir
+NOISE_RATE = CONFIG.data.noise_rate
+SEED = CONFIG.data.seed
+NUM_CLASSES = len(CONFIG.data.classes)
+EXPECTED_SAMPLES = CONFIG.data.train_samples
+DOWNLOAD_CIFAR10 = CONFIG.data.download
+OVERWRITE = CONFIG.runtime.overwrite_noise
 
 CLEAN_LABELS_FILENAME = "train_clean_labels.npy"
 NOISY_LABELS_FILENAME = "train_noisy_labels.npy"

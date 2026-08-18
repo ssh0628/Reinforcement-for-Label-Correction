@@ -1,4 +1,4 @@
-"""Evaluate a fine-tuned CIFAR-10 model on the clean held-out test split."""
+"""Evaluate the fine-tuned model on the official clean CIFAR-10 test split."""
 
 from __future__ import annotations
 
@@ -10,29 +10,26 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import timm
 import torch
 from torch import Tensor, nn
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if TYPE_CHECKING:
-    from cifar_test import cifar_test_rtx5080 as cifar
+    from cifar_test import cifar_rl as cifar
 else:
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
-    from cifar_test import cifar_test_rtx5080 as cifar
+    from cifar_test import cifar_rl as cifar
 
 
-# User-editable paths. Select the matching Full or Subset fine-tuning run.
-SOURCE_FINETUNE_OUTPUT_DIR = (
-    PROJECT_ROOT / "outputs" / "cifar10_finetuning_full"
-)
+CONFIG = cifar.CONFIG
+SOURCE_FINETUNE_OUTPUT_DIR = CONFIG.finetune_output_dir
 FINETUNE_CHECKPOINT_PATH = SOURCE_FINETUNE_OUTPUT_DIR / "finetune_last.pt"
-OUTPUT_DIR = PROJECT_ROOT / "outputs" / "cifar10_final_test_full"
+OUTPUT_DIR = CONFIG.final_test_output_dir
 
-TEST_BATCH_SIZE = 256
-SEED = 0
-OVERWRITE = False
+TEST_BATCH_SIZE = CONFIG.runtime.final_test_batch_size
+SEED = CONFIG.data.seed
+OVERWRITE = CONFIG.runtime.overwrite_final_test
 
 RUN_LOG_PATH = OUTPUT_DIR / "run.log"
 TEST_CSV_PATH = OUTPUT_DIR / "test.csv"
@@ -104,13 +101,7 @@ def _load_model(device: torch.device) -> nn.Module:
     if int(checkpoint["num_classes"]) != cifar.NUM_CLASSES:
         raise ValueError("Checkpoint class count does not match CIFAR-10.")
 
-    model = timm.create_model(
-        cifar.MODEL_NAME,
-        pretrained=False,
-        num_classes=cifar.NUM_CLASSES,
-        drop_rate=cifar.DROP_RATE,
-        drop_path_rate=cifar.DROP_PATH_RATE,
-    )
+    model = cifar.build_model()
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(
         device=device,
@@ -166,10 +157,10 @@ def _evaluate(
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     model.eval()
     benchmark = cifar.benchmark
-    mean = torch.tensor(benchmark.IMAGENET_MEAN, device=device).reshape(
+    mean = torch.tensor(cifar.CIFAR10_MEAN, device=device).reshape(
         1, 3, 1, 1
     )
-    std = torch.tensor(benchmark.IMAGENET_STD, device=device).reshape(
+    std = torch.tensor(cifar.CIFAR10_STD, device=device).reshape(
         1, 3, 1, 1
     )
     criterion = nn.CrossEntropyLoss(reduction="sum")
@@ -227,14 +218,14 @@ def main() -> None:
     benchmark.seed_everything(SEED)
     torch.backends.cudnn.benchmark = benchmark.CUDNN_BENCHMARK
 
-    test_images, test_labels = cifar.load_cifar10_validation_test()["test"]
-    if test_images.size(0) != 5_000 or test_labels.size(0) != 5_000:
-        raise RuntimeError("Unexpected held-out CIFAR-10 test size.")
+    test_images, test_labels = cifar.load_full_cifar10_test()
+    if test_images.size(0) != 10_000 or test_labels.size(0) != 10_000:
+        raise RuntimeError("Unexpected official CIFAR-10 test size.")
     model = _load_model(device)
 
     print(f"device={device} ({torch.cuda.get_device_name(device)})")
     print(f"checkpoint={FINETUNE_CHECKPOINT_PATH}")
-    print(f"heldout_test_samples={test_labels.numel()}")
+    print(f"official_test_samples={test_labels.numel()}")
     benchmark.synchronize(device)
     started = time.perf_counter()
     summary, per_class = _evaluate(

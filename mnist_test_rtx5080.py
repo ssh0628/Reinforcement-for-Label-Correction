@@ -60,8 +60,8 @@ import timm
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, MultiStepLR
+from torch.optim import AdamW, Optimizer, SGD
+from torch.optim.lr_scheduler import CosineAnnealingLR, LRScheduler, MultiStepLR
 from torchvision.datasets import MNIST
 
 from rl.actor.policy import LabelCorrectionPolicy
@@ -126,10 +126,12 @@ OUTPUT_DIR = (
 )
 
 MODEL_NAME = "convnextv2_tiny.fcmae_ft_in22k_in1k"
+WARMUP_MODEL_ID = ""
 PRETRAINED = False
 IMAGE_SIZE = 224
 DROP_RATE = 0.1
 DROP_PATH_RATE = 0.2
+MODEL_FACTORY: Callable[[bool, int], nn.Module] | None = None
 
 WARMUP_EPOCHS = 1
 WARMUP_FREEZE_EPOCHS = 0
@@ -141,8 +143,14 @@ WARMUP_UNFROZEN_HEAD_LR = 5e-4
 WARMUP_MIN_LR = 1e-6
 WARMUP_WEIGHT_DECAY = 0.05
 WARMUP_LABEL_SMOOTHING = 0.1
-WARMUP_GRAD_CLIP_NORM = 1.0
+WARMUP_GRAD_CLIP_NORM: float | None = 1.0
 WARMUP_MIN_NOISY_VALIDATION_ACCURACY = 0.45
+WARMUP_OPTIMIZER_NAME = "adamw"
+WARMUP_MOMENTUM = 0.9
+WARMUP_SCHEDULER_NAME = "cosine"
+WARMUP_LR_DECAY_FRACTION = 0.5
+WARMUP_LR_DECAY_FACTOR = 0.1
+WARMUP_DEPLOY_CHECKPOINT = "best"  # "best" or "last"
 
 RL_EPOCHS = 1
 TRAJECTORY_LENGTH = 10
@@ -160,13 +168,17 @@ ACTOR_LR = 3e-5
 ACTOR_WEIGHT_DECAY = 0.1
 ACTOR_BETAS = (0.9, 0.999)
 ACTOR_EPS = 1e-8
+ACTOR_OPTIMIZER_NAME = "adamw"
+ACTOR_MOMENTUM = 0.9
 CRITIC_LR = 1e-2
 CRITIC_MOMENTUM = 0.9
 CRITIC_WEIGHT_DECAY = 5e-4
+CRITIC_NUM_BINS = 100
 DISCOUNT_FACTOR = 0.9
 NLA_WEIGHT = 0.5
 LR_DECAY_FACTOR = 0.1
 LR_DECAY_FRACTION = 0.5
+RL_DEPLOY_CHECKPOINT = "best"  # "best" or "last"
 
 USE_AMP = True
 AMP_DTYPE = torch.bfloat16
@@ -265,6 +277,9 @@ TIMING_FIELDS = (
 
 RUN_SUMMARY_FIELDS = (
     "dataset",
+    "model_name",
+    "warmup_model_id",
+    "image_size",
     "seed",
     "noise_rate",
     "train_samples",
@@ -274,9 +289,14 @@ RUN_SUMMARY_FIELDS = (
     "warmup_epochs",
     "warmup_freeze_epochs",
     "warmup_batch_size",
+    "warmup_optimizer",
+    "warmup_learning_rate",
+    "warmup_weight_decay",
     "warmup_best_epoch",
     "warmup_best_noisy_validation_accuracy",
     "warmup_best_clean_validation_accuracy",
+    "warmup_deployment_mode",
+    "warmup_deployment_epoch",
     "warmup_seconds",
     "rl_epochs",
     "trajectory_length",
@@ -285,7 +305,19 @@ RUN_SUMMARY_FIELDS = (
     "policy_update_mode",
     "policy_update_samples",
     "policy_update_batch_size",
+    "actor_optimizer",
+    "actor_learning_rate",
+    "actor_momentum",
+    "actor_weight_decay",
+    "rl_epoch0_validation_accuracy",
+    "rl_epoch0_validation_macro_f1",
     "k",
+    "temperature",
+    "discount_factor",
+    "reward_nla_weight",
+    "critic_num_bins",
+    "lr_decay_fraction",
+    "lr_decay_factor",
     "knn_query_chunk_size",
     "knn_reference_chunk_size",
     "correction_chunk_size",
@@ -301,6 +333,8 @@ RUN_SUMMARY_FIELDS = (
     "rl_best_validation_loss",
     "rl_best_checkpoint",
     "rl_last_checkpoint",
+    "rl_deployment_checkpoint",
+    "rl_deployment_epoch",
     "setup_seconds",
     "train_seconds",
     "mean_epoch_seconds",
@@ -798,6 +832,18 @@ def preprocess(
     return (images - mean) / std
 
 
+def create_experiment_model() -> nn.Module:
+    if MODEL_FACTORY is not None:
+        return MODEL_FACTORY(PRETRAINED, NUM_CLASSES)
+    return timm.create_model(
+        MODEL_NAME,
+        pretrained=PRETRAINED,
+        num_classes=NUM_CLASSES,
+        drop_rate=DROP_RATE,
+        drop_path_rate=DROP_PATH_RATE,
+    )
+
+
 def encode(model: nn.Module, images: Tensor) -> Tensor:
     feature_map = model.forward_features(images)
     embeddings = model.forward_head(feature_map, pre_logits=True)
@@ -829,7 +875,7 @@ def _build_warmup_optimizer(
     model: nn.Module,
     *,
     backbone_frozen: bool,
-) -> AdamW:
+) -> Optimizer:
     head = _warmup_head(model)
     if backbone_frozen:
         parameter_groups = [
@@ -858,11 +904,47 @@ def _build_warmup_optimizer(
                 "name": "head",
             },
         ]
-    return AdamW(
-        parameter_groups,
-        weight_decay=WARMUP_WEIGHT_DECAY,
-        betas=ACTOR_BETAS,
-        eps=ACTOR_EPS,
+    if WARMUP_OPTIMIZER_NAME == "adamw":
+        return AdamW(
+            parameter_groups,
+            weight_decay=WARMUP_WEIGHT_DECAY,
+            betas=ACTOR_BETAS,
+            eps=ACTOR_EPS,
+        )
+    if WARMUP_OPTIMIZER_NAME == "sgd":
+        return SGD(
+            parameter_groups,
+            lr=WARMUP_BACKBONE_LR,
+            momentum=WARMUP_MOMENTUM,
+            weight_decay=WARMUP_WEIGHT_DECAY,
+        )
+    raise ValueError(
+        "WARMUP_OPTIMIZER_NAME must be 'adamw' or 'sgd'."
+    )
+
+
+def _build_warmup_scheduler(
+    optimizer: Optimizer,
+    trainable_epochs: int,
+) -> LRScheduler:
+    if WARMUP_SCHEDULER_NAME == "cosine":
+        return CosineAnnealingLR(
+            optimizer,
+            T_max=trainable_epochs,
+            eta_min=WARMUP_MIN_LR,
+        )
+    if WARMUP_SCHEDULER_NAME == "step_halfway":
+        milestone = max(
+            1,
+            math.ceil(trainable_epochs * WARMUP_LR_DECAY_FRACTION),
+        )
+        return MultiStepLR(
+            optimizer,
+            milestones=[milestone],
+            gamma=WARMUP_LR_DECAY_FACTOR,
+        )
+    raise ValueError(
+        "WARMUP_SCHEDULER_NAME must be 'cosine' or 'step_halfway'."
     )
 
 
@@ -963,6 +1045,10 @@ def _save_warmup_checkpoint(
     epoch: int,
     noisy_validation_accuracy: float,
     clean_validation_accuracy: float,
+    selection: str = "best",
+    best_epoch: int | None = None,
+    best_noisy_validation_accuracy: float | None = None,
+    best_clean_validation_accuracy: float | None = None,
 ) -> None:
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     try:
@@ -974,6 +1060,19 @@ def _save_warmup_checkpoint(
                 "clean_validation_accuracy": clean_validation_accuracy,
                 "noise_rate": NOISE_RATE,
                 "pretrained": PRETRAINED,
+                "warmup_model_id": WARMUP_MODEL_ID,
+                "selection": selection,
+                "best_epoch": epoch if best_epoch is None else best_epoch,
+                "best_noisy_validation_accuracy": (
+                    noisy_validation_accuracy
+                    if best_noisy_validation_accuracy is None
+                    else best_noisy_validation_accuracy
+                ),
+                "best_clean_validation_accuracy": (
+                    clean_validation_accuracy
+                    if best_clean_validation_accuracy is None
+                    else best_clean_validation_accuracy
+                ),
             },
             temporary_path,
         )
@@ -986,7 +1085,7 @@ def load_warmup_checkpoint(
     model: nn.Module,
     checkpoint_path: Path,
     device: torch.device,
-) -> dict[str, float | int]:
+) -> dict[str, object]:
     if not checkpoint_path.is_file():
         raise FileNotFoundError(
             f"Warmup checkpoint not found: {checkpoint_path}"
@@ -1017,6 +1116,18 @@ def load_warmup_checkpoint(
         raise ValueError(
             "Warmup checkpoint pretrained setting does not match this run."
         )
+    checkpoint_model_id = str(checkpoint.get("warmup_model_id", ""))
+    if WARMUP_MODEL_ID and checkpoint_model_id != WARMUP_MODEL_ID:
+        raise ValueError(
+            "Warmup model ID does not match this run: "
+            f"{checkpoint_model_id!r} != {WARMUP_MODEL_ID!r}."
+        )
+    deployment_mode = str(checkpoint.get("selection", "best"))
+    if deployment_mode != WARMUP_DEPLOY_CHECKPOINT:
+        raise ValueError(
+            "Warmup checkpoint deployment mode does not match this run: "
+            f"{deployment_mode!r} != {WARMUP_DEPLOY_CHECKPOINT!r}."
+        )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(
         device=device,
@@ -1028,13 +1139,21 @@ def load_warmup_checkpoint(
     )
     model.eval()
     return {
-        "best_epoch": int(checkpoint["epoch"]),
+        "best_epoch": int(checkpoint.get("best_epoch", checkpoint["epoch"])),
         "best_noisy_validation_accuracy": float(
-            checkpoint["noisy_validation_accuracy"]
+            checkpoint.get(
+                "best_noisy_validation_accuracy",
+                checkpoint["noisy_validation_accuracy"],
+            )
         ),
         "best_clean_validation_accuracy": float(
-            checkpoint["clean_validation_accuracy"]
+            checkpoint.get(
+                "best_clean_validation_accuracy",
+                checkpoint["clean_validation_accuracy"],
+            )
         ),
+        "deployment_mode": deployment_mode,
+        "deployment_epoch": int(checkpoint["epoch"]),
     }
 
 
@@ -1130,7 +1249,7 @@ def train_supervised_warmup(
     std: Tensor,
     warmup_csv_path: Path,
     checkpoint_path: Path,
-) -> dict[str, float | int]:
+) -> dict[str, object]:
     """Warm up semantic features using only the 40%-noisy labels."""
     if not 0 <= WARMUP_FREEZE_EPOCHS < WARMUP_EPOCHS:
         raise ValueError("WARMUP_FREEZE_EPOCHS must be in [0, WARMUP_EPOCHS).")
@@ -1141,8 +1260,8 @@ def train_supervised_warmup(
         "cuda",
         enabled=USE_AMP and AMP_DTYPE == torch.float16,
     )
-    optimizer: AdamW | None = None
-    scheduler: CosineAnnealingLR | None = None
+    optimizer: Optimizer | None = None
+    scheduler: LRScheduler | None = None
     history: list[dict[str, object]] = []
     best_noisy_accuracy = float("-inf")
     best_clean_accuracy = float("nan")
@@ -1158,10 +1277,9 @@ def train_supervised_warmup(
                 backbone_frozen=backbone_frozen,
             )
             if not backbone_frozen:
-                scheduler = CosineAnnealingLR(
+                scheduler = _build_warmup_scheduler(
                     optimizer,
-                    T_max=WARMUP_EPOCHS - WARMUP_FREEZE_EPOCHS,
-                    eta_min=WARMUP_MIN_LR,
+                    WARMUP_EPOCHS - WARMUP_FREEZE_EPOCHS,
                 )
         else:
             _set_warmup_phase(model, backbone_frozen=backbone_frozen)
@@ -1198,11 +1316,12 @@ def train_supervised_warmup(
                 logits = model(images)
                 loss = criterion(logits, targets)
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                WARMUP_GRAD_CLIP_NORM,
-            )
+            if WARMUP_GRAD_CLIP_NORM is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    WARMUP_GRAD_CLIP_NORM,
+                )
             scaler.step(optimizer)
             scaler.update()
             batch_count = end - start
@@ -1261,6 +1380,18 @@ def train_supervised_warmup(
                 noisy_validation_accuracy=best_noisy_accuracy,
                 clean_validation_accuracy=best_clean_accuracy,
             )
+        if epoch == WARMUP_EPOCHS and WARMUP_DEPLOY_CHECKPOINT == "last":
+            _save_warmup_checkpoint(
+                model,
+                checkpoint_path,
+                epoch=epoch,
+                noisy_validation_accuracy=noisy_accuracy,
+                clean_validation_accuracy=float(validation["clean_accuracy"]),
+                selection="last",
+                best_epoch=best_epoch,
+                best_noisy_validation_accuracy=best_noisy_accuracy,
+                best_clean_validation_accuracy=best_clean_accuracy,
+            )
         if scheduler is not None:
             scheduler.step()
 
@@ -1272,8 +1403,10 @@ def train_supervised_warmup(
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
     model.eval()
+    deployed_epoch = int(checkpoint["epoch"])
     print(
-        f"[WARMUP BEST] epoch={best_epoch} "
+        f"[WARMUP] deployment={WARMUP_DEPLOY_CHECKPOINT} "
+        f"deployment_epoch={deployed_epoch} best_epoch={best_epoch} "
         f"val_noisy_acc={best_noisy_accuracy:.4f} "
         f"val_clean_acc={best_clean_accuracy:.4f}"
     )
@@ -1287,6 +1420,8 @@ def train_supervised_warmup(
         "best_epoch": best_epoch,
         "best_noisy_validation_accuracy": best_noisy_accuracy,
         "best_clean_validation_accuracy": best_clean_accuracy,
+        "deployment_mode": WARMUP_DEPLOY_CHECKPOINT,
+        "deployment_epoch": deployed_epoch,
     }
 
 
@@ -1493,7 +1628,7 @@ def clean_full_training_labels(
     cleaning_per_class_path: Path,
     checkpoint_epoch: int,
 ) -> dict[str, object]:
-    """Deploy the frozen best actor for T' steps over the full train split."""
+    """Deploy the selected frozen actor for T' steps over the full train split."""
     if CLEANING_TRAJECTORY_LENGTH <= 0:
         raise ValueError("CLEANING_TRAJECTORY_LENGTH must be positive.")
     synchronize(device)
@@ -1691,7 +1826,7 @@ def compute_policy_embedding_gradient(
 
 def update_backbone_from_embedding_gradient(
     model: nn.Module,
-    optimizer: AdamW,
+    optimizer: Optimizer,
     scaler: torch.amp.GradScaler,
     raw_images: Tensor,
     embedding_gradient: Tensor,
@@ -1817,6 +1952,7 @@ def build_benchmark_config() -> Config:
             critic_lr=CRITIC_LR,
             critic_momentum=CRITIC_MOMENTUM,
             critic_weight_decay=CRITIC_WEIGHT_DECAY,
+            critic_num_bins=CRITIC_NUM_BINS,
             policy_update_mode=ACTOR_UPDATE_MODE,
             policy_update_subset_size=POLICY_UPDATE_SUBSET_SIZE,
             policy_update_batch_size=POLICY_UPDATE_BATCH_SIZE,
@@ -1872,11 +2008,13 @@ def print_configuration(
         f"channels_last={USE_CHANNELS_LAST}"
     )
     print(
-        f"actor=AdamW(lr={ACTOR_LR}, wd={ACTOR_WEIGHT_DECAY}) "
+        f"actor={ACTOR_OPTIMIZER_NAME.upper()}(lr={ACTOR_LR}, "
+        f"momentum={ACTOR_MOMENTUM}, wd={ACTOR_WEIGHT_DECAY}) "
         f"critic=SGD(lr={CRITIC_LR}, momentum={CRITIC_MOMENTUM})"
     )
     print(
         f"pretrained={PRETRAINED} warmup_epochs={WARMUP_EPOCHS} "
+        f"warmup_model_id={WARMUP_MODEL_ID or 'unset'} "
         f"warmup_freeze_epochs={WARMUP_FREEZE_EPOCHS} "
         f"warmup_batch={WARMUP_BATCH_SIZE} "
         f"warmup_label_smoothing={WARMUP_LABEL_SMOOTHING} "
@@ -1884,7 +2022,14 @@ def print_configuration(
         f"{WARMUP_MIN_NOISY_VALIDATION_ACCURACY}"
     )
     print(
-        "warmup_selection=noisy_validation_accuracy "
+        f"warmup_optimizer={WARMUP_OPTIMIZER_NAME.upper()} "
+        f"warmup_scheduler={WARMUP_SCHEDULER_NAME} "
+        f"warmup_deploy_checkpoint={WARMUP_DEPLOY_CHECKPOINT} "
+        f"rl_deploy_checkpoint={RL_DEPLOY_CHECKPOINT}"
+    )
+    print(
+        "warmup_best_metric=noisy_validation_accuracy "
+        f"warmup_deployment={WARMUP_DEPLOY_CHECKPOINT} "
         "clean_labels=reporting_only"
     )
 
@@ -1921,6 +2066,14 @@ def build_timing_rows(timings: Timings) -> list[dict[str, object]]:
 def main() -> None:
     if RL_EPOCHS <= 0:
         raise ValueError("RL_EPOCHS must be positive.")
+    if RL_DEPLOY_CHECKPOINT not in {"best", "last"}:
+        raise ValueError("RL_DEPLOY_CHECKPOINT must be 'best' or 'last'.")
+    if WARMUP_DEPLOY_CHECKPOINT not in {"best", "last"}:
+        raise ValueError(
+            "WARMUP_DEPLOY_CHECKPOINT must be 'best' or 'last'."
+        )
+    if ACTOR_OPTIMIZER_NAME not in {"adamw", "sgd"}:
+        raise ValueError("ACTOR_OPTIMIZER_NAME must be 'adamw' or 'sgd'.")
     if not 0 < POLICY_UPDATE_SAMPLES <= EXPECTED_SAMPLES:
         raise ValueError(
             "POLICY_UPDATE_SAMPLES must be in [1, EXPECTED_SAMPLES]."
@@ -2011,13 +2164,7 @@ def main() -> None:
         "model_init",
         device,
         timings,
-        lambda: timm.create_model(
-            MODEL_NAME,
-            pretrained=PRETRAINED,
-            num_classes=NUM_CLASSES,
-            drop_rate=DROP_RATE,
-            drop_path_rate=DROP_PATH_RATE,
-        ).to(
+        lambda: create_experiment_model().to(
             device=device,
             memory_format=(
                 torch.channels_last
@@ -2088,13 +2235,23 @@ def main() -> None:
     reward_function = RLNLCReward(cfg).to(device)
     critic = build_critic(cfg).to(device)
     critic_optimizer = build_critic_optimizer(critic, cfg)
-    actor_optimizer = AdamW(
-        model.parameters(),
-        lr=ACTOR_LR,
-        weight_decay=ACTOR_WEIGHT_DECAY,
-        betas=ACTOR_BETAS,
-        eps=ACTOR_EPS,
-    )
+    if ACTOR_OPTIMIZER_NAME == "adamw":
+        actor_optimizer: Optimizer = AdamW(
+            model.parameters(),
+            lr=ACTOR_LR,
+            weight_decay=ACTOR_WEIGHT_DECAY,
+            betas=ACTOR_BETAS,
+            eps=ACTOR_EPS,
+        )
+    elif ACTOR_OPTIMIZER_NAME == "sgd":
+        actor_optimizer = SGD(
+            model.parameters(),
+            lr=ACTOR_LR,
+            momentum=ACTOR_MOMENTUM,
+            weight_decay=ACTOR_WEIGHT_DECAY,
+        )
+    else:
+        raise ValueError("ACTOR_OPTIMIZER_NAME must be 'adamw' or 'sgd'.")
     scheduler_milestone = max(
         1,
         math.ceil(RL_EPOCHS * LR_DECAY_FRACTION),
@@ -2136,6 +2293,30 @@ def main() -> None:
     best_rl_epoch = 0
     best_rl_key: tuple[float, float, float] | None = None
     best_validation_summary: dict[str, object] | None = None
+
+    val_images, val_clean, val_noisy, val_noise_mask = evaluation_data["val"]
+    epoch_zero_summary, _ = evaluate_correction_split(
+        split="val",
+        epoch=0,
+        model=model,
+        policy=policy,
+        raw_images=val_images,
+        clean_labels_cpu=val_clean,
+        noisy_labels_cpu=val_noisy,
+        noise_mask_cpu=val_noise_mask,
+        device=device,
+        mean=mean,
+        std=std,
+        timings=timings,
+    )
+    validation_seconds.append(float(epoch_zero_summary["elapsed_seconds"]))
+    append_csv(train_csv_path, [epoch_zero_summary], SUMMARY_FIELDS)
+    print(
+        "[RL EPOCH 0] reporting_only=True "
+        f"val_acc={float(epoch_zero_summary['accuracy']):.6f} "
+        f"val_macro_f1={float(epoch_zero_summary['macro_f1']):.6f}"
+    )
+    seed_everything(SEED)
 
     for epoch in range(1, RL_EPOCHS + 1):
         synchronize(device)
@@ -2432,22 +2613,34 @@ def main() -> None:
     if best_validation_summary is None or best_rl_epoch == 0:
         raise RuntimeError("RL training finished without a best checkpoint.")
 
+    deployment_checkpoint_path = (
+        rl_best_checkpoint_path
+        if RL_DEPLOY_CHECKPOINT == "best"
+        else rl_last_checkpoint_path
+    )
     restored_checkpoint = measure(
-        "rl_best_restore",
+        "rl_deployment_restore",
         device,
         timings,
-        lambda: _restore_rl_model(model, rl_best_checkpoint_path, device),
+        lambda: _restore_rl_model(
+            model,
+            deployment_checkpoint_path,
+            device,
+        ),
     )
-    restored_epoch = int(restored_checkpoint["epoch"])
-    if restored_epoch != best_rl_epoch:
+    deployed_epoch = int(restored_checkpoint["epoch"])
+    expected_deployment_epoch = (
+        best_rl_epoch if RL_DEPLOY_CHECKPOINT == "best" else RL_EPOCHS
+    )
+    if deployed_epoch != expected_deployment_epoch:
         raise RuntimeError(
-            "Restored RL checkpoint epoch does not match the selected best epoch: "
-            f"{restored_epoch} != {best_rl_epoch}."
+            "Restored RL checkpoint epoch does not match the deployment mode: "
+            f"{deployed_epoch} != {expected_deployment_epoch}."
         )
     del restored_checkpoint
     print(
-        f"[RL RESTORE] checkpoint={rl_best_checkpoint_path} "
-        f"epoch={restored_epoch}"
+        f"[RL RESTORE] mode={RL_DEPLOY_CHECKPOINT} "
+        f"checkpoint={deployment_checkpoint_path} epoch={deployed_epoch}"
     )
 
     cleaning_summary: dict[str, object] | None = None
@@ -2467,13 +2660,13 @@ def main() -> None:
             cleaning_csv_path=cleaning_csv_path,
             cleaning_summary_path=cleaning_summary_path,
             cleaning_per_class_path=cleaning_per_class_path,
-            checkpoint_epoch=best_rl_epoch,
+            checkpoint_epoch=deployed_epoch,
         )
 
     test_images, test_clean, test_noisy, test_noise_mask = evaluation_data["test"]
     test_summary, test_per_class = evaluate_correction_split(
         split="test",
-        epoch=best_rl_epoch,
+        epoch=deployed_epoch,
         model=model,
         policy=policy,
         raw_images=test_images,
@@ -2509,7 +2702,7 @@ def main() -> None:
     checkpoint_names = {
         "rl_last_checkpoint",
         "rl_best_checkpoint",
-        "rl_best_restore",
+        "rl_deployment_restore",
     }
     checkpoint_total = sum(
         sum(values)
@@ -2525,6 +2718,9 @@ def main() -> None:
         [
             {
                 "dataset": DATASET_NAME,
+                "model_name": MODEL_NAME,
+                "warmup_model_id": WARMUP_MODEL_ID,
+                "image_size": IMAGE_SIZE,
                 "seed": SEED,
                 "noise_rate": NOISE_RATE,
                 "train_samples": EXPECTED_SAMPLES,
@@ -2534,12 +2730,19 @@ def main() -> None:
                 "warmup_epochs": WARMUP_EPOCHS,
                 "warmup_freeze_epochs": WARMUP_FREEZE_EPOCHS,
                 "warmup_batch_size": WARMUP_BATCH_SIZE,
+                "warmup_optimizer": WARMUP_OPTIMIZER_NAME,
+                "warmup_learning_rate": WARMUP_BACKBONE_LR,
+                "warmup_weight_decay": WARMUP_WEIGHT_DECAY,
                 "warmup_best_epoch": warmup_result["best_epoch"],
                 "warmup_best_noisy_validation_accuracy": warmup_result[
                     "best_noisy_validation_accuracy"
                 ],
                 "warmup_best_clean_validation_accuracy": warmup_result[
                     "best_clean_validation_accuracy"
+                ],
+                "warmup_deployment_mode": warmup_result["deployment_mode"],
+                "warmup_deployment_epoch": warmup_result[
+                    "deployment_epoch"
                 ],
                 "warmup_seconds": sum(timings.get("supervised_warmup", ())),
                 "rl_epochs": RL_EPOCHS,
@@ -2551,7 +2754,23 @@ def main() -> None:
                 "policy_update_mode": ACTOR_UPDATE_MODE,
                 "policy_update_samples": POLICY_UPDATE_SAMPLES,
                 "policy_update_batch_size": POLICY_UPDATE_BATCH_SIZE,
+                "actor_optimizer": ACTOR_OPTIMIZER_NAME,
+                "actor_learning_rate": ACTOR_LR,
+                "actor_momentum": ACTOR_MOMENTUM,
+                "actor_weight_decay": ACTOR_WEIGHT_DECAY,
+                "rl_epoch0_validation_accuracy": epoch_zero_summary[
+                    "accuracy"
+                ],
+                "rl_epoch0_validation_macro_f1": epoch_zero_summary[
+                    "macro_f1"
+                ],
                 "k": K,
+                "temperature": TEMPERATURE,
+                "discount_factor": DISCOUNT_FACTOR,
+                "reward_nla_weight": NLA_WEIGHT,
+                "critic_num_bins": CRITIC_NUM_BINS,
+                "lr_decay_fraction": LR_DECAY_FRACTION,
+                "lr_decay_factor": LR_DECAY_FACTOR,
                 "knn_query_chunk_size": KNN_QUERY_CHUNK_SIZE,
                 "knn_reference_chunk_size": KNN_REFERENCE_CHUNK_SIZE,
                 "correction_chunk_size": CORRECTION_CHUNK_SIZE,
@@ -2589,6 +2808,8 @@ def main() -> None:
                 "rl_best_validation_loss": best_validation_summary["loss"],
                 "rl_best_checkpoint": str(rl_best_checkpoint_path),
                 "rl_last_checkpoint": str(rl_last_checkpoint_path),
+                "rl_deployment_checkpoint": str(deployment_checkpoint_path),
+                "rl_deployment_epoch": deployed_epoch,
                 "setup_seconds": setup_total,
                 "train_seconds": sum(epoch_seconds),
                 "mean_epoch_seconds": sum(epoch_seconds) / len(epoch_seconds),
@@ -2652,6 +2873,10 @@ def main() -> None:
     print(f"warmup_checkpoint={warmup_checkpoint_path}")
     print(f"rl_best_checkpoint={rl_best_checkpoint_path}")
     print(f"rl_last_checkpoint={rl_last_checkpoint_path}")
+    print(
+        f"rl_deployment_checkpoint={deployment_checkpoint_path} "
+        f"epoch={deployed_epoch}"
+    )
     if cleaning_summary is not None:
         print(f"corrected_labels={corrected_labels_path}")
         print(f"cleaning_csv={cleaning_csv_path}")

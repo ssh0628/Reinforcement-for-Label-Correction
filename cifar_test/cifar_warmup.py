@@ -1,7 +1,6 @@
-"""Warm up one shared CIFAR-10 model from the saved 40% noisy labels.
+"""Create the fixed ``resnet18_cifar10_sn40_warmup50`` warm-up artifact.
 
-Edit the three paths below when artifacts live outside the default workspace.
-Both full and subset RL runs must load the checkpoint produced here.
+The Full RL run loads the checkpoint produced here.
 """
 
 from __future__ import annotations
@@ -11,39 +10,26 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import timm
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if TYPE_CHECKING:
-    from cifar_test import cifar_test_rtx5080 as cifar
+    from cifar_test import cifar_rl as cifar
 else:
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
-    from cifar_test import cifar_test_rtx5080 as cifar
+    from cifar_test import cifar_rl as cifar
 
 
-NOISY_LABELS_PATH = (
-    PROJECT_ROOT
-    / "outputs"
-    / "cifar10_shared"
-    / "noise_40_seed0"
-    / "train_noisy_labels.npy"
-)
-NOISE_MASK_PATH = (
-    PROJECT_ROOT
-    / "outputs"
-    / "cifar10_shared"
-    / "noise_40_seed0"
-    / "train_noise_mask.npy"
-)
-OUTPUT_DIR = PROJECT_ROOT / "outputs" / "cifar10_shared" / "warmup"
-WARMUP_CHECKPOINT_PATH = OUTPUT_DIR / "warmup_best.pt"
+NOISY_LABELS_PATH = cifar.NOISY_LABELS_PATH
+NOISE_MASK_PATH = cifar.NOISE_MASK_PATH
+WARMUP_CHECKPOINT_PATH = cifar.WARMUP_CHECKPOINT_PATH
+OUTPUT_DIR = WARMUP_CHECKPOINT_PATH.parent
 
 RUN_LOG_PATH = OUTPUT_DIR / "run.log"
 WARMUP_CSV_PATH = OUTPUT_DIR / "warmup.csv"
 TIMING_CSV_PATH = OUTPUT_DIR / "timing.csv"
-OVERWRITE = False
+OVERWRITE = cifar.CONFIG.runtime.overwrite_warmup
 
 
 def _validate_input_artifacts() -> None:
@@ -126,13 +112,7 @@ def main() -> None:
         "model_init",
         device,
         timings,
-        lambda: timm.create_model(
-            cifar.MODEL_NAME,
-            pretrained=cifar.PRETRAINED,
-            num_classes=cifar.NUM_CLASSES,
-            drop_rate=cifar.DROP_RATE,
-            drop_path_rate=cifar.DROP_PATH_RATE,
-        ).to(
+        lambda: cifar.build_model().to(
             device=device,
             memory_format=(
                 torch.channels_last
@@ -142,11 +122,11 @@ def main() -> None:
         ),
     )
     mean = torch.tensor(
-        benchmark.IMAGENET_MEAN,
+        cifar.CIFAR10_MEAN,
         device=device,
     ).reshape(1, 3, 1, 1)
     std = torch.tensor(
-        benchmark.IMAGENET_STD,
+        cifar.CIFAR10_STD,
         device=device,
     ).reshape(1, 3, 1, 1)
     benchmark.measure(
@@ -186,7 +166,9 @@ def main() -> None:
     )
     benchmark.print_timing_summary(timings)
     print(
-        f"[OK] best_epoch={result['best_epoch']} "
+        f"[OK] deployment={result['deployment_mode']} "
+        f"deployment_epoch={result['deployment_epoch']} "
+        f"best_epoch={result['best_epoch']} "
         "best_noisy_val_acc="
         f"{float(result['best_noisy_validation_accuracy']):.6f}"
     )
