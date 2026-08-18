@@ -99,6 +99,7 @@ LR_DECAY_FRACTION = CONFIG.rl.lr_decay_fraction
 
 RL_OUTPUT_FILENAMES = (
     engine.RUN_LOG_FILENAME,
+    CONFIG.output.diagnostic_log_name,
     engine.TRAIN_CSV_FILENAME,
     engine.TEST_CSV_FILENAME,
     engine.TEST_PER_CLASS_CSV_FILENAME,
@@ -322,6 +323,9 @@ def configure_engine() -> None:
     engine.NLA_WEIGHT = NLA_WEIGHT
     engine.LR_DECAY_FACTOR = LR_DECAY_FACTOR
     engine.LR_DECAY_FRACTION = LR_DECAY_FRACTION
+    engine.CHECK_LOG_FILENAME = CONFIG.output.diagnostic_log_name
+    engine.DIAGNOSTICS_ENABLED = CONFIG.runtime.enable_rl_diagnostics
+    engine.DIAGNOSTIC_PROBE_SIZE = CONFIG.runtime.diagnostic_probe_size
     engine.USE_AMP = CONFIG.runtime.use_amp
     engine.AMP_DTYPE = getattr(torch, CONFIG.runtime.amp_dtype)
     engine.USE_CHANNELS_LAST = CONFIG.runtime.use_channels_last

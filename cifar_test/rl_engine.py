@@ -8,6 +8,7 @@ warm-up, KNN, actor-critic, cleaning, metrics, checkpoint, and timing logic.
 from __future__ import annotations
 
 import csv
+import json
 import math
 import random
 import sys
@@ -38,6 +39,7 @@ from setting.config import Config
 DATASET_NAME = "CIFAR-10"
 DATASET_STAGE_PREFIX = "cifar10"
 RUN_LOG_FILENAME = "run.log"
+CHECK_LOG_FILENAME = "check.log"
 ACTOR_BEST_CHECKPOINT_FILENAME = "actor_best.pt"
 ACTOR_LAST_CHECKPOINT_FILENAME = "actor_last.pt"
 CRITIC_BEST_CHECKPOINT_FILENAME = "critic_best.pt"
@@ -126,6 +128,8 @@ AMP_DTYPE = torch.bfloat16
 USE_CHANNELS_LAST = True
 CUDNN_BENCHMARK = True
 SEED = 0
+DIAGNOSTICS_ENABLED = False
+DIAGNOSTIC_PROBE_SIZE = 1_024
 
 DATA_MEAN = (0.4914, 0.4822, 0.4465)
 DATA_STD = (0.2470, 0.2435, 0.2616)
@@ -247,6 +251,9 @@ RUN_SUMMARY_FIELDS = (
     "actor_learning_rate",
     "actor_momentum",
     "actor_weight_decay",
+    "diagnostics_enabled",
+    "diagnostic_probe_size",
+    "diagnostic_log",
     "rl_epoch0_validation_accuracy",
     "rl_epoch0_validation_macro_f1",
     "k",
@@ -711,6 +718,260 @@ def append_csv(
         if needs_header:
             writer.writeheader()
         writer.writerows(rows)
+
+
+def append_check_event(
+    path: Path,
+    event: str,
+    **values: object,
+) -> None:
+    """Append one machine-readable diagnostic event to ``check.log``."""
+    def json_safe(value: object) -> object:
+        if isinstance(value, float):
+            return value if math.isfinite(value) else str(value)
+        if isinstance(value, dict):
+            return {str(key): json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [json_safe(item) for item in value]
+        return value
+
+    record = json_safe({"event": event, **values})
+    with path.open("a", encoding="utf-8", buffering=1) as handle:
+        handle.write(
+            json.dumps(
+                record,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+        )
+        handle.write("\n")
+
+
+@torch.no_grad()
+def tensor_distribution(tensor: Tensor) -> dict[str, float | int]:
+    """Return compact finite-value statistics without retaining GPU tensors."""
+    values = tensor.detach().float()
+    if values.numel() == 0:
+        return {
+            "count": 0,
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "l2_norm": 0.0,
+            "max_abs": 0.0,
+            "finite_fraction": 1.0,
+            "nonzero_fraction": 0.0,
+        }
+    finite = torch.isfinite(values)
+    safe = torch.where(finite, values, torch.zeros_like(values))
+    metrics = torch.stack(
+        (
+            safe.mean(),
+            safe.std(unbiased=False),
+            safe.min(),
+            safe.max(),
+            safe.norm(),
+            safe.abs().max(),
+            finite.float().mean(),
+            safe.ne(0).float().mean(),
+        )
+    ).cpu().tolist()
+    return {
+        "count": values.numel(),
+        "mean": metrics[0],
+        "std": metrics[1],
+        "min": metrics[2],
+        "max": metrics[3],
+        "l2_norm": metrics[4],
+        "max_abs": metrics[5],
+        "finite_fraction": metrics[6],
+        "nonzero_fraction": metrics[7],
+    }
+
+
+@torch.no_grad()
+def snapshot_parameters(model: nn.Module) -> dict[str, Tensor]:
+    return {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+
+@torch.no_grad()
+def snapshot_batchnorm_buffers(model: nn.Module) -> dict[str, Tensor]:
+    snapshots: dict[str, Tensor] = {}
+    for module_name, module in model.named_modules():
+        if not isinstance(module, nn.modules.batchnorm._BatchNorm):
+            continue
+        prefix = f"{module_name}." if module_name else ""
+        for buffer_name in ("running_mean", "running_var", "num_batches_tracked"):
+            buffer = getattr(module, buffer_name, None)
+            if buffer is not None:
+                snapshots[f"{prefix}{buffer_name}"] = buffer.detach().clone()
+    return snapshots
+
+
+def parameter_group(name: str) -> str:
+    return name.split(".", maxsplit=1)[0]
+
+
+@torch.no_grad()
+def parameter_update_diagnostics(
+    model: nn.Module,
+    optimizer: Optimizer,
+    before: dict[str, Tensor],
+    batchnorm_before: dict[str, Tensor],
+) -> dict[str, object]:
+    """Summarize gradients and the actual optimizer parameter displacement."""
+    batchnorm_parameter_ids = {
+        id(parameter)
+        for module in model.modules()
+        if isinstance(module, nn.modules.batchnorm._BatchNorm)
+        for parameter in module.parameters(recurse=False)
+    }
+    rows: list[Tensor] = []
+    metadata: list[tuple[str, bool, int, bool]] = []
+    for name, parameter in model.named_parameters():
+        if name not in before:
+            continue
+        previous = before[name].float()
+        current = parameter.detach().float()
+        delta = current - previous
+        gradient = parameter.grad
+        if gradient is None:
+            gradient_square = current.new_zeros(())
+            gradient_max = current.new_zeros(())
+            gradient_finite = current.new_ones(())
+        else:
+            gradient_float = gradient.detach().float()
+            gradient_square = gradient_float.square().sum()
+            gradient_max = gradient_float.abs().max()
+            gradient_finite = torch.isfinite(gradient_float).all().float()
+        rows.append(
+            torch.stack(
+                (
+                    previous.square().sum(),
+                    current.square().sum(),
+                    delta.square().sum(),
+                    (previous * current).sum(),
+                    gradient_square,
+                    gradient_max,
+                    delta.abs().max(),
+                    gradient_finite,
+                )
+            )
+        )
+        metadata.append(
+            (
+                parameter_group(name),
+                id(parameter) in batchnorm_parameter_ids,
+                parameter.numel(),
+                gradient is not None,
+            )
+        )
+
+    if not rows:
+        raise RuntimeError("No trainable parameters were available for diagnostics.")
+    values = torch.stack(rows).cpu().tolist()
+
+    def aggregate(indices: list[int]) -> dict[str, float | int | bool]:
+        before_sq = sum(values[index][0] for index in indices)
+        after_sq = sum(values[index][1] for index in indices)
+        delta_sq = sum(values[index][2] for index in indices)
+        dot = sum(values[index][3] for index in indices)
+        gradient_sq = sum(values[index][4] for index in indices)
+        before_norm = math.sqrt(max(0.0, before_sq))
+        after_norm = math.sqrt(max(0.0, after_sq))
+        delta_norm = math.sqrt(max(0.0, delta_sq))
+        gradient_norm = math.sqrt(max(0.0, gradient_sq))
+        return {
+            "parameter_tensors": len(indices),
+            "parameter_elements": sum(metadata[index][2] for index in indices),
+            "parameters_with_gradient": sum(
+                int(metadata[index][3]) for index in indices
+            ),
+            "parameter_norm_before": before_norm,
+            "parameter_norm_after": after_norm,
+            "parameter_delta_norm": delta_norm,
+            "relative_parameter_delta": delta_norm / max(before_norm, 1e-12),
+            "parameter_cosine_before_after": dot
+            / max(before_norm * after_norm, 1e-12),
+            "gradient_norm": gradient_norm,
+            "gradient_max_abs": max(values[index][5] for index in indices),
+            "parameter_delta_max_abs": max(
+                values[index][6] for index in indices
+            ),
+            "gradient_all_finite": all(
+                values[index][7] == 1.0 for index in indices
+            ),
+            "delta_to_gradient_ratio": delta_norm
+            / max(gradient_norm, 1e-12),
+        }
+
+    all_indices = list(range(len(metadata)))
+    groups = sorted({item[0] for item in metadata})
+    group_diagnostics = {
+        group: aggregate(
+            [index for index, item in enumerate(metadata) if item[0] == group]
+        )
+        for group in groups
+    }
+    batchnorm_indices = [
+        index for index, item in enumerate(metadata) if item[1]
+    ]
+
+    buffer_delta_sq = 0.0
+    buffer_delta_max = 0.0
+    buffer_changed = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.modules.batchnorm._BatchNorm):
+            continue
+        prefix = f"{name}." if name else ""
+        for buffer_name in ("running_mean", "running_var", "num_batches_tracked"):
+            current = getattr(module, buffer_name, None)
+            key = f"{prefix}{buffer_name}"
+            if current is None or key not in batchnorm_before:
+                continue
+            delta = current.detach().float() - batchnorm_before[key].float()
+            delta_square = float(delta.square().sum())
+            delta_max = float(delta.abs().max()) if delta.numel() else 0.0
+            buffer_delta_sq += delta_square
+            buffer_delta_max = max(buffer_delta_max, delta_max)
+            buffer_changed += int(delta_max > 0.0)
+
+    momentum_square = 0.0
+    momentum_max = 0.0
+    momentum_tensors = 0
+    for state in optimizer.state.values():
+        momentum = state.get("momentum_buffer")
+        if momentum is None:
+            continue
+        momentum_float = momentum.detach().float()
+        momentum_square += float(momentum_float.square().sum())
+        momentum_max = max(momentum_max, float(momentum_float.abs().max()))
+        momentum_tensors += 1
+
+    return {
+        "overall": aggregate(all_indices),
+        "groups": group_diagnostics,
+        "batchnorm_affine": (
+            aggregate(batchnorm_indices) if batchnorm_indices else None
+        ),
+        "batchnorm_buffers": {
+            "buffer_count": len(batchnorm_before),
+            "changed_buffer_count": buffer_changed,
+            "delta_norm": math.sqrt(max(0.0, buffer_delta_sq)),
+            "delta_max_abs": buffer_delta_max,
+        },
+        "momentum": {
+            "buffer_count": momentum_tensors,
+            "l2_norm": math.sqrt(max(0.0, momentum_square)),
+            "max_abs": momentum_max,
+        },
+    }
 
 
 def preprocess(
@@ -1538,7 +1799,7 @@ def compute_policy_embedding_gradient(
     q_value: Tensor,
     query_indices_cpu: Tensor,
     device: torch.device,
-) -> tuple[Tensor, float]:
+) -> tuple[Tensor, float, dict[str, object] | None]:
     """Differentiate policy loss on queries using the full cached KNN graph.
 
     KNN indices are discrete and fixed within the current RL step. Query and
@@ -1596,8 +1857,30 @@ def compute_policy_embedding_gradient(
     selected_embedding_gradient = (
         embedding_gradient[query_indices].detach().clone()
     )
+    diagnostics: dict[str, object] | None = None
+    if DIAGNOSTICS_ENABLED:
+        full_distribution = tensor_distribution(embedding_gradient)
+        selected_distribution = tensor_distribution(selected_embedding_gradient)
+        full_norm = float(full_distribution["l2_norm"])
+        selected_norm = float(selected_distribution["l2_norm"])
+        outside_norm = math.sqrt(
+            max(0.0, full_norm * full_norm - selected_norm * selected_norm)
+        )
+        diagnostics = {
+            "full_graph_gradient": full_distribution,
+            "selected_vjp_gradient": selected_distribution,
+            "full_graph_row_norm": tensor_distribution(
+                embedding_gradient.float().norm(dim=1)
+            ),
+            "selected_vjp_row_norm": tensor_distribution(
+                selected_embedding_gradient.float().norm(dim=1)
+            ),
+            "outside_selected_gradient_norm": outside_norm,
+            "selected_gradient_norm_fraction": selected_norm
+            / max(full_norm, 1e-12),
+        }
     del embedding_leaf
-    return selected_embedding_gradient, float(total_loss)
+    return selected_embedding_gradient, float(total_loss), diagnostics
 
 
 def update_backbone_from_embedding_gradient(
@@ -1610,13 +1893,19 @@ def update_backbone_from_embedding_gradient(
     device: torch.device,
     mean: Tensor,
     std: Tensor,
-) -> None:
+) -> dict[str, object] | None:
     """Map selected embedding gradients through the actor backbone.
 
     The cached policy graph may use every dataset sample, but this VJP sends
     gradients through only the chosen full/subset actor-update set.
     """
     model.eval()
+    parameter_before = (
+        snapshot_parameters(model) if DIAGNOSTICS_ENABLED else None
+    )
+    batchnorm_before = (
+        snapshot_batchnorm_buffers(model) if DIAGNOSTICS_ENABLED else None
+    )
     optimizer.zero_grad(set_to_none=True)
     sample_count = raw_images.size(0)
     if update_indices_cpu.ndim != 1 or update_indices_cpu.numel() == 0:
@@ -1660,8 +1949,89 @@ def update_backbone_from_embedding_gradient(
                 f"samples={end}/{update_count}"
             )
 
+    if DIAGNOSTICS_ENABLED:
+        scaler.unscale_(optimizer)
     scaler.step(optimizer)
     scaler.update()
+    if parameter_before is None or batchnorm_before is None:
+        return None
+    diagnostics = parameter_update_diagnostics(
+        model,
+        optimizer,
+        parameter_before,
+        batchnorm_before,
+    )
+    del parameter_before, batchnorm_before
+    return diagnostics
+
+
+@torch.inference_mode()
+def embedding_drift_diagnostics(
+    model: nn.Module,
+    probe_images: Tensor,
+    embeddings_before: Tensor,
+    device: torch.device,
+    mean: Tensor,
+    std: Tensor,
+) -> dict[str, object]:
+    """Measure representation drift on a fixed probe set after one update."""
+    model.eval()
+    images = preprocess(probe_images, device, mean, std)
+    with torch.autocast(
+        device_type=device.type,
+        dtype=AMP_DTYPE,
+        enabled=USE_AMP,
+    ):
+        embeddings_after = encode(model, images).float()
+    before = embeddings_before.detach().float()
+    cosine = F.cosine_similarity(before, embeddings_after, dim=1)
+    before_norm = before.norm(dim=1)
+    after_norm = embeddings_after.norm(dim=1)
+    absolute_l2 = (embeddings_after - before).norm(dim=1)
+    relative_l2 = absolute_l2 / before_norm.clamp_min(1e-12)
+    return {
+        "probe_samples": before.size(0),
+        "cosine_similarity": tensor_distribution(cosine),
+        "absolute_l2_change": tensor_distribution(absolute_l2),
+        "relative_l2_change": tensor_distribution(relative_l2),
+        "embedding_norm_before": tensor_distribution(before_norm),
+        "embedding_norm_after": tensor_distribution(after_norm),
+    }
+
+
+@torch.inference_mode()
+def knn_graph_diagnostics(
+    embeddings: Tensor,
+    neighbors: Tensor,
+    clean_labels: Tensor,
+    noisy_labels: Tensor,
+    state_labels: Tensor,
+) -> dict[str, object]:
+    """Report semantic KNN purity, feature scale, and graph hubness."""
+    clean_purity = clean_labels[neighbors].eq(
+        clean_labels.unsqueeze(1)
+    ).float().mean()
+    noisy_purity = noisy_labels[neighbors].eq(
+        noisy_labels.unsqueeze(1)
+    ).float().mean()
+    state_purity = state_labels[neighbors].eq(
+        state_labels.unsqueeze(1)
+    ).float().mean()
+    purities = torch.stack((clean_purity, noisy_purity, state_purity)).cpu()
+    indegree = torch.bincount(
+        neighbors.flatten(),
+        minlength=embeddings.size(0),
+    ).float()
+    return {
+        "clean_label_purity": float(purities[0]),
+        "noisy_label_purity": float(purities[1]),
+        "current_state_purity": float(purities[2]),
+        "embedding_values": tensor_distribution(embeddings),
+        "embedding_row_norm": tensor_distribution(
+            embeddings.float().norm(dim=1)
+        ),
+        "neighbor_indegree": tensor_distribution(indegree),
+    }
 
 
 def update_critic(
@@ -1670,7 +2040,10 @@ def update_critic(
     encoding: Tensor,
     reward: Tensor,
     next_encoding: Tensor | None,
-) -> float:
+) -> tuple[float, dict[str, object] | None]:
+    parameter_before = (
+        snapshot_parameters(critic) if DIAGNOSTICS_ENABLED else None
+    )
     optimizer.zero_grad(set_to_none=True)
     current_q = critic.value_from_encoding(encoding)
     terminal = next_encoding is None
@@ -1686,7 +2059,26 @@ def update_critic(
     )
     td.loss.backward()
     optimizer.step()
-    return float(td.loss.detach())
+    loss = float(td.loss.detach())
+    if parameter_before is None:
+        return loss, None
+    diagnostics = {
+        "terminal": terminal,
+        "current_q": float(current_q.detach()),
+        "reward": float(reward.detach()),
+        "next_q": float(next_q.detach()),
+        "td_target": float(td.target.detach()),
+        "td_error": float(td.error.detach()),
+        "td_loss": loss,
+        "parameter_update": parameter_update_diagnostics(
+            critic,
+            optimizer,
+            parameter_before,
+            {},
+        ),
+    }
+    del parameter_before
+    return loss, diagnostics
 
 
 def build_engine_config() -> Config:
@@ -1785,6 +2177,11 @@ def print_configuration(
         f"critic=SGD(lr={CRITIC_LR}, momentum={CRITIC_MOMENTUM})"
     )
     print(
+        f"rl_diagnostics={DIAGNOSTICS_ENABLED} "
+        f"diagnostic_probe_size={DIAGNOSTIC_PROBE_SIZE} "
+        f"check_log={OUTPUT_DIR / CHECK_LOG_FILENAME}"
+    )
+    print(
         f"pretrained={PRETRAINED} warmup_epochs={WARMUP_EPOCHS} "
         f"warmup_model_id={WARMUP_MODEL_ID or 'unset'} "
         f"warmup_batch={WARMUP_BATCH_SIZE} "
@@ -1847,6 +2244,8 @@ def main() -> None:
         raise ValueError(
             "POLICY_UPDATE_BATCH_SIZE cannot exceed POLICY_UPDATE_SAMPLES."
         )
+    if DIAGNOSTICS_ENABLED and DIAGNOSTIC_PROBE_SIZE <= 0:
+        raise ValueError("DIAGNOSTIC_PROBE_SIZE must be positive when enabled.")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     actor_best_checkpoint_path = OUTPUT_DIR / ACTOR_BEST_CHECKPOINT_FILENAME
     actor_last_checkpoint_path = OUTPUT_DIR / ACTOR_LAST_CHECKPOINT_FILENAME
@@ -1857,6 +2256,7 @@ def main() -> None:
     test_per_class_path = OUTPUT_DIR / TEST_PER_CLASS_CSV_FILENAME
     timing_csv_path = OUTPUT_DIR / TIMING_CSV_FILENAME
     run_summary_path = OUTPUT_DIR / RUN_SUMMARY_CSV_FILENAME
+    check_log_path = OUTPUT_DIR / CHECK_LOG_FILENAME
     corrected_labels_path = (
         CORRECTED_LABELS_OUTPUT_PATH
         if CORRECTED_LABELS_OUTPUT_PATH is not None
@@ -1866,6 +2266,8 @@ def main() -> None:
     cleaning_summary_path = OUTPUT_DIR / CLEANING_SUMMARY_FILENAME
     cleaning_per_class_path = OUTPUT_DIR / CLEANING_PER_CLASS_FILENAME
     write_csv(train_csv_path, [], SUMMARY_FIELDS)
+    if DIAGNOSTICS_ENABLED:
+        check_log_path.write_text("", encoding="utf-8")
 
     device = resolve_local_device()
     seed_everything(SEED)
@@ -2015,6 +2417,79 @@ def main() -> None:
     clean_labels = clean_labels_cpu.to(device, non_blocking=True)
     initial_noisy_labels = noisy_labels_cpu.to(device, non_blocking=True)
     noise_mask = noise_mask_cpu.to(device, non_blocking=True)
+    diagnostic_probe_indices_cpu: Tensor | None = None
+    diagnostic_probe_indices_device: Tensor | None = None
+    diagnostic_probe_images: Tensor | None = None
+    if DIAGNOSTICS_ENABLED:
+        probe_size = min(DIAGNOSTIC_PROBE_SIZE, EXPECTED_SAMPLES)
+        diagnostic_probe_indices_cpu = (
+            torch.arange(probe_size, dtype=torch.long)
+            * EXPECTED_SAMPLES
+            // probe_size
+        )
+        diagnostic_probe_indices_device = diagnostic_probe_indices_cpu.to(
+            device=device,
+            non_blocking=True,
+        )
+        diagnostic_probe_images = pin_for_cuda(
+            raw_images[diagnostic_probe_indices_cpu].contiguous()
+        )
+        initial_actor_parameters = snapshot_parameters(model)
+        initial_actor_batchnorm = snapshot_batchnorm_buffers(model)
+        initial_critic_parameters = snapshot_parameters(critic)
+        append_check_event(
+            check_log_path,
+            "run_start",
+            schema_version=1,
+            seed=SEED,
+            actor_learning_rate=ACTOR_LR,
+            actor_momentum=ACTOR_MOMENTUM,
+            actor_weight_decay=ACTOR_WEIGHT_DECAY,
+            critic_learning_rate=CRITIC_LR,
+            critic_momentum=CRITIC_MOMENTUM,
+            critic_weight_decay=CRITIC_WEIGHT_DECAY,
+            discount_factor=DISCOUNT_FACTOR,
+            reward_nla_weight=NLA_WEIGHT,
+            update_mode=ACTOR_UPDATE_MODE,
+            update_samples=POLICY_UPDATE_SAMPLES,
+            update_batch_size=POLICY_UPDATE_BATCH_SIZE,
+            probe_samples=probe_size,
+            amp=USE_AMP,
+            amp_dtype=str(AMP_DTYPE),
+            model_training=model.training,
+            batchnorm_training_modules=sum(
+                int(module.training)
+                for module in model.modules()
+                if isinstance(module, nn.modules.batchnorm._BatchNorm)
+            ),
+            fixed_knn=knn_graph_diagnostics(
+                fixed_embeddings,
+                global_neighbors,
+                clean_labels,
+                initial_noisy_labels,
+                initial_noisy_labels,
+            ),
+            fixed_knn_cosine=tensor_distribution(global_cosines),
+            actor_initial=parameter_update_diagnostics(
+                model,
+                actor_optimizer,
+                initial_actor_parameters,
+                initial_actor_batchnorm,
+            ),
+            critic_initial=parameter_update_diagnostics(
+                critic,
+                critic_optimizer,
+                initial_critic_parameters,
+                {},
+            ),
+            cuda_allocated_gib=torch.cuda.memory_allocated(device) / 1024**3,
+            cuda_reserved_gib=torch.cuda.memory_reserved(device) / 1024**3,
+        )
+        del (
+            initial_actor_parameters,
+            initial_actor_batchnorm,
+            initial_critic_parameters,
+        )
     epoch_seconds: list[float] = []
     validation_seconds: list[float] = []
     final_train_summary: dict[str, object] | None = None
@@ -2099,6 +2574,17 @@ def main() -> None:
                 lambda: build_neighbor_indices(policy_embeddings),
                 step=global_step,
             )
+            step_knn_diagnostics = (
+                knn_graph_diagnostics(
+                    policy_embeddings,
+                    policy_neighbors,
+                    clean_labels,
+                    initial_noisy_labels,
+                    label_state.argmax(dim=1),
+                )
+                if DIAGNOSTICS_ENABLED
+                else None
+            )
             correction = measure(
                 "full_correction",
                 device,
@@ -2147,7 +2633,11 @@ def main() -> None:
                 EXPECTED_SAMPLES,
                 global_step,
             )
-            embedding_gradient, actor_loss = measure(
+            (
+                embedding_gradient,
+                actor_loss,
+                policy_gradient_diagnostics,
+            ) = measure(
                 "actor_policy_gradient",
                 device,
                 timings,
@@ -2163,7 +2653,12 @@ def main() -> None:
                 ),
                 step=global_step,
             )
-            measure(
+            probe_embeddings_before = (
+                policy_embeddings[diagnostic_probe_indices_device].detach()
+                if diagnostic_probe_indices_device is not None
+                else None
+            )
+            actor_update_diagnostics = measure(
                 "actor_backbone_update",
                 device,
                 timings,
@@ -2180,31 +2675,53 @@ def main() -> None:
                 ),
                 step=global_step,
             )
+            step_embedding_drift = None
+            if (
+                diagnostic_probe_images is not None
+                and probe_embeddings_before is not None
+            ):
+                step_embedding_drift = measure(
+                    "actor_embedding_drift_diagnostics",
+                    device,
+                    timings,
+                    lambda: embedding_drift_diagnostics(
+                        model,
+                        diagnostic_probe_images,
+                        probe_embeddings_before,
+                        device,
+                        mean,
+                        std,
+                    ),
+                    step=global_step,
+                )
             del embedding_gradient
 
             step_critic_losses: list[float] = []
+            step_critic_diagnostics: list[dict[str, object]] = []
 
             def perform_critic_updates() -> tuple[float, ...]:
                 if previous_encoding is not None and previous_reward is not None:
-                    step_critic_losses.append(
-                        update_critic(
-                            critic,
-                            critic_optimizer,
-                            previous_encoding,
-                            previous_reward,
-                            encoding,
-                        )
+                    critic_loss, critic_diagnostics = update_critic(
+                        critic,
+                        critic_optimizer,
+                        previous_encoding,
+                        previous_reward,
+                        encoding,
                     )
+                    step_critic_losses.append(critic_loss)
+                    if critic_diagnostics is not None:
+                        step_critic_diagnostics.append(critic_diagnostics)
                 if step == TRAJECTORY_LENGTH:
-                    step_critic_losses.append(
-                        update_critic(
-                            critic,
-                            critic_optimizer,
-                            encoding,
-                            reward_output.total_reward,
-                            None,
-                        )
+                    critic_loss, critic_diagnostics = update_critic(
+                        critic,
+                        critic_optimizer,
+                        encoding,
+                        reward_output.total_reward,
+                        None,
                     )
+                    step_critic_losses.append(critic_loss)
+                    if critic_diagnostics is not None:
+                        step_critic_diagnostics.append(critic_diagnostics)
                 return tuple(step_critic_losses)
 
             if previous_encoding is not None or step == TRAJECTORY_LENGTH:
@@ -2230,6 +2747,104 @@ def main() -> None:
             clean_accuracy = float(
                 current_hard_labels.eq(clean_labels).float().mean()
             )
+            if DIAGNOSTICS_ENABLED:
+                probabilities = correction.correction_probabilities.float()
+                stable_probabilities = probabilities.clamp(1e-7, 1.0 - 1e-7)
+                probability_entropy = -(
+                    stable_probabilities * stable_probabilities.log()
+                    + (1.0 - stable_probabilities)
+                    * torch.log1p(-stable_probabilities)
+                )
+                soft_labels = correction.corrected_labels.float().clamp_min(
+                    1e-12
+                )
+                label_entropy = -(soft_labels * soft_labels.log()).sum(dim=1)
+                reward_scalars = torch.stack(
+                    (
+                        reward_output.label_consistency,
+                        reward_output.noisy_label_alignment,
+                        reward_output.total_reward,
+                    )
+                ).detach().float().cpu().tolist()
+                append_check_event(
+                    check_log_path,
+                    "rl_step",
+                    epoch=epoch,
+                    trajectory_step=step,
+                    global_step=global_step,
+                    actor_learning_rate=actor_optimizer.param_groups[0]["lr"],
+                    critic_learning_rate=critic_optimizer.param_groups[0]["lr"],
+                    reward={
+                        "label_consistency": reward_scalars[0],
+                        "noisy_label_alignment": reward_scalars[1],
+                        "total": reward_scalars[2],
+                        "per_sample_consistency": tensor_distribution(
+                            reward_output.per_sample_consistency
+                        ),
+                    },
+                    critic={
+                        "q_used_by_actor": float(q_value),
+                        "state_encoding": tensor_distribution(encoding),
+                        "updates": step_critic_diagnostics,
+                    },
+                    policy={
+                        "actor_loss": actor_loss,
+                        "action_count": step_action_count,
+                        "action_rate": step_action_count / EXPECTED_SAMPLES,
+                        "correction_probability": tensor_distribution(
+                            probabilities
+                        ),
+                        "selected_action_probability": tensor_distribution(
+                            probabilities[correction.actions]
+                        ),
+                        "rejected_action_probability": tensor_distribution(
+                            probabilities[~correction.actions]
+                        ),
+                        "bernoulli_entropy": tensor_distribution(
+                            probability_entropy
+                        ),
+                        "corrected_label_entropy": tensor_distribution(
+                            label_entropy
+                        ),
+                    },
+                    labels={
+                        "changed_from_noisy_rate": changed_from_noisy_rate,
+                        "clean_accuracy": clean_accuracy,
+                    },
+                    knn=step_knn_diagnostics,
+                    policy_gradient=policy_gradient_diagnostics,
+                    actor_update=actor_update_diagnostics,
+                    embedding_drift=step_embedding_drift,
+                    timing_seconds={
+                        name: timings[name][-1]
+                        for name in (
+                            "actor_feature_extraction",
+                            "exact_policy_knn",
+                            "full_correction",
+                            "reward_including_clean_knn",
+                            "critic_state_encoding",
+                            "actor_policy_gradient",
+                            "actor_backbone_update",
+                            "actor_embedding_drift_diagnostics",
+                            "critic_update",
+                        )
+                        if timings.get(name)
+                        and (name != "critic_update" or step_critic_losses)
+                    },
+                    amp_scale=float(scaler.get_scale()),
+                    model_training=model.training,
+                    batchnorm_training_modules=sum(
+                        int(module.training)
+                        for module in model.modules()
+                        if isinstance(module, nn.modules.batchnorm._BatchNorm)
+                    ),
+                    cuda_allocated_gib=torch.cuda.memory_allocated(device)
+                    / 1024**3,
+                    cuda_reserved_gib=torch.cuda.memory_reserved(device)
+                    / 1024**3,
+                    cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(device)
+                    / 1024**3,
+                )
             print(
                 f"[RL] epoch={epoch} step={step} "
                 f"reward={reward_value:.6f} q={float(q_value):.6f} "
@@ -2290,6 +2905,28 @@ def main() -> None:
             [train_summary, val_summary],
             SUMMARY_FIELDS,
         )
+        if DIAGNOSTICS_ENABLED:
+            append_check_event(
+                check_log_path,
+                "epoch_summary",
+                epoch=epoch,
+                train=train_summary,
+                validation=val_summary,
+                actor_learning_rate_next_epoch=actor_optimizer.param_groups[0][
+                    "lr"
+                ],
+                critic_learning_rate_next_epoch=critic_optimizer.param_groups[0][
+                    "lr"
+                ],
+                mean_reward=sum(epoch_rewards) / len(epoch_rewards),
+                mean_actor_loss=sum(epoch_actor_losses)
+                / len(epoch_actor_losses),
+                mean_critic_loss=mean_critic_loss,
+                cuda_peak_allocated_gib=torch.cuda.max_memory_allocated(device)
+                / 1024**3,
+                cuda_peak_reserved_gib=torch.cuda.max_memory_reserved(device)
+                / 1024**3,
+            )
 
         def save_epoch_checkpoints(
             actor_path: Path,
@@ -2489,6 +3126,13 @@ def main() -> None:
                 "actor_learning_rate": ACTOR_LR,
                 "actor_momentum": ACTOR_MOMENTUM,
                 "actor_weight_decay": ACTOR_WEIGHT_DECAY,
+                "diagnostics_enabled": DIAGNOSTICS_ENABLED,
+                "diagnostic_probe_size": (
+                    DIAGNOSTIC_PROBE_SIZE if DIAGNOSTICS_ENABLED else 0
+                ),
+                "diagnostic_log": (
+                    str(check_log_path) if DIAGNOSTICS_ENABLED else ""
+                ),
                 "rl_epoch0_validation_accuracy": epoch_zero_summary[
                     "accuracy"
                 ],
@@ -2617,6 +3261,8 @@ def main() -> None:
         print(f"cleaning_summary_csv={cleaning_summary_path}")
         print(f"cleaning_per_class_csv={cleaning_per_class_path}")
     print(f"train_csv={train_csv_path}")
+    if DIAGNOSTICS_ENABLED:
+        print(f"check_log={check_log_path}")
     print(f"test_csv={test_csv_path}")
     print(f"test_per_class_csv={test_per_class_path}")
     print(f"timing_csv={timing_csv_path}")

@@ -1,8 +1,7 @@
 """Single source of truth for the CIFAR-10 ResNet-18 experiment.
 
-Edit this file before moving the project to another machine. In particular,
-``DataConfig.root`` and ``OutputConfig.root`` may be changed to absolute paths
-on the training machine. No output path is tied to the repository location.
+The default project location targets the H100 machine. Change ``PROJECT_ROOT``
+once if the repository is moved; data and output paths follow automatically.
 """
 
 from __future__ import annotations
@@ -11,9 +10,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+PROJECT_ROOT = Path("/root/project/rlnlc")
+
+
 @dataclass(frozen=True, slots=True)
 class DataConfig:
-    root: Path = Path("data/cifar10")
+    root: Path = PROJECT_ROOT / "data" / "cifar10"
     download: bool = True
     classes: tuple[int, ...] = tuple(range(10))
     train_samples: int = 50_000
@@ -84,7 +86,8 @@ class RLConfig:
 
 @dataclass(frozen=True, slots=True)
 class OutputConfig:
-    root: Path = Path("outputs")
+    root: Path = PROJECT_ROOT / "outputs"
+    experiment_tag: str = "actorlr1e-2_check"
 
     warmup_checkpoint_name: str = "resnet18_cifar10_sn40_warmup50.pt"
     actor_best_checkpoint_name: str = "actor_best.pt"
@@ -93,6 +96,7 @@ class OutputConfig:
     critic_last_checkpoint_name: str = "critic_last.pt"
     corrected_labels_name: str = "train_corrected_labels.npy"
     finetune_checkpoint_name: str = "finetune_last.pt"
+    diagnostic_log_name: str = "check.log"
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +118,8 @@ class RuntimeConfig:
     use_channels_last: bool = True
     cudnn_benchmark: bool = True
     final_test_batch_size: int = 1_024
+    enable_rl_diagnostics: bool = True
+    diagnostic_probe_size: int = 1_024
     overwrite_noise: bool = False
     overwrite_warmup: bool = False
     overwrite_rl: bool = False
@@ -165,9 +171,14 @@ class ResNet18CIFARConfig:
 
     @property
     def experiment_id(self) -> str:
-        return (
+        base = (
             f"{self.warmup.model_id}_"
             f"{self.rl.update_mode}_noise{self.noise_tag}"
+        )
+        return (
+            f"{base}_{self.output.experiment_tag}"
+            if self.output.experiment_tag
+            else base
         )
 
     @property
@@ -251,9 +262,15 @@ class ResNet18CIFARConfig:
             self.output.critic_last_checkpoint_name,
             self.output.corrected_labels_name,
             self.output.finetune_checkpoint_name,
+            self.output.diagnostic_log_name,
         )
         if not all(name and Path(name).name == name for name in output_names):
             raise ValueError("Output artifact names must be non-empty filenames.")
+        if self.output.experiment_tag and (
+            Path(self.output.experiment_tag).name != self.output.experiment_tag
+            or self.output.experiment_tag in {".", ".."}
+        ):
+            raise ValueError("output.experiment_tag must be a single path component.")
         positive_values = (
             self.warmup.epochs,
             self.warmup.batch_size,
@@ -266,6 +283,7 @@ class ResNet18CIFARConfig:
             self.finetune.epochs,
             self.finetune.batch_size,
             self.runtime.final_test_batch_size,
+            self.runtime.diagnostic_probe_size,
         )
         if any(value <= 0 for value in positive_values):
             raise ValueError(
