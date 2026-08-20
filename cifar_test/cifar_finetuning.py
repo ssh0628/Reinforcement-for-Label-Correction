@@ -1,17 +1,16 @@
 """Fine-tune an RLNLC CIFAR-10 model on saved corrected labels.
 
-This stage only trains and saves ``finetune_last.pt``. Run
-``cifar_final_test.py`` separately to evaluate the saved checkpoint.
+The last RL actor always supplies the corrected labels. The initial model is
+selected in ``cifar_config.py`` as warmup, best_actor, or last_actor. Run
+``cifar_evaluate.py`` separately to evaluate the saved checkpoint.
 """
 
 from __future__ import annotations
 
-import csv
+import math
 import sys
 import time
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -20,16 +19,15 @@ from torch.optim import SGD
 from torch.optim.lr_scheduler import MultiStepLR
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if TYPE_CHECKING:
-    from cifar_test import cifar_rl as cifar
-else:
-    if str(PROJECT_ROOT) not in sys.path:
-        sys.path.insert(0, str(PROJECT_ROOT))
-    from cifar_test import cifar_rl as cifar
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from cifar_test import cifar_common as cifar
 
 
 CONFIG = cifar.CONFIG
-ACTOR_CHECKPOINT_PATH = CONFIG.actor_last_checkpoint_path
+INITIALIZATION = CONFIG.finetune.initialization
+INITIAL_CHECKPOINT_PATH = CONFIG.finetune_initial_checkpoint_path
 CORRECTED_LABELS_PATH = CONFIG.corrected_labels_path
 OUTPUT_DIR = CONFIG.finetune_output_dir
 
@@ -38,7 +36,7 @@ TRAIN_BATCH_SIZE = CONFIG.finetune.batch_size
 LEARNING_RATE = CONFIG.finetune.learning_rate
 MOMENTUM = CONFIG.finetune.momentum
 WEIGHT_DECAY = CONFIG.finetune.weight_decay
-LR_DECAY_EPOCH = round(
+LR_DECAY_EPOCH = math.ceil(
     FINETUNE_EPOCHS * CONFIG.finetune.lr_decay_fraction
 )
 LR_DECAY_FACTOR = CONFIG.finetune.lr_decay_factor
@@ -66,42 +64,18 @@ def _validate_output_destination(*, include_log: bool) -> None:
     ]
     if include_log:
         paths.append(RUN_LOG_PATH)
-    existing = [path for path in paths if path.exists()]
-    if existing and not OVERWRITE:
-        raise FileExistsError(
-            f"Fine-tuning outputs already exist: {existing}. Set "
-            "OVERWRITE=True only when replacement is intentional."
-        )
+    cifar.require_available_outputs(
+        paths,
+        overwrite=OVERWRITE,
+        stage="Fine-tuning",
+    )
 
 
 def _validate_input_artifacts() -> None:
-    missing = [
-        path
-        for path in (ACTOR_CHECKPOINT_PATH, CORRECTED_LABELS_PATH)
-        if not path.is_file()
-    ]
-    if missing:
-        raise FileNotFoundError(f"Fine-tuning inputs not found: {missing}")
-    if (
-        ACTOR_CHECKPOINT_PATH.parent.resolve()
-        != CORRECTED_LABELS_PATH.parent.resolve()
-    ):
-        raise ValueError(
-            "ACTOR_CHECKPOINT_PATH and CORRECTED_LABELS_PATH must come from "
-            "the same RL output directory."
-        )
-
-
-def _write_csv(
-    path: Path,
-    rows: list[dict[str, object]],
-    fieldnames: tuple[str, ...],
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    cifar.require_files(
+        (INITIAL_CHECKPOINT_PATH, CORRECTED_LABELS_PATH),
+        stage="Fine-tuning",
+    )
 
 
 def _load_corrected_labels(clean_labels: Tensor) -> Tensor:
@@ -110,7 +84,10 @@ def _load_corrected_labels(clean_labels: Tensor) -> Tensor:
             f"Corrected-label artifact not found: {CORRECTED_LABELS_PATH}"
         )
     array = np.load(CORRECTED_LABELS_PATH, allow_pickle=False)
-    labels = torch.from_numpy(np.asarray(array)).to(torch.long).contiguous()
+    array = np.asarray(array)
+    if not np.issubdtype(array.dtype, np.integer):
+        raise TypeError("Corrected labels must use an integer NumPy dtype.")
+    labels = torch.from_numpy(array).to(torch.long).contiguous()
     if labels.shape != clean_labels.shape:
         raise ValueError(
             "Corrected labels do not match CIFAR-10 train size: "
@@ -123,33 +100,49 @@ def _load_corrected_labels(clean_labels: Tensor) -> Tensor:
     return cifar.engine.pin_for_cuda(labels)
 
 
-def _load_actor(device: torch.device) -> nn.Module:
-    if not ACTOR_CHECKPOINT_PATH.is_file():
+def _load_initial_model(device: torch.device) -> nn.Module:
+    if not INITIAL_CHECKPOINT_PATH.is_file():
         raise FileNotFoundError(
-            f"Actor checkpoint not found: {ACTOR_CHECKPOINT_PATH}"
+            f"Initial checkpoint not found: {INITIAL_CHECKPOINT_PATH}"
         )
     checkpoint = torch.load(
-        ACTOR_CHECKPOINT_PATH,
+        INITIAL_CHECKPOINT_PATH,
         map_location="cpu",
         weights_only=True,
     )
     if not isinstance(checkpoint, dict):
-        raise TypeError("Actor checkpoint must contain a dictionary.")
-    required = {"model", "model_name", "num_classes", "epoch"}
+        raise TypeError("Initial checkpoint must contain a dictionary.")
+    required = {"model", "epoch"}
     missing = required.difference(checkpoint)
     if missing:
-        raise KeyError(f"Actor checkpoint is missing fields: {sorted(missing)}")
-    if checkpoint["model_name"] != cifar.MODEL_NAME:
-        raise ValueError("Actor checkpoint model name does not match CIFAR config.")
-    if int(checkpoint["num_classes"]) != cifar.NUM_CLASSES:
-        raise ValueError("Actor checkpoint class count does not match CIFAR-10.")
+        raise KeyError(
+            f"Initial checkpoint is missing fields: {sorted(missing)}"
+        )
+    if (
+        "model_name" in checkpoint
+        and checkpoint["model_name"] != cifar.MODEL_NAME
+    ):
+        raise ValueError("Initial checkpoint model name does not match config.")
+    if (
+        "num_classes" in checkpoint
+        and int(checkpoint["num_classes"]) != cifar.NUM_CLASSES
+    ):
+        raise ValueError("Initial checkpoint class count does not match CIFAR-10.")
+    if INITIALIZATION == "warmup" and (
+        checkpoint.get("warmup_model_id") != CONFIG.warmup.model_id
+    ):
+        raise ValueError("Warmup checkpoint model ID does not match config.")
+    if INITIALIZATION == "last_actor" and int(checkpoint["epoch"]) != CONFIG.rl.epochs:
+        raise ValueError(
+            "last_actor initialization must use the configured final RL epoch."
+        )
 
     model = cifar.build_model()
     try:
         model.load_state_dict(checkpoint["model"], strict=True)
     except RuntimeError as error:
         raise RuntimeError(
-            "The actor checkpoint does not contain the classifier head."
+            "The initial checkpoint does not contain the classifier head."
         ) from error
     model.to(
         device=device,
@@ -170,7 +163,8 @@ def _save_checkpoint(model: nn.Module) -> None:
         "epoch": FINETUNE_EPOCHS,
         "model_name": cifar.MODEL_NAME,
         "num_classes": cifar.NUM_CLASSES,
-        "source_actor_checkpoint": str(ACTOR_CHECKPOINT_PATH),
+        "initialization": INITIALIZATION,
+        "source_checkpoint": str(INITIAL_CHECKPOINT_PATH),
         "corrected_labels": str(CORRECTED_LABELS_PATH),
         "optimizer": CONFIG.finetune.optimizer,
         "learning_rate": LEARNING_RATE,
@@ -191,6 +185,7 @@ def main() -> None:
     _validate_input_artifacts()
     _validate_output_destination(include_log=False)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    FINAL_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     cifar.configure_engine()
     engine = cifar.engine
@@ -201,7 +196,7 @@ def main() -> None:
 
     train_images, clean_train_labels = cifar.load_full_cifar10_train()
     corrected_labels = _load_corrected_labels(clean_train_labels)
-    model = _load_actor(device)
+    model = _load_initial_model(device)
     mean = torch.tensor(cifar.CIFAR10_MEAN, device=device).reshape(
         1, 3, 1, 1
     )
@@ -229,7 +224,8 @@ def main() -> None:
     history: list[dict[str, object]] = []
 
     print(f"device={device} ({torch.cuda.get_device_name(device)})")
-    print(f"actor_checkpoint={ACTOR_CHECKPOINT_PATH}")
+    print(f"initialization={INITIALIZATION}")
+    print(f"initial_checkpoint={INITIAL_CHECKPOINT_PATH}")
     print(f"corrected_labels={CORRECTED_LABELS_PATH}")
     print(f"epochs={FINETUNE_EPOCHS} batch_size={TRAIN_BATCH_SIZE}")
     print(
@@ -303,7 +299,7 @@ def main() -> None:
             "elapsed_seconds": elapsed,
         }
         history.append(row)
-        _write_csv(TRAIN_CSV_PATH, history, TRAIN_FIELDS)
+        engine.write_csv(TRAIN_CSV_PATH, history, TRAIN_FIELDS)
         print(
             f"[FINETUNE] epoch={epoch}/{FINETUNE_EPOCHS} "
             f"loss={float(row['loss']):.6f} "
@@ -315,19 +311,13 @@ def main() -> None:
     _save_checkpoint(model)
     print(f"checkpoint={FINAL_CHECKPOINT_PATH}")
     print(f"train_csv={TRAIN_CSV_PATH}")
-    print("next_stage=cifar_test/cifar_final_test.py")
+    print("next_stage=cifar_test/cifar_evaluate.py")
 
 
 def run_with_file_logging() -> None:
     _validate_input_artifacts()
     _validate_output_destination(include_log=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with RUN_LOG_PATH.open("w", encoding="utf-8", buffering=1) as handle:
-        stdout = cifar.engine.TeeStream(sys.stdout, handle)
-        stderr = cifar.engine.TeeStream(sys.stderr, handle)
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            print(f"run_log={RUN_LOG_PATH}")
-            main()
+    cifar.run_with_log(RUN_LOG_PATH, main)
 
 
 if __name__ == "__main__":

@@ -6,25 +6,21 @@ Both full and subset RL runs load the checkpoint produced here.
 from __future__ import annotations
 
 import sys
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if TYPE_CHECKING:
-    from cifar_test import cifar_rl as cifar
-else:
-    if str(PROJECT_ROOT) not in sys.path:
-        sys.path.insert(0, str(PROJECT_ROOT))
-    from cifar_test import cifar_rl as cifar
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from cifar_test import cifar_common as cifar
 
 
 NOISY_LABELS_PATH = cifar.NOISY_LABELS_PATH
 NOISE_MASK_PATH = cifar.NOISE_MASK_PATH
 WARMUP_CHECKPOINT_PATH = cifar.WARMUP_CHECKPOINT_PATH
-OUTPUT_DIR = WARMUP_CHECKPOINT_PATH.parent
+OUTPUT_DIR = cifar.CONFIG.warmup_log_dir
 
 RUN_LOG_PATH = OUTPUT_DIR / "run.log"
 WARMUP_CSV_PATH = OUTPUT_DIR / "warmup.csv"
@@ -33,25 +29,21 @@ OVERWRITE = cifar.CONFIG.runtime.overwrite_warmup
 
 
 def _validate_input_artifacts() -> None:
-    missing = [
-        path
-        for path in (NOISY_LABELS_PATH, NOISE_MASK_PATH)
-        if not path.is_file()
-    ]
-    if missing:
-        raise FileNotFoundError(f"Warmup inputs not found: {missing}")
+    cifar.require_files(
+        (NOISY_LABELS_PATH, NOISE_MASK_PATH),
+        stage="Warmup",
+    )
 
 
 def _validate_output_destination(*, include_log: bool) -> None:
     paths = [WARMUP_CHECKPOINT_PATH, WARMUP_CSV_PATH, TIMING_CSV_PATH]
     if include_log:
         paths.append(RUN_LOG_PATH)
-    existing = [path for path in paths if path.exists()]
-    if existing and not OVERWRITE:
-        raise FileExistsError(
-            f"Warmup outputs already exist: {existing}. Set OVERWRITE=True "
-            "only when replacement is intentional."
-        )
+    cifar.require_available_outputs(
+        paths,
+        overwrite=OVERWRITE,
+        stage="Warmup",
+    )
 
 
 def main() -> None:
@@ -63,6 +55,7 @@ def main() -> None:
     engine.EXTERNAL_NOISE_MASK_PATH = NOISE_MASK_PATH
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    WARMUP_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     device = engine.resolve_local_device()
     engine.seed_everything(cifar.SEED)
@@ -86,7 +79,7 @@ def main() -> None:
         "cifar10_eval_load",
         device,
         timings,
-        cifar.load_cifar10_validation_test,
+        cifar.load_cifar10_validation,
     )
     val_images, val_clean_labels = evaluation_splits["val"]
     val_noisy_labels, _ = engine.measure(
@@ -178,13 +171,7 @@ def main() -> None:
 def run_with_file_logging() -> None:
     _validate_input_artifacts()
     _validate_output_destination(include_log=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with RUN_LOG_PATH.open("w", encoding="utf-8", buffering=1) as handle:
-        stdout = cifar.engine.TeeStream(sys.stdout, handle)
-        stderr = cifar.engine.TeeStream(sys.stderr, handle)
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            print(f"run_log={RUN_LOG_PATH}")
-            main()
+    cifar.run_with_log(RUN_LOG_PATH, main)
 
 
 if __name__ == "__main__":

@@ -1,34 +1,34 @@
-"""Evaluate the fine-tuned model on the official clean CIFAR-10 test split."""
+"""Evaluate the fine-tuned model on the held-out clean CIFAR-10 test split.
+
+The other half of the official CIFAR-10 test set is used for validation, so
+only the untouched 5,000-image half is used here to avoid validation leakage.
+"""
 
 from __future__ import annotations
 
-import csv
 import math
 import sys
 import time
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor, nn
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if TYPE_CHECKING:
-    from cifar_test import cifar_rl as cifar
-else:
-    if str(PROJECT_ROOT) not in sys.path:
-        sys.path.insert(0, str(PROJECT_ROOT))
-    from cifar_test import cifar_rl as cifar
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from cifar_test import cifar_common as cifar
 
 
 CONFIG = cifar.CONFIG
 FINETUNE_CHECKPOINT_PATH = CONFIG.finetune_checkpoint_path
-OUTPUT_DIR = CONFIG.final_test_output_dir
+INITIALIZATION = CONFIG.finetune.initialization
+OUTPUT_DIR = CONFIG.evaluate_output_dir
 
-TEST_BATCH_SIZE = CONFIG.runtime.final_test_batch_size
+TEST_BATCH_SIZE = CONFIG.runtime.evaluate_batch_size
 SEED = CONFIG.data.seed
-OVERWRITE = CONFIG.runtime.overwrite_final_test
+OVERWRITE = CONFIG.runtime.overwrite_evaluate
 
 RUN_LOG_PATH = OUTPUT_DIR / "run.log"
 TEST_CSV_PATH = OUTPUT_DIR / "test.csv"
@@ -54,31 +54,15 @@ PER_CLASS_FIELDS = (
 
 
 def _validate_paths(*, include_log: bool) -> None:
-    if not FINETUNE_CHECKPOINT_PATH.is_file():
-        raise FileNotFoundError(
-            f"Fine-tuned checkpoint not found: {FINETUNE_CHECKPOINT_PATH}"
-        )
+    cifar.require_files((FINETUNE_CHECKPOINT_PATH,), stage="Evaluation")
     outputs = [TEST_CSV_PATH, TEST_PER_CLASS_CSV_PATH]
     if include_log:
         outputs.append(RUN_LOG_PATH)
-    existing = [path for path in outputs if path.exists()]
-    if existing and not OVERWRITE:
-        raise FileExistsError(
-            f"Final-test outputs already exist: {existing}. Set "
-            "OVERWRITE=True only when replacement is intentional."
-        )
-
-
-def _write_csv(
-    path: Path,
-    rows: list[dict[str, object]],
-    fieldnames: tuple[str, ...],
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    cifar.require_available_outputs(
+        outputs,
+        overwrite=OVERWRITE,
+        stage="Evaluation",
+    )
 
 
 def _load_model(device: torch.device) -> nn.Module:
@@ -99,6 +83,10 @@ def _load_model(device: torch.device) -> nn.Module:
         raise ValueError("Checkpoint model name does not match CIFAR config.")
     if int(checkpoint["num_classes"]) != cifar.NUM_CLASSES:
         raise ValueError("Checkpoint class count does not match CIFAR-10.")
+    if checkpoint.get("initialization") != INITIALIZATION:
+        raise ValueError(
+            "Checkpoint initialization does not match the configured ablation."
+        )
 
     model = cifar.build_model()
     model.load_state_dict(checkpoint["model"], strict=True)
@@ -217,14 +205,15 @@ def main() -> None:
     engine.seed_everything(SEED)
     torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
 
-    test_images, test_labels = cifar.load_full_cifar10_test()
-    if test_images.size(0) != 10_000 or test_labels.size(0) != 10_000:
-        raise RuntimeError("Unexpected official CIFAR-10 test size.")
+    test_images, test_labels = cifar.load_cifar10_evaluation_split("test")
+    if test_images.size(0) != 5_000 or test_labels.size(0) != 5_000:
+        raise RuntimeError("Unexpected held-out CIFAR-10 test size.")
     model = _load_model(device)
 
     print(f"device={device} ({torch.cuda.get_device_name(device)})")
+    print(f"initialization={INITIALIZATION}")
     print(f"checkpoint={FINETUNE_CHECKPOINT_PATH}")
-    print(f"official_test_samples={test_labels.numel()}")
+    print(f"held_out_test_samples={test_labels.numel()}")
     engine.synchronize(device)
     started = time.perf_counter()
     summary, per_class = _evaluate(
@@ -239,8 +228,12 @@ def main() -> None:
     if not math.isfinite(float(summary["loss"])):
         raise RuntimeError("Final test loss is not finite.")
 
-    _write_csv(TEST_CSV_PATH, [summary], TEST_FIELDS)
-    _write_csv(TEST_PER_CLASS_CSV_PATH, per_class, PER_CLASS_FIELDS)
+    engine.write_csv(TEST_CSV_PATH, [summary], TEST_FIELDS)
+    engine.write_csv(
+        TEST_PER_CLASS_CSV_PATH,
+        per_class,
+        PER_CLASS_FIELDS,
+    )
     print(
         f"[FINAL TEST] samples={summary['samples']} "
         f"loss={float(summary['loss']):.6f} "
@@ -255,13 +248,7 @@ def main() -> None:
 
 def run_with_file_logging() -> None:
     _validate_paths(include_log=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with RUN_LOG_PATH.open("w", encoding="utf-8", buffering=1) as handle:
-        stdout = cifar.engine.TeeStream(sys.stdout, handle)
-        stderr = cifar.engine.TeeStream(sys.stderr, handle)
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            print(f"run_log={RUN_LOG_PATH}")
-            main()
+    cifar.run_with_log(RUN_LOG_PATH, main)
 
 
 if __name__ == "__main__":

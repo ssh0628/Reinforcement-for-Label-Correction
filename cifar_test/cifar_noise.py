@@ -1,6 +1,6 @@
 """Create one reusable 40% symmetric-noise artifact for CIFAR-10.
 
-All paths and generation settings come from ``config_resent18.py``. Every
+All paths and generation settings come from ``cifar_config.py``. Every
 baseline loads the same saved labels and mask instead of generating noise
 independently.
 """
@@ -23,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from cifar_test.config_resent18 import CONFIG
+from cifar_test.cifar_config import CONFIG
 
 
 CIFAR10_ROOT = CONFIG.data_root
