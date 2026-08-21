@@ -63,42 +63,29 @@ def validate_cleaning_destination(cfg: Config) -> None:
     existing = [path for path in output_paths if path.exists()]
     if existing and not cfg.cleaning.overwrite:
         raise FileExistsError(
-            "Cleaning output already exists: "
-            f"{existing}. Set cleaning.overwrite=True to replace it."
+            f"Cleaning output already exists: {existing}. Set cleaning.overwrite=True to replace it."
         )
 
 
 def load_cleaning_checkpoint(
-    cfg: Config,
-    global_cache_path: Path,
-    global_cache_provenance_sha256: str,
+    cfg: Config, global_cache_path: Path, global_cache_provenance_sha256: str
 ) -> dict[str, object]:
     checkpoint_path = cfg.cleaning.checkpoint_path
     if not checkpoint_path.is_file():
-        raise FileNotFoundError(
-            f"RL cleaning checkpoint not found: {checkpoint_path}"
-        )
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=True,
-    )
+        raise FileNotFoundError(f"RL cleaning checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict):
         raise TypeError("RL cleaning checkpoint must contain a dictionary.")
     missing = REQUIRED_POLICY_CHECKPOINT_KEYS.difference(checkpoint)
     if missing:
-        raise ValueError(
-            f"RL cleaning checkpoint is missing fields: {sorted(missing)}."
-        )
+        raise ValueError(f"RL cleaning checkpoint is missing fields: {sorted(missing)}.")
     if checkpoint["version"] != TRAINER_CHECKPOINT_VERSION:
         raise ValueError(
             "Unsupported RL cleaning checkpoint version: "
             f"{checkpoint['version']} != {TRAINER_CHECKPOINT_VERSION}."
         )
     if checkpoint["epoch"] != cfg.rl_train.epochs:
-        raise ValueError(
-            "Final cleaning requires a checkpoint from the last RL epoch."
-        )
+        raise ValueError("Final cleaning requires a checkpoint from the last RL epoch.")
     if tuple(checkpoint["class_names"]) != cfg.data.class_names:
         raise ValueError("RL cleaning checkpoint class names do not match config.")
     if checkpoint["model_name"] != cfg.model.name:
@@ -106,16 +93,9 @@ def load_cleaning_checkpoint(
 
     checkpoint_cache_path = Path(str(checkpoint["global_knn_cache"]))
     if checkpoint_cache_path.resolve() != global_cache_path.resolve():
-        raise ValueError(
-            "RL cleaning checkpoint global KNN cache does not match config."
-        )
-    if (
-        checkpoint["global_knn_provenance_sha256"]
-        != global_cache_provenance_sha256
-    ):
-        raise ValueError(
-            "RL cleaning checkpoint was trained with a different Global KNN cache."
-        )
+        raise ValueError("RL cleaning checkpoint global KNN cache does not match config.")
+    if checkpoint["global_knn_provenance_sha256"] != global_cache_provenance_sha256:
+        raise ValueError("RL cleaning checkpoint was trained with a different Global KNN cache.")
     saved_signature = checkpoint["training_signature"]
     expected_signature = build_rl_training_signature(cfg)
     if not isinstance(saved_signature, Mapping):
@@ -126,10 +106,7 @@ def load_cleaning_checkpoint(
         if saved_signature.get(key) != expected_signature.get(key)
     )
     if mismatches:
-        raise ValueError(
-            "Cleaning settings differ from the trained policy: "
-            f"{mismatches}."
-        )
+        raise ValueError(f"Cleaning settings differ from the trained policy: {mismatches}.")
     actor_state = checkpoint["actor"]
     if not isinstance(actor_state, Mapping):
         raise TypeError("RL cleaning checkpoint actor state must be a mapping.")
@@ -152,9 +129,7 @@ class LabelCleaner:
     ) -> None:
         cfg.validate()
         if loader.dataset is not dataset or loader.sampler is not sampler:
-            raise ValueError(
-                "Cleaning loader must use the supplied dataset and sampler."
-            )
+            raise ValueError("Cleaning loader must use the supplied dataset and sampler.")
         self.actor = actor
         self.dataset = dataset
         self.sampler = sampler
@@ -183,10 +158,7 @@ class LabelCleaner:
         artifact_temp = output_dir / f".{artifact_path.name}.tmp"
         labels_temp = output_dir / f".{labels_path.name}.tmp"
 
-        hard_labels = state.hard_labels.detach().cpu().numpy().astype(
-            np.int64,
-            copy=False,
-        )
+        hard_labels = state.hard_labels.detach().cpu().numpy().astype(np.int64, copy=False)
         artifact = {
             "version": CLEANING_ARTIFACT_VERSION,
             "split": self.cfg.global_knn.split,
@@ -197,17 +169,11 @@ class LabelCleaner:
             "model_name": self.cfg.model.name,
             "policy_checkpoint": str(self.checkpoint_path),
             "global_knn_cache": str(self.global_cache_path),
-            "global_knn_provenance_sha256": (
-                self.global_cache_provenance_sha256
-            ),
-            "dataset_manifest_sha256": dataset_manifest_fingerprint(
-                self.dataset.paths
-            ),
+            "global_knn_provenance_sha256": (self.global_cache_provenance_sha256),
+            "dataset_manifest_sha256": dataset_manifest_fingerprint(self.dataset.paths),
             "label_state": state.state_dict(),
             "last_actions": last_actions.detach().cpu().clone(),
-            "last_correction_probabilities": (
-                last_probabilities.detach().cpu().clone()
-            ),
+            "last_correction_probabilities": (last_probabilities.detach().cpu().clone()),
             "history": [asdict(item) for item in history],
             "corrected_labels_file": labels_path.name,
         }
@@ -223,37 +189,22 @@ class LabelCleaner:
         return artifact_path, labels_path
 
     def run(self) -> CleaningResult:
-        state = LabelState.from_noisy_labels(
-            self.dataset.targets,
-            self.cfg.num_classes,
-            device=self.device,
-        )
+        state = LabelState.from_noisy_labels(self.dataset.targets, self.cfg.num_classes, device=self.device)
         embeddings, policy_neighbors = build_actor_policy_graph(
-            self.actor,
-            self.sampler,
-            self.loader,
-            len(self.dataset),
-            self.device,
-            self.cfg,
+            self.actor, self.sampler, self.loader, len(self.dataset), self.device, self.cfg
         )
         history: list[CleaningStepMetrics] = []
         last_actions: Tensor | None = None
         last_probabilities: Tensor | None = None
 
         for step in range(1, self.cfg.cleaning.trajectory_length + 1):
-            correction = self.actor.policy.correct_all(
-                embeddings,
-                state.current_labels,
-                policy_neighbors,
-            )
+            correction = self.actor.policy.correct_all(embeddings, state.current_labels, policy_neighbors)
             state = state.transition(correction.corrected_labels)
             last_actions = correction.actions
             last_probabilities = correction.correction_probabilities
             metrics = CleaningStepMetrics(
                 step=step,
-                mean_correction_probability=float(
-                    correction.correction_probabilities.mean()
-                ),
+                mean_correction_probability=float(correction.correction_probabilities.mean()),
                 action_rate=float(correction.actions.float().mean()),
                 cumulative_changed_rate=state.correction_rate,
             )
@@ -268,12 +219,7 @@ class LabelCleaner:
         if last_actions is None or last_probabilities is None:
             raise RuntimeError("Cleaning completed without a correction step.")
         del embeddings, policy_neighbors
-        artifact_path, labels_path = self._save_outputs(
-            state,
-            history,
-            last_actions,
-            last_probabilities,
-        )
+        artifact_path, labels_path = self._save_outputs(state, history, last_actions, last_probabilities)
         return CleaningResult(
             final_state=state,
             history=tuple(history),
@@ -297,19 +243,12 @@ def build_label_cleaner(cfg: Config) -> LabelCleaner:
     cache_labels = global_cache.labels
     del global_cache
 
-    checkpoint = load_cleaning_checkpoint(
-        cfg,
-        global_cache_path,
-        global_cache_provenance_sha256,
-    )
+    checkpoint = load_cleaning_checkpoint(cfg, global_cache_path, global_cache_provenance_sha256)
     actor = load_policy_actor(cfg, device)
     actor.load_state_dict(checkpoint["actor"], strict=True)
     del checkpoint
     dataset, sampler, loader = build_rl_loader(actor, cfg, device)
-    if len(dataset) != cache_sample_count or not torch.equal(
-        dataset.targets,
-        cache_labels,
-    ):
+    if len(dataset) != cache_sample_count or not torch.equal(dataset.targets, cache_labels):
         raise ValueError("Cleaning dataset does not match the global KNN cache.")
     del cache_labels
     return LabelCleaner(

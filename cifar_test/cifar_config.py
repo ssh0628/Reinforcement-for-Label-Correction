@@ -1,10 +1,4 @@
-"""Single source of truth for the CIFAR-10 ResNet-18 experiment.
-
-The default project location targets the H100 machine. Change ``PROJECT_ROOT``
-once if the repository is moved; data and output paths follow automatically.
-"""
-
-from __future__ import annotations
+"""CIFAR-10 ResNet-18 experiment configuration."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,15 +9,18 @@ PROJECT_ROOT = Path("/root/project/rlnlc")
 
 @dataclass(frozen=True, slots=True)
 class DataConfig:
-    root: Path = PROJECT_ROOT / "data" / "cifar10"
+    root: Path = PROJECT_ROOT / "cifar10"
     download: bool = True
+
     classes: tuple[int, ...] = tuple(range(10))
-    train_samples: int = 50_000
+    train_samples: int = 10_000
+    subset_seed: int = 0
+    noise_rate: float = 0.50
+
+    seed: int = 0
     image_size: int = 32
     mean: tuple[float, float, float] = (0.4914, 0.4822, 0.4465)
     std: tuple[float, float, float] = (0.2470, 0.2435, 0.2616)
-    noise_rate: float = 0.40
-    seed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,8 +30,15 @@ class ModelConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class TrainingAugmentationConfig:
+    enabled: bool = True
+    random_crop_padding: int = 4
+    horizontal_flip_probability: float = 0.5
+
+
+@dataclass(frozen=True, slots=True)
 class WarmupConfig:
-    model_id: str = "resnet18_cifar10_sn40_warmup50"
+    model_id: str = "exp1_warmup"
     epochs: int = 50
     batch_size: int = 128
     eval_batch_size: int = 1_024
@@ -62,11 +66,12 @@ class RLConfig:
     trajectory_length: int = 10
     initial_state_randomization_rate: float = 0.10
     feature_batch_size: int = 1_024
-    update_mode: str = "full"  # "full" or "subset"
+    update_mode: str = "full"
     subset_size: int = 5_000
-    # Direct query microbatch (memory control only). Each forward can contain
-    # up to update_batch_size * (k + 1) query/neighbor image occurrences.
+
     update_batch_size: int = 512
+    record_change_diagnostics: bool = True
+    change_diagnostic_probe_size: int = 50_000
 
     actor_optimizer: str = "sgd"
     actor_learning_rate: float = 1e-2
@@ -91,24 +96,9 @@ class CorrectionConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class OutputConfig:
-    """Compact experiment layout rooted at ``cifar_output/expN``."""
-
-    root: Path = PROJECT_ROOT / "cifar_output"
-    experiment_name: str = "exp1"
-
-    warmup_checkpoint_name: str = "warmup.pt"
-    actor_best_checkpoint_name: str = "actor_best.pt"
-    actor_last_checkpoint_name: str = "actor_last.pt"
-    critic_best_checkpoint_name: str = "critic_best.pt"
-    critic_last_checkpoint_name: str = "critic_last.pt"
-    corrected_labels_name: str = "train_corrected_labels.npy"
-    finetune_checkpoint_name: str = "finetune_last.pt"
-
-
-@dataclass(frozen=True, slots=True)
 class FineTuneConfig:
-    initialization: str = "last_actor"  # warmup, best_actor, or last_actor
+    initialization: str = "warmup"
+    evaluation_checkpoint: str = "accuracy"
     epochs: int = 100
     batch_size: int = 128
     optimizer: str = "sgd"
@@ -117,6 +107,21 @@ class FineTuneConfig:
     weight_decay: float = 5e-4
     lr_decay_fraction: float = 0.5
     lr_decay_factor: float = 0.1
+
+
+@dataclass(frozen=True, slots=True)
+class OutputConfig:
+    root: Path = PROJECT_ROOT / "cifar_output"
+    experiment_name: str = "exp1"
+    warmup_checkpoint_name: str = "warmup.pt"
+    actor_best_checkpoint_name: str = "actor_best.pt"
+    actor_last_checkpoint_name: str = "actor_last.pt"
+    critic_best_checkpoint_name: str = "critic_best.pt"
+    critic_last_checkpoint_name: str = "critic_last.pt"
+    corrected_labels_name: str = "train_corrected_soft_labels.npy"
+    finetune_best_accuracy_checkpoint_name: str = "finetune_best_accuracy.pt"
+    finetune_best_loss_checkpoint_name: str = "finetune_best_loss.pt"
+    finetune_last_checkpoint_name: str = "finetune_last.pt"
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +143,7 @@ class RuntimeConfig:
 class ResNet18CIFARConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    augmentation: TrainingAugmentationConfig = field(default_factory=TrainingAugmentationConfig)
     warmup: WarmupConfig = field(default_factory=WarmupConfig)
     knn: KNNConfig = field(default_factory=KNNConfig)
     rl: RLConfig = field(default_factory=RLConfig)
@@ -160,9 +166,15 @@ class ResNet18CIFARConfig:
 
     @property
     def noise_output_dir(self) -> Path:
-        return self.data_root / (
-            f"cifar10_noise_{self.noise_tag}_seed{self.data.seed}"
+        name = (
+            f"cifar10_train{self.data.train_samples}_subsetseed{self.data.subset_seed}_"
+            f"noise{self.noise_tag}_seed{self.data.seed}"
         )
+        return self.data_root / name
+
+    @property
+    def experiment_output_dir(self) -> Path:
+        return self.output_root / self.output.experiment_name
 
     @property
     def warmup_output_dir(self) -> Path:
@@ -179,14 +191,6 @@ class ResNet18CIFARConfig:
     @property
     def warmup_checkpoint_path(self) -> Path:
         return self.warmup_model_dir / self.output.warmup_checkpoint_name
-
-    @property
-    def experiment_id(self) -> str:
-        return self.output.experiment_name
-
-    @property
-    def experiment_output_dir(self) -> Path:
-        return self.output_root / self.experiment_id
 
     @property
     def mode_output_dir(self) -> Path:
@@ -206,9 +210,15 @@ class ResNet18CIFARConfig:
 
     @property
     def actor_update_samples(self) -> int:
-        if self.rl.update_mode == "full":
-            return self.data.train_samples
-        return self.rl.subset_size
+        return self.data.train_samples if self.rl.update_mode == "full" else self.rl.subset_size
+
+    @property
+    def actor_update_batch_size(self) -> int:
+        return min(self.rl.update_batch_size, self.actor_update_samples)
+
+    @property
+    def change_diagnostic_probe_size(self) -> int:
+        return min(self.rl.change_diagnostic_probe_size, self.data.train_samples)
 
     @property
     def actor_best_checkpoint_path(self) -> Path:
@@ -240,12 +250,11 @@ class ResNet18CIFARConfig:
 
     @property
     def finetune_initial_checkpoint_path(self) -> Path:
-        sources = {
+        return {
             "warmup": self.warmup_checkpoint_path,
             "best_actor": self.actor_best_checkpoint_path,
             "last_actor": self.actor_last_checkpoint_path,
-        }
-        return sources[self.finetune.initialization]
+        }[self.finetune.initialization]
 
     @property
     def finetune_output_dir(self) -> Path:
@@ -260,161 +269,77 @@ class ResNet18CIFARConfig:
         return self.log_output_dir / "evaluate"
 
     @property
-    def finetune_checkpoint_path(self) -> Path:
-        return self.finetune_model_dir / self.output.finetune_checkpoint_name
+    def finetune_best_accuracy_checkpoint_path(self) -> Path:
+        return self.finetune_model_dir / self.output.finetune_best_accuracy_checkpoint_name
+
+    @property
+    def finetune_best_loss_checkpoint_path(self) -> Path:
+        return self.finetune_model_dir / self.output.finetune_best_loss_checkpoint_name
+
+    @property
+    def finetune_last_checkpoint_path(self) -> Path:
+        return self.finetune_model_dir / self.output.finetune_last_checkpoint_name
+
+    @property
+    def finetune_evaluation_checkpoint_path(self) -> Path:
+        return {
+            "accuracy": self.finetune_best_accuracy_checkpoint_path,
+            "loss": self.finetune_best_loss_checkpoint_path,
+        }[self.finetune.evaluation_checkpoint]
 
     def validate(self) -> None:
-        if self.model.pretrained:
-            raise ValueError("The paper-style ResNet-18 must not be pretrained.")
         if not self.data_root.is_absolute() or not self.output_root.is_absolute():
             raise ValueError("Data and output roots must be absolute paths.")
+        if self.model.pretrained:
+            raise ValueError("The paper-style ResNet-18 must not be pretrained.")
         if self.data.classes != tuple(range(10)):
             raise ValueError("CIFAR-10 classes must be 0 through 9.")
+        if not 0 < self.data.train_samples <= 50_000 or self.data.train_samples % 10:
+            raise ValueError("train_samples must be in [1, 50000] and divisible by 10.")
         if not 0 <= self.data.noise_rate < 1:
             raise ValueError("noise_rate must be in [0, 1).")
-        if self.data.train_samples != 50_000 or self.data.image_size != 32:
-            raise ValueError(
-                "The CIFAR-10 baseline requires 50,000 native 32x32 images."
-            )
-        if len(self.data.mean) != 3 or len(self.data.std) != 3:
-            raise ValueError("CIFAR-10 mean and std must contain three values.")
-        if any(value <= 0 for value in self.data.std):
-            raise ValueError("CIFAR-10 standard deviations must be positive.")
-        if not self.warmup.model_id:
-            raise ValueError("warmup.model_id must not be empty.")
-        if (
-            self.warmup.optimizer.lower() != "sgd"
-            or self.rl.actor_optimizer.lower() != "sgd"
-        ):
-            raise ValueError("This paper-style baseline requires SGD.")
-        if (
-            self.rl.critic_optimizer.lower() != "sgd"
-            or self.finetune.optimizer.lower() != "sgd"
-        ):
-            raise ValueError("Critic and fine-tuning optimizers must be SGD.")
         if self.rl.update_mode not in {"full", "subset"}:
-            raise ValueError("rl.update_mode must be 'full' or 'subset'.")
-        if self.finetune.initialization not in {
-            "warmup",
-            "best_actor",
-            "last_actor",
-        }:
-            raise ValueError(
-                "finetune.initialization must be warmup, best_actor, or "
-                "last_actor."
-            )
-        if not 0 < self.rl.subset_size <= self.data.train_samples:
-            raise ValueError(
-                "rl.subset_size must be in [1, data.train_samples]."
-            )
-        if self.rl.update_batch_size > self.actor_update_samples:
-            raise ValueError(
-                "rl.update_batch_size cannot exceed actor_update_samples."
-            )
-        if not 0 < self.rl.initial_state_randomization_rate < 1:
-            raise ValueError(
-                "rl.initial_state_randomization_rate must be in (0, 1)."
-            )
-        if not 0 <= self.rl.discount_factor <= 1:
-            raise ValueError("rl.discount_factor must be in [0, 1].")
-        if self.rl.reward_nla_weight < 0 or self.rl.critic_num_bins < 2:
-            raise ValueError(
-                "RL reward weight must be non-negative and critic bins at "
-                "least two."
-            )
-        momentums = (
-            self.warmup.momentum,
-            self.rl.actor_momentum,
-            self.rl.critic_momentum,
-            self.finetune.momentum,
-        )
-        if any(value < 0 for value in momentums):
-            raise ValueError("SGD momentums must be non-negative.")
+            raise ValueError("update_mode must be 'full' or 'subset'.")
+        if self.rl.update_mode == "subset" and not 0 < self.rl.subset_size <= self.data.train_samples:
+            raise ValueError("subset_size must be in [1, train_samples].")
+        if self.finetune.initialization not in {"warmup", "best_actor", "last_actor"}:
+            raise ValueError("Invalid fine-tuning initialization.")
+        if self.finetune.evaluation_checkpoint not in {"accuracy", "loss"}:
+            raise ValueError("evaluation_checkpoint must be accuracy or loss.")
         if self.knn.k >= self.data.train_samples:
-            raise ValueError("knn.k must be smaller than data.train_samples.")
-        if (
-            self.knn.query_chunk_size <= 0
-            or self.knn.reference_chunk_size <= 0
-            or self.knn.correction_chunk_size <= 0
-        ):
-            raise ValueError("KNN and correction chunk sizes must be positive.")
-        learning_rates = (
-            self.warmup.learning_rate,
-            self.rl.actor_learning_rate,
-            self.rl.critic_learning_rate,
-            self.finetune.learning_rate,
-        )
-        if any(value <= 0 for value in learning_rates):
-            raise ValueError("All learning rates must be positive.")
-        weight_decays = (
-            self.warmup.weight_decay,
-            self.rl.actor_weight_decay,
-            self.rl.critic_weight_decay,
-            self.finetune.weight_decay,
-        )
-        if any(value < 0 for value in weight_decays):
-            raise ValueError("Weight decays must be non-negative.")
-        schedule_values = (
-            (self.warmup.lr_decay_fraction, self.warmup.lr_decay_factor),
-            (self.rl.lr_decay_fraction, self.rl.lr_decay_factor),
-            (self.finetune.lr_decay_fraction, self.finetune.lr_decay_factor),
-        )
-        if any(
-            not 0 < fraction <= 1 or not 0 < factor <= 1
-            for fraction, factor in schedule_values
-        ):
-            raise ValueError(
-                "LR decay fractions and factors must be in (0, 1]."
-            )
+            raise ValueError("k must be smaller than train_samples.")
+        if not 0 < self.rl.initial_state_randomization_rate < 1:
+            raise ValueError("initial_state_randomization_rate must be in (0, 1).")
+        if not 0 <= self.rl.discount_factor <= 1:
+            raise ValueError("discount_factor must be in [0, 1].")
         if self.runtime.amp_dtype not in {"float16", "bfloat16"}:
-            raise ValueError("runtime.amp_dtype must be float16 or bfloat16.")
-        output_names = (
-            self.output.warmup_checkpoint_name,
-            self.output.actor_best_checkpoint_name,
-            self.output.actor_last_checkpoint_name,
-            self.output.critic_best_checkpoint_name,
-            self.output.critic_last_checkpoint_name,
-            self.output.corrected_labels_name,
-            self.output.finetune_checkpoint_name,
-        )
-        if not all(name and Path(name).name == name for name in output_names):
-            raise ValueError("Output artifact names must be non-empty filenames.")
-        rl_checkpoint_names = (
-            self.output.actor_best_checkpoint_name,
-            self.output.actor_last_checkpoint_name,
-            self.output.critic_best_checkpoint_name,
-            self.output.critic_last_checkpoint_name,
-        )
-        if len(set(rl_checkpoint_names)) != len(rl_checkpoint_names):
-            raise ValueError("RL checkpoint filenames must be distinct.")
-        if (
-            not self.output.experiment_name
-            or Path(self.output.experiment_name).name
-            != self.output.experiment_name
-            or self.output.experiment_name in {".", ".."}
-        ):
-            raise ValueError(
-                "output.experiment_name must be one non-empty path component."
-            )
-        positive_values = (
+            raise ValueError("amp_dtype must be float16 or bfloat16.")
+
+        positive = (
             self.warmup.epochs,
             self.warmup.batch_size,
             self.warmup.eval_batch_size,
             self.rl.epochs,
             self.rl.trajectory_length,
-            self.correction.trajectory_length,
             self.rl.feature_batch_size,
             self.rl.update_batch_size,
-            self.knn.k,
-            self.knn.temperature,
+            self.rl.change_diagnostic_probe_size,
+            self.correction.trajectory_length,
             self.finetune.epochs,
             self.finetune.batch_size,
             self.runtime.evaluate_batch_size,
+            self.knn.k,
+            self.knn.temperature,
+            self.knn.query_chunk_size,
+            self.knn.reference_chunk_size,
+            self.knn.correction_chunk_size,
+            self.warmup.learning_rate,
+            self.rl.actor_learning_rate,
+            self.rl.critic_learning_rate,
+            self.finetune.learning_rate,
         )
-        if any(value <= 0 for value in positive_values):
-            raise ValueError(
-                "Training counts and positive hyperparameters must be positive."
-            )
+        if any(value <= 0 for value in positive):
+            raise ValueError("Epochs, batch sizes, chunk sizes, and learning rates must be positive.")
 
 
 CONFIG = ResNet18CIFARConfig()

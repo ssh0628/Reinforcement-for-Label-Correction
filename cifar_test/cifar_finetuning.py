@@ -1,8 +1,9 @@
-"""Fine-tune an RLNLC CIFAR-10 model on saved corrected labels.
+"""Fine-tune an RLNLC CIFAR-10 model on corrected soft labels.
 
 The last RL actor always supplies the corrected labels. The initial model is
-selected in ``cifar_config.py`` as warmup, best_actor, or last_actor. Run
-``cifar_evaluate.py`` separately to evaluate the saved checkpoint.
+selected in ``cifar_config.py`` as warmup, best_actor, or last_actor. Separate
+best checkpoints are saved for clean-validation accuracy and loss, along with
+the final-epoch model.
 """
 
 from __future__ import annotations
@@ -33,134 +34,96 @@ OUTPUT_DIR = CONFIG.finetune_output_dir
 
 FINETUNE_EPOCHS = CONFIG.finetune.epochs
 TRAIN_BATCH_SIZE = CONFIG.finetune.batch_size
+VALIDATION_BATCH_SIZE = CONFIG.runtime.evaluate_batch_size
 LEARNING_RATE = CONFIG.finetune.learning_rate
 MOMENTUM = CONFIG.finetune.momentum
 WEIGHT_DECAY = CONFIG.finetune.weight_decay
-LR_DECAY_EPOCH = math.ceil(
-    FINETUNE_EPOCHS * CONFIG.finetune.lr_decay_fraction
-)
+LR_DECAY_EPOCH = math.ceil(FINETUNE_EPOCHS * CONFIG.finetune.lr_decay_fraction)
 LR_DECAY_FACTOR = CONFIG.finetune.lr_decay_factor
 SEED = CONFIG.data.seed
 OVERWRITE = CONFIG.runtime.overwrite_finetune
 
 RUN_LOG_PATH = OUTPUT_DIR / "run.log"
 TRAIN_CSV_PATH = OUTPUT_DIR / "train.csv"
-FINAL_CHECKPOINT_PATH = CONFIG.finetune_checkpoint_path
+BEST_ACCURACY_CHECKPOINT_PATH = CONFIG.finetune_best_accuracy_checkpoint_path
+BEST_LOSS_CHECKPOINT_PATH = CONFIG.finetune_best_loss_checkpoint_path
+LAST_CHECKPOINT_PATH = CONFIG.finetune_last_checkpoint_path
 
 TRAIN_FIELDS = (
     "epoch",
-    "learning_rate",
-    "loss",
-    "corrected_label_accuracy",
-    "clean_label_accuracy",
-    "elapsed_seconds",
+    "lr",
+    "train_loss",
+    "corrected_accuracy",
+    "clean_accuracy",
+    "val_loss",
+    "val_accuracy",
+    "seconds",
 )
 
 
-def _validate_output_destination(*, include_log: bool) -> None:
-    paths = [
-        TRAIN_CSV_PATH,
-        FINAL_CHECKPOINT_PATH,
-    ]
-    if include_log:
-        paths.append(RUN_LOG_PATH)
-    cifar.require_available_outputs(
-        paths,
-        overwrite=OVERWRITE,
-        stage="Fine-tuning",
-    )
-
-
-def _validate_input_artifacts() -> None:
-    cifar.require_files(
-        (INITIAL_CHECKPOINT_PATH, CORRECTED_LABELS_PATH),
-        stage="Fine-tuning",
-    )
-
-
-def _load_corrected_labels(clean_labels: Tensor) -> Tensor:
-    if not CORRECTED_LABELS_PATH.is_file():
-        raise FileNotFoundError(
-            f"Corrected-label artifact not found: {CORRECTED_LABELS_PATH}"
-        )
+def _load_corrected_soft_labels(clean_labels: Tensor) -> Tensor:
     array = np.load(CORRECTED_LABELS_PATH, allow_pickle=False)
     array = np.asarray(array)
-    if not np.issubdtype(array.dtype, np.integer):
-        raise TypeError("Corrected labels must use an integer NumPy dtype.")
-    labels = torch.from_numpy(array).to(torch.long).contiguous()
-    if labels.shape != clean_labels.shape:
-        raise ValueError(
-            "Corrected labels do not match CIFAR-10 train size: "
-            f"{tuple(labels.shape)} != {tuple(clean_labels.shape)}."
+    if not np.issubdtype(array.dtype, np.floating):
+        raise TypeError(
+            "Corrected labels must be a floating-point soft-label array. "
+            "Run cifar_correction.py again with the current code."
         )
-    if labels.numel() and (
-        int(labels.min()) < 0 or int(labels.max()) >= cifar.NUM_CLASSES
-    ):
-        raise ValueError("Corrected labels contain an out-of-range class ID.")
+    labels = torch.from_numpy(array).to(torch.float32).contiguous()
+    cifar.engine.validate_soft_labels(labels, clean_labels.numel())
     return cifar.engine.pin_for_cuda(labels)
 
 
 def _load_initial_model(device: torch.device) -> nn.Module:
-    if not INITIAL_CHECKPOINT_PATH.is_file():
-        raise FileNotFoundError(
-            f"Initial checkpoint not found: {INITIAL_CHECKPOINT_PATH}"
-        )
-    checkpoint = torch.load(
-        INITIAL_CHECKPOINT_PATH,
-        map_location="cpu",
-        weights_only=True,
-    )
+    checkpoint = torch.load(INITIAL_CHECKPOINT_PATH, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict):
         raise TypeError("Initial checkpoint must contain a dictionary.")
     required = {"model", "epoch"}
     missing = required.difference(checkpoint)
     if missing:
-        raise KeyError(
-            f"Initial checkpoint is missing fields: {sorted(missing)}"
-        )
-    if (
-        "model_name" in checkpoint
-        and checkpoint["model_name"] != cifar.MODEL_NAME
-    ):
+        raise KeyError(f"Initial checkpoint is missing fields: {sorted(missing)}")
+    if "model_name" in checkpoint and checkpoint["model_name"] != cifar.MODEL_NAME:
         raise ValueError("Initial checkpoint model name does not match config.")
-    if (
-        "num_classes" in checkpoint
-        and int(checkpoint["num_classes"]) != cifar.NUM_CLASSES
-    ):
+    if "num_classes" in checkpoint and int(checkpoint["num_classes"]) != cifar.NUM_CLASSES:
         raise ValueError("Initial checkpoint class count does not match CIFAR-10.")
-    if INITIALIZATION == "warmup" and (
-        checkpoint.get("warmup_model_id") != CONFIG.warmup.model_id
-    ):
+    if INITIALIZATION == "warmup" and (checkpoint.get("warmup_model_id") != CONFIG.warmup.model_id):
         raise ValueError("Warmup checkpoint model ID does not match config.")
+    cifar.engine.validate_training_augmentation_checkpoint(checkpoint)
+    cifar.engine.validate_training_data_checkpoint(checkpoint)
     if INITIALIZATION == "last_actor" and int(checkpoint["epoch"]) != CONFIG.rl.epochs:
-        raise ValueError(
-            "last_actor initialization must use the configured final RL epoch."
-        )
+        raise ValueError("last_actor initialization must use the configured final RL epoch.")
 
     model = cifar.build_model()
     try:
         model.load_state_dict(checkpoint["model"], strict=True)
     except RuntimeError as error:
-        raise RuntimeError(
-            "The initial checkpoint does not contain the classifier head."
-        ) from error
+        raise RuntimeError("The initial checkpoint does not contain the classifier head.") from error
     model.to(
         device=device,
-        memory_format=(
-            torch.channels_last
-            if cifar.engine.USE_CHANNELS_LAST
-            else torch.contiguous_format
-        ),
+        memory_format=(torch.channels_last if cifar.engine.USE_CHANNELS_LAST else torch.contiguous_format),
     )
     return model
 
 
-def _save_checkpoint(model: nn.Module) -> None:
-    temporary_path = FINAL_CHECKPOINT_PATH.with_suffix(
-        f"{FINAL_CHECKPOINT_PATH.suffix}.tmp"
-    )
+def _save_checkpoint(
+    model: nn.Module,
+    path: Path,
+    *,
+    epoch: int,
+    checkpoint_kind: str,
+    selection_metric: str | None,
+    validation: dict[str, float],
+) -> None:
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     payload = {
-        "epoch": FINETUNE_EPOCHS,
+        "epoch": epoch,
+        "checkpoint_kind": checkpoint_kind,
+        "selection_metric": selection_metric,
+        "selection_mode": ("min" if selection_metric == "loss" else "max")
+        if selection_metric is not None
+        else None,
+        "selection_value": (validation[selection_metric] if selection_metric is not None else None),
+        "validation": validation,
         "model_name": cifar.MODEL_NAME,
         "num_classes": cifar.NUM_CLASSES,
         "initialization": INITIALIZATION,
@@ -170,22 +133,42 @@ def _save_checkpoint(model: nn.Module) -> None:
         "learning_rate": LEARNING_RATE,
         "momentum": MOMENTUM,
         "weight_decay": WEIGHT_DECAY,
+        "training_augmentation": (cifar.engine.training_augmentation_metadata()),
+        "training_data": cifar.engine.training_data_metadata(),
         "model": model.state_dict(),
     }
     try:
         torch.save(payload, temporary_path)
-        temporary_path.replace(FINAL_CHECKPOINT_PATH)
+        temporary_path.replace(path)
     finally:
         temporary_path.unlink(missing_ok=True)
 
 
+@torch.inference_mode()
+def _evaluate_validation(
+    model: nn.Module, images: Tensor, labels: Tensor, device: torch.device, mean: Tensor, std: Tensor
+) -> dict[str, float]:
+    model.eval()
+    engine = cifar.engine
+    loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+    correct_count = torch.zeros((), dtype=torch.long, device=device)
+
+    for start in range(0, labels.numel(), VALIDATION_BATCH_SIZE):
+        end = min(start + VALIDATION_BATCH_SIZE, labels.numel())
+        batch_images = cifar.preprocess_cifar10(images[start:end], device, mean, std)
+        targets = labels[start:end].to(device, non_blocking=True)
+        with torch.autocast(device_type="cuda", dtype=engine.AMP_DTYPE, enabled=engine.USE_AMP):
+            logits = model(batch_images)
+            loss = nn.functional.cross_entropy(logits, targets, reduction="sum")
+        correct_count += logits.argmax(dim=1).eq(targets).sum()
+        loss_sum += loss.to(torch.float64)
+
+    return {"loss": float(loss_sum / labels.numel()), "accuracy": float(correct_count / labels.numel())}
+
+
 def main() -> None:
-    if FINETUNE_EPOCHS <= 0:
-        raise ValueError("FINETUNE_EPOCHS must be positive.")
-    _validate_input_artifacts()
-    _validate_output_destination(include_log=False)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    FINAL_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BEST_ACCURACY_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     cifar.configure_engine()
     engine = cifar.engine
@@ -194,60 +177,38 @@ def main() -> None:
     torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
     torch.cuda.reset_peak_memory_stats()
 
-    train_images, clean_train_labels = cifar.load_full_cifar10_train()
-    corrected_labels = _load_corrected_labels(clean_train_labels)
+    train_images, clean_train_labels = cifar.load_selected_cifar10_train()
+    validation_images, validation_labels = cifar.load_cifar10_evaluation_split("val")
+    corrected_labels = _load_corrected_soft_labels(clean_train_labels)
+    training_sample_count = clean_train_labels.numel()
     model = _load_initial_model(device)
-    mean = torch.tensor(cifar.CIFAR10_MEAN, device=device).reshape(
-        1, 3, 1, 1
-    )
-    std = torch.tensor(cifar.CIFAR10_STD, device=device).reshape(
-        1, 3, 1, 1
-    )
-    optimizer = SGD(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        momentum=MOMENTUM,
-        weight_decay=WEIGHT_DECAY,
-    )
-    scheduler = MultiStepLR(
-        optimizer,
-        milestones=[LR_DECAY_EPOCH],
-        gamma=LR_DECAY_FACTOR,
-    )
+    mean, std = engine.normalization_tensors(device)
+    optimizer = SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+    scheduler = MultiStepLR(optimizer, milestones=[LR_DECAY_EPOCH], gamma=LR_DECAY_FACTOR)
     criterion = nn.CrossEntropyLoss()
-    scaler = torch.amp.GradScaler(
-        "cuda",
-        enabled=(
-            engine.USE_AMP and engine.AMP_DTYPE == torch.float16
-        ),
-    )
-    history: list[dict[str, object]] = []
+    scaler = engine.build_grad_scaler()
+    engine.write_csv(TRAIN_CSV_PATH, [], TRAIN_FIELDS)
 
-    print(f"device={device} ({torch.cuda.get_device_name(device)})")
-    print(f"initialization={INITIALIZATION}")
-    print(f"initial_checkpoint={INITIAL_CHECKPOINT_PATH}")
-    print(f"corrected_labels={CORRECTED_LABELS_PATH}")
-    print(f"epochs={FINETUNE_EPOCHS} batch_size={TRAIN_BATCH_SIZE}")
+    print(f"device={torch.cuda.get_device_name(device)} initialization={INITIALIZATION}")
     print(
-        f"optimizer={CONFIG.finetune.optimizer.upper()} "
-        f"lr={LEARNING_RATE} momentum={MOMENTUM} "
-        f"weight_decay={WEIGHT_DECAY} lr_decay_epoch={LR_DECAY_EPOCH}"
+        f"epochs={FINETUNE_EPOCHS} batch={TRAIN_BATCH_SIZE} lr={LEARNING_RATE} decay_epoch={LR_DECAY_EPOCH}"
     )
-    print(
-        "initial_corrected_label_accuracy="
-        f"{float(corrected_labels.eq(clean_train_labels).float().mean()):.6f}"
-    )
+    initial_argmax_accuracy = float(corrected_labels.argmax(dim=1).eq(clean_train_labels).float().mean())
+    print(f"corrected_label_accuracy={initial_argmax_accuracy:.4f}")
 
+    best_values = {"accuracy": float("-inf"), "loss": float("inf")}
+    best_epochs = {metric: 0 for metric in best_values}
+    best_validations: dict[str, dict[str, float]] = {}
+    best_paths = {"accuracy": BEST_ACCURACY_CHECKPOINT_PATH, "loss": BEST_LOSS_CHECKPOINT_PATH}
+    last_validation: dict[str, float] | None = None
     for epoch in range(1, FINETUNE_EPOCHS + 1):
         engine.synchronize(device)
-        started = time.perf_counter()
+        epoch_started = time.perf_counter()
         model.train()
         learning_rate = float(optimizer.param_groups[0]["lr"])
         generator = torch.Generator().manual_seed(SEED + epoch)
-        permutation = torch.randperm(
-            corrected_labels.numel(),
-            generator=generator,
-        )
+        augmentation_generator = torch.Generator(device=device).manual_seed(SEED + epoch)
+        permutation = torch.randperm(training_sample_count, generator=generator)
         loss_sum = torch.zeros((), dtype=torch.float64, device=device)
         corrected_count = torch.zeros((), dtype=torch.long, device=device)
         clean_count = torch.zeros((), dtype=torch.long, device=device)
@@ -255,23 +216,13 @@ def main() -> None:
         for start in range(0, permutation.numel(), TRAIN_BATCH_SIZE):
             end = min(start + TRAIN_BATCH_SIZE, permutation.numel())
             indices = permutation[start:end]
-            images = cifar.preprocess_cifar10(
-                train_images[indices],
-                device,
-                mean,
-                std,
+            images = engine.preprocess_training(
+                train_images[indices], device, mean, std, augmentation_generator
             )
             targets = corrected_labels[indices].to(device, non_blocking=True)
-            clean_targets = clean_train_labels[indices].to(
-                device,
-                non_blocking=True,
-            )
+            clean_targets = clean_train_labels[indices].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(
-                device_type="cuda",
-                dtype=engine.AMP_DTYPE,
-                enabled=engine.USE_AMP,
-            ):
+            with torch.autocast(device_type="cuda", dtype=engine.AMP_DTYPE, enabled=engine.USE_AMP):
                 logits = model(images)
                 loss = criterion(logits, targets)
             scaler.scale(loss).backward()
@@ -280,43 +231,89 @@ def main() -> None:
             batch_count = end - start
             predictions = logits.argmax(dim=1)
             loss_sum += loss.detach().to(torch.float64) * batch_count
-            corrected_count += predictions.eq(targets).sum()
+            corrected_count += predictions.eq(targets.argmax(dim=1)).sum()
             clean_count += predictions.eq(clean_targets).sum()
 
-        scheduler.step()
         engine.synchronize(device)
-        elapsed = time.perf_counter() - started
+        validation = _evaluate_validation(model, validation_images, validation_labels, device, mean, std)
+        engine.synchronize(device)
+        improved = {
+            "accuracy": validation["accuracy"] > best_values["accuracy"],
+            "loss": validation["loss"] < best_values["loss"],
+        }
+        for metric, is_improved in improved.items():
+            if not is_improved:
+                continue
+            best_values[metric] = validation[metric]
+            best_epochs[metric] = epoch
+            best_validations[metric] = validation.copy()
+            _save_checkpoint(
+                model,
+                best_paths[metric],
+                epoch=epoch,
+                checkpoint_kind="best",
+                selection_metric=metric,
+                validation=validation,
+            )
+        last_validation = validation.copy()
+        scheduler.step()
+        elapsed = time.perf_counter() - epoch_started
         row: dict[str, object] = {
             "epoch": epoch,
-            "learning_rate": learning_rate,
-            "loss": float(loss_sum / corrected_labels.numel()),
-            "corrected_label_accuracy": float(
-                corrected_count / corrected_labels.numel()
-            ),
-            "clean_label_accuracy": float(
-                clean_count / clean_train_labels.numel()
-            ),
-            "elapsed_seconds": elapsed,
+            "lr": learning_rate,
+            "train_loss": float(loss_sum / training_sample_count),
+            "corrected_accuracy": float(corrected_count / training_sample_count),
+            "clean_accuracy": float(clean_count / clean_train_labels.numel()),
+            "val_loss": validation["loss"],
+            "val_accuracy": validation["accuracy"],
+            "seconds": elapsed,
         }
-        history.append(row)
-        engine.write_csv(TRAIN_CSV_PATH, history, TRAIN_FIELDS)
+        engine.append_csv(TRAIN_CSV_PATH, [row], TRAIN_FIELDS)
         print(
             f"[FINETUNE] epoch={epoch}/{FINETUNE_EPOCHS} "
-            f"loss={float(row['loss']):.6f} "
-            f"corrected_acc={float(row['corrected_label_accuracy']):.4f} "
-            f"clean_acc={float(row['clean_label_accuracy']):.4f} "
+            f"loss={float(row['train_loss']):.4f} clean_acc={float(row['clean_accuracy']):.4f} "
+            f"val_loss={validation['loss']:.4f} val_acc={validation['accuracy']:.4f} "
             f"seconds={elapsed:.3f}"
         )
 
-    _save_checkpoint(model)
-    print(f"checkpoint={FINAL_CHECKPOINT_PATH}")
-    print(f"train_csv={TRAIN_CSV_PATH}")
-    print("next_stage=cifar_test/cifar_evaluate.py")
+    if len(best_validations) != 2 or last_validation is None:
+        raise RuntimeError("Fine-tuning did not produce validation metrics.")
+    _save_checkpoint(
+        model,
+        LAST_CHECKPOINT_PATH,
+        epoch=FINETUNE_EPOCHS,
+        checkpoint_kind="last",
+        selection_metric=None,
+        validation=last_validation,
+    )
+    for metric in ("accuracy", "loss"):
+        validation = best_validations[metric]
+        print(
+            f"[FINETUNE BEST {metric.upper()}] "
+            f"epoch={best_epochs[metric]} "
+            f"val_loss={validation['loss']:.6f} "
+            f"val_accuracy={validation['accuracy']:.6f} "
+            f"checkpoint={best_paths[metric]}"
+        )
+    print(f"output={OUTPUT_DIR}")
+    print("next=cifar_test/cifar_evaluate.py")
 
 
 def run_with_file_logging() -> None:
-    _validate_input_artifacts()
-    _validate_output_destination(include_log=True)
+    cifar.require_files(
+        (cifar.TRAIN_INDICES_PATH, INITIAL_CHECKPOINT_PATH, CORRECTED_LABELS_PATH), stage="Fine-tuning"
+    )
+    cifar.require_available_outputs(
+        [
+            TRAIN_CSV_PATH,
+            BEST_ACCURACY_CHECKPOINT_PATH,
+            BEST_LOSS_CHECKPOINT_PATH,
+            LAST_CHECKPOINT_PATH,
+            RUN_LOG_PATH,
+        ],
+        overwrite=OVERWRITE,
+        stage="Fine-tuning",
+    )
     cifar.run_with_log(RUN_LOG_PATH, main)
 
 

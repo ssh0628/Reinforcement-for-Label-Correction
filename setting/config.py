@@ -89,20 +89,14 @@ class BestCheckpoint:
 def _default_best_checkpoints() -> tuple[BestCheckpoint, ...]:
     return (
         BestCheckpoint("macro_f1", "max", "best_macro_f1.pt"),
-        BestCheckpoint(
-            "balanced_accuracy",
-            "max",
-            "best_balanced_accuracy.pt",
-        ),
+        BestCheckpoint("balanced_accuracy", "max", "best_balanced_accuracy.pt"),
         BestCheckpoint("loss", "min", "best_loss.pt"),
     )
 
 
 @dataclass(frozen=True, slots=True)
 class CheckpointConfig:
-    best: tuple[BestCheckpoint, ...] = field(
-        default_factory=_default_best_checkpoints
-    )
+    best: tuple[BestCheckpoint, ...] = field(default_factory=_default_best_checkpoints)
     last_filename: str = "last.pt"
 
 
@@ -110,9 +104,7 @@ class CheckpointConfig:
 class GlobalKNNConfig:
     k: int = 10
     split: str = "train"
-    checkpoint_path: Path = (
-        PROJECT_ROOT / "outputs" / "warmup" / "best_macro_f1.pt"
-    )
+    checkpoint_path: Path = PROJECT_ROOT / "outputs" / "warmup" / "best_macro_f1.pt"
     output_dir: Path = PROJECT_ROOT / "outputs" / "global_knn"
     query_chunk_size: int = 8192
     reference_chunk_size: int = 65536
@@ -212,19 +204,12 @@ class Config:
             raise ValueError(f"class_names must be {CLASS_NAMES}.")
         if not self.data.npy_dir.is_absolute():
             raise ValueError("data.npy_dir must be an absolute path.")
-        if (
-            self.data.train_labels_override is not None
-            and not self.data.train_labels_override.is_absolute()
-        ):
-            raise ValueError(
-                "data.train_labels_override must be None or an absolute path."
-            )
+        if self.data.train_labels_override is not None and not self.data.train_labels_override.is_absolute():
+            raise ValueError("data.train_labels_override must be None or an absolute path.")
         if len(self.data.letterbox_fill) != 3 or not all(
             0 <= channel <= 255 for channel in self.data.letterbox_fill
         ):
-            raise ValueError(
-                "data.letterbox_fill must contain three values in [0, 255]."
-            )
+            raise ValueError("data.letterbox_fill must contain three values in [0, 255].")
         if self.data.image_size <= 0:
             raise ValueError("data.image_size must be positive.")
         if not 0 <= self.data.horizontal_flip_p <= 1:
@@ -233,12 +218,8 @@ class Config:
             raise ValueError("data.vertical_flip_p must be in [0, 1].")
         if self.data.rotation_degrees < 0:
             raise ValueError("data.rotation_degrees must be non-negative.")
-        if len(self.data.color_jitter) != 4 or any(
-            value < 0 for value in self.data.color_jitter
-        ):
-            raise ValueError(
-                "data.color_jitter must contain four non-negative values."
-            )
+        if len(self.data.color_jitter) != 4 or any(value < 0 for value in self.data.color_jitter):
+            raise ValueError("data.color_jitter must contain four non-negative values.")
         if self.data.color_jitter[3] > 0.5:
             raise ValueError("The color-jitter hue must not exceed 0.5.")
         if not 0 <= self.model.drop_rate < 1:
@@ -252,9 +233,7 @@ class Config:
         if self.train.optimizer_name.lower() != "adamw":
             raise ValueError("Only AdamW is supported by the warmup baseline.")
         if self.train.scheduler_name != "cosine_annealing":
-            raise ValueError(
-                "Only cosine_annealing is supported by the warmup baseline."
-            )
+            raise ValueError("Only cosine_annealing is supported by the warmup baseline.")
         if self.train.lr_head <= 0 or self.train.lr_unfrozen <= 0:
             raise ValueError("Warmup learning rates must be positive.")
         if self.train.weight_decay < 0:
@@ -268,41 +247,27 @@ class Config:
             raise ValueError("train.min_lr must be in [0, lr_unfrozen].")
         if not 0 <= self.train.label_smoothing <= 1:
             raise ValueError("train.label_smoothing must be in [0, 1].")
-        if (
-            self.train.sampler_num_samples is not None
-            and self.train.sampler_num_samples <= 0
-        ):
+        if self.train.sampler_num_samples is not None and self.train.sampler_num_samples <= 0:
             raise ValueError("train.sampler_num_samples must be positive.")
 
         batch_sizes = {
             "warmup_batch_size": self.loader.warmup_batch_size,
-            "global_knn_feature_batch_size": (
-                self.loader.global_knn_feature_batch_size
-            ),
+            "global_knn_feature_batch_size": (self.loader.global_knn_feature_batch_size),
             "rl_feature_batch_size": self.loader.rl_feature_batch_size,
         }
-        invalid_batch_sizes = [
-            name for name, value in batch_sizes.items() if value <= 0
-        ]
+        invalid_batch_sizes = [name for name, value in batch_sizes.items() if value <= 0]
         if invalid_batch_sizes:
-            raise ValueError(
-                f"Loader batch sizes must be positive: {invalid_batch_sizes}."
-            )
+            raise ValueError(f"Loader batch sizes must be positive: {invalid_batch_sizes}.")
         if self.loader.num_workers < 0:
             raise ValueError("loader.num_workers must be non-negative.")
         if self.loader.num_workers > 0 and self.loader.prefetch_factor <= 0:
-            raise ValueError(
-                "loader.prefetch_factor must be positive when workers are used."
-            )
+            raise ValueError("loader.prefetch_factor must be positive when workers are used.")
 
         if self.global_knn.k <= 0:
             raise ValueError("global_knn.k must be positive.")
         if self.global_knn.split != "train":
             raise ValueError("global_knn.split must be train.")
-        if (
-            self.global_knn.query_chunk_size <= 0
-            or self.global_knn.reference_chunk_size <= 0
-        ):
+        if self.global_knn.query_chunk_size <= 0 or self.global_knn.reference_chunk_size <= 0:
             raise ValueError("global_knn chunk sizes must be positive.")
         if not self.global_knn.checkpoint_path.is_absolute():
             raise ValueError("global_knn.checkpoint_path must be absolute.")
@@ -324,9 +289,7 @@ class Config:
         if self.rl_train.critic_num_bins < 2:
             raise ValueError("rl_train.critic_num_bins must be at least two.")
         if not 0 < self.rl_train.initial_state_randomization_rate < 1:
-            raise ValueError(
-                "rl_train.initial_state_randomization_rate must be in (0, 1)."
-            )
+            raise ValueError("rl_train.initial_state_randomization_rate must be in (0, 1).")
         if self.rl_train.actor_optimizer_name.lower() != "adamw":
             raise ValueError("The RL actor optimizer must be AdamW.")
         if self.rl_train.actor_lr <= 0:
@@ -353,40 +316,24 @@ class Config:
         if not 0 < self.rl_train.lr_decay_factor < 1:
             raise ValueError("rl_train.lr_decay_factor must be in (0, 1).")
         if self.rl_train.policy_update_mode not in {"full", "subset"}:
-            raise ValueError(
-                "rl_train.policy_update_mode must be 'full' or 'subset'."
-            )
+            raise ValueError("rl_train.policy_update_mode must be 'full' or 'subset'.")
         if self.rl_train.policy_update_subset_size <= 0:
-            raise ValueError(
-                "rl_train.policy_update_subset_size must be positive."
-            )
+            raise ValueError("rl_train.policy_update_subset_size must be positive.")
         if self.rl_train.policy_update_batch_size <= 0:
-            raise ValueError(
-                "rl_train.policy_update_batch_size must be positive."
-            )
+            raise ValueError("rl_train.policy_update_batch_size must be positive.")
         if (
             self.rl_train.policy_update_mode == "subset"
-            and self.rl_train.policy_update_batch_size
-            > self.rl_train.policy_update_subset_size
+            and self.rl_train.policy_update_batch_size > self.rl_train.policy_update_subset_size
         ):
-            raise ValueError(
-                "RL policy update batch size cannot exceed subset size."
-            )
+            raise ValueError("RL policy update batch size cannot exceed subset size.")
         if self.rl_train.checkpoint_interval <= 0:
             raise ValueError("rl_train.checkpoint_interval must be positive.")
         checkpoint_filename = self.rl_train.checkpoint_filename
-        if (
-            not checkpoint_filename
-            or Path(checkpoint_filename).name != checkpoint_filename
-        ):
-            raise ValueError(
-                "rl_train.checkpoint_filename must be a plain filename."
-            )
+        if not checkpoint_filename or Path(checkpoint_filename).name != checkpoint_filename:
+            raise ValueError("rl_train.checkpoint_filename must be a plain filename.")
         resume_path = self.rl_train.resume_checkpoint_path
         if resume_path is not None and not resume_path.is_absolute():
-            raise ValueError(
-                "rl_train.resume_checkpoint_path must be None or absolute."
-            )
+            raise ValueError("rl_train.resume_checkpoint_path must be None or absolute.")
         if not isinstance(self.rl_train.overwrite, bool):
             raise TypeError("rl_train.overwrite must be a boolean.")
         if not self.rl_train.output_dir.is_absolute():
@@ -398,14 +345,8 @@ class Config:
             raise ValueError("cleaning.checkpoint_path must be absolute.")
         if not self.cleaning.output_dir.is_absolute():
             raise ValueError("cleaning.output_dir must be absolute.")
-        cleaning_filenames = (
-            self.cleaning.artifact_filename,
-            self.cleaning.corrected_labels_filename,
-        )
-        if any(
-            not filename or Path(filename).name != filename
-            for filename in cleaning_filenames
-        ):
+        cleaning_filenames = (self.cleaning.artifact_filename, self.cleaning.corrected_labels_filename)
+        if any(not filename or Path(filename).name != filename for filename in cleaning_filenames):
             raise ValueError("Cleaning outputs must use plain filenames.")
         if self.cleaning.artifact_filename == self.cleaning.corrected_labels_filename:
             raise ValueError("Cleaning output filenames must be different.")
@@ -414,14 +355,8 @@ class Config:
 
         supported_metrics = {"macro_f1", "balanced_accuracy", "loss"}
         checkpoint_metrics = [item.metric for item in self.checkpoint.best]
-        if (
-            set(checkpoint_metrics) != supported_metrics
-            or len(checkpoint_metrics) != 3
-        ):
-            raise ValueError(
-                "checkpoint.best must contain macro_f1, balanced_accuracy, "
-                "and loss once each."
-            )
+        if set(checkpoint_metrics) != supported_metrics or len(checkpoint_metrics) != 3:
+            raise ValueError("checkpoint.best must contain macro_f1, balanced_accuracy, and loss once each.")
         if len({item.filename for item in self.checkpoint.best}) != 3:
             raise ValueError("Best checkpoint filenames must be unique.")
 

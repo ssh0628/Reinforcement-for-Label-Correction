@@ -38,12 +38,7 @@ def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def structured_fingerprint(value: object) -> str:
-    payload = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -55,19 +50,14 @@ def dataset_manifest_fingerprint(paths: Iterable[object]) -> str:
         try:
             stat = path.stat()
         except OSError as exc:
-            raise FileNotFoundError(
-                f"Image not found while fingerprinting dataset: {path}"
-            ) from exc
+            raise FileNotFoundError(f"Image not found while fingerprinting dataset: {path}") from exc
         for field in (str(path), str(stat.st_size), str(stat.st_mtime_ns)):
             digest.update(field.encode("utf-8"))
             digest.update(b"\0")
     return digest.hexdigest()
 
 
-def evaluation_preprocessing_signature(
-    data: DataConfig,
-    model_name: str,
-) -> dict[str, object]:
+def evaluation_preprocessing_signature(data: DataConfig, model_name: str) -> dict[str, object]:
     pretrained_cfg = timm.get_pretrained_cfg(model_name)
     return {
         "implementation": "aspect_letterbox-v1",
@@ -83,11 +73,7 @@ def evaluation_preprocessing_signature(
 class AspectLetterbox:
     """Resize without distortion, then pad symmetrically to a square."""
 
-    def __init__(
-        self,
-        size: int,
-        fill: tuple[int, int, int],
-    ) -> None:
+    def __init__(self, size: int, fill: tuple[int, int, int]) -> None:
         self.size = size
         self.fill = fill
 
@@ -99,10 +85,7 @@ class AspectLetterbox:
         scale = min(self.size / width, self.size / height)
         resized_width = min(self.size, max(1, round(width * scale)))
         resized_height = min(self.size, max(1, round(height * scale)))
-        resized = image.resize(
-            (resized_width, resized_height),
-            resample=Image.Resampling.BICUBIC,
-        )
+        resized = image.resize((resized_width, resized_height), resample=Image.Resampling.BICUBIC)
 
         canvas = Image.new("RGB", (self.size, self.size), self.fill)
         left = (self.size - resized_width) // 2
@@ -119,64 +102,38 @@ def build_transforms(model: nn.Module, data: DataConfig):
         [
             transforms.RandomHorizontalFlip(p=data.horizontal_flip_p),
             transforms.RandomVerticalFlip(p=data.vertical_flip_p),
-            transforms.RandomRotation(
-                data.rotation_degrees,
-                fill=data.letterbox_fill,
-            ),
+            transforms.RandomRotation(data.rotation_degrees, fill=data.letterbox_fill),
             transforms.ColorJitter(*data.color_jitter),
             letterbox,
             transforms.ToTensor(),
             normalize,
         ]
     )
-    eval_transform = transforms.Compose(
-        [
-            letterbox,
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
+    eval_transform = transforms.Compose([letterbox, transforms.ToTensor(), normalize])
     return train_transform, eval_transform
 
 
 class NPYPathDataset(Dataset[tuple[Tensor, int, int]]):
-    def __init__(
-        self,
-        data: DataConfig,
-        split: str,
-        transform=None,
-    ) -> None:
+    def __init__(self, data: DataConfig, split: str, transform=None) -> None:
         self.data = data
         self.transform = transform
         self.paths = _load_npy(data.paths_file(split))
         labels = _load_npy(data.labels_file(split))
 
         if self.paths.ndim != 1 or labels.ndim != 1:
-            raise ValueError(
-                f"[{split}] paths and labels must be one-dimensional arrays."
-            )
+            raise ValueError(f"[{split}] paths and labels must be one-dimensional arrays.")
         if len(self.paths) != len(labels):
-            raise ValueError(
-                f"[{split}] paths/labels length mismatch: "
-                f"{len(self.paths)} != {len(labels)}."
-            )
+            raise ValueError(f"[{split}] paths/labels length mismatch: {len(self.paths)} != {len(labels)}.")
 
         self.labels = np.array(labels, dtype=np.int64, copy=True)
         if len(self.labels) == 0:
             raise ValueError(f"[{split}] dataset is empty.")
         if self.labels.min() < 0 or self.labels.max() >= len(data.class_names):
-            raise ValueError(
-                f"[{split}] labels must be in [0, {len(data.class_names) - 1}]."
-            )
+            raise ValueError(f"[{split}] labels must be in [0, {len(data.class_names) - 1}].")
         self.targets = torch.from_numpy(self.labels)
 
         non_absolute = next(
-            (
-                _as_path(path)
-                for path in self.paths
-                if not Path(_as_path(path)).is_absolute()
-            ),
-            None,
+            (_as_path(path) for path in self.paths if not Path(_as_path(path)).is_absolute()), None
         )
         if non_absolute is not None:
             raise ValueError(f"[{split}] image path is not absolute: {non_absolute}")
@@ -190,9 +147,7 @@ class NPYPathDataset(Dataset[tuple[Tensor, int, int]]):
         metadata = json.loads(classes_file.read_text(encoding="utf-8"))
         actual = tuple(metadata.get("classes", ()))
         if actual != self.data.class_names:
-            raise ValueError(
-                f"classes.json mismatch: {actual} != {self.data.class_names}."
-            )
+            raise ValueError(f"classes.json mismatch: {actual} != {self.data.class_names}.")
 
     def __len__(self) -> int:
         return len(self.paths)

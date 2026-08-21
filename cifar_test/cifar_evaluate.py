@@ -6,7 +6,6 @@ only the untouched 5,000-image half is used here to avoid validation leakage.
 
 from __future__ import annotations
 
-import math
 import sys
 import time
 from pathlib import Path
@@ -22,7 +21,8 @@ from cifar_test import cifar_common as cifar
 
 
 CONFIG = cifar.CONFIG
-FINETUNE_CHECKPOINT_PATH = CONFIG.finetune_checkpoint_path
+FINETUNE_SELECTION_METRIC = CONFIG.finetune.evaluation_checkpoint
+FINETUNE_CHECKPOINT_PATH = CONFIG.finetune_evaluation_checkpoint_path
 INITIALIZATION = CONFIG.finetune.initialization
 OUTPUT_DIR = CONFIG.evaluate_output_dir
 
@@ -32,171 +32,68 @@ OVERWRITE = CONFIG.runtime.overwrite_evaluate
 
 RUN_LOG_PATH = OUTPUT_DIR / "run.log"
 TEST_CSV_PATH = OUTPUT_DIR / "test.csv"
-TEST_PER_CLASS_CSV_PATH = OUTPUT_DIR / "test_per_class.csv"
 
-TEST_FIELDS = (
-    "samples",
-    "loss",
-    "accuracy",
-    "balanced_accuracy",
-    "macro_recall",
-    "macro_precision",
-    "macro_f1",
-    "elapsed_seconds",
-)
-PER_CLASS_FIELDS = (
-    "class_id",
-    "support",
-    "precision",
-    "recall",
-    "f1",
-)
+TEST_FIELDS = ("epoch", "initialization", "selection", "loss", "accuracy", "seconds")
 
 
-def _validate_paths(*, include_log: bool) -> None:
-    cifar.require_files((FINETUNE_CHECKPOINT_PATH,), stage="Evaluation")
-    outputs = [TEST_CSV_PATH, TEST_PER_CLASS_CSV_PATH]
-    if include_log:
-        outputs.append(RUN_LOG_PATH)
-    cifar.require_available_outputs(
-        outputs,
-        overwrite=OVERWRITE,
-        stage="Evaluation",
-    )
-
-
-def _load_model(device: torch.device) -> nn.Module:
-    checkpoint = torch.load(
-        FINETUNE_CHECKPOINT_PATH,
-        map_location="cpu",
-        weights_only=True,
-    )
+def _load_model(device: torch.device) -> tuple[nn.Module, dict[str, object]]:
+    checkpoint = torch.load(FINETUNE_CHECKPOINT_PATH, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict):
         raise TypeError("Fine-tuned checkpoint must contain a dictionary.")
     required = {"model", "model_name", "num_classes", "epoch"}
     missing = required.difference(checkpoint)
     if missing:
-        raise KeyError(
-            f"Fine-tuned checkpoint is missing fields: {sorted(missing)}"
-        )
+        raise KeyError(f"Fine-tuned checkpoint is missing fields: {sorted(missing)}")
     if checkpoint["model_name"] != cifar.MODEL_NAME:
         raise ValueError("Checkpoint model name does not match CIFAR config.")
     if int(checkpoint["num_classes"]) != cifar.NUM_CLASSES:
         raise ValueError("Checkpoint class count does not match CIFAR-10.")
     if checkpoint.get("initialization") != INITIALIZATION:
-        raise ValueError(
-            "Checkpoint initialization does not match the configured ablation."
-        )
+        raise ValueError("Checkpoint initialization does not match the configured ablation.")
+    cifar.engine.validate_training_data_checkpoint(checkpoint)
+    if checkpoint.get("checkpoint_kind") != "best":
+        raise ValueError("Final evaluation must use the fine-tuning best model.")
+    if checkpoint.get("selection_metric") != FINETUNE_SELECTION_METRIC:
+        raise ValueError("Fine-tuning checkpoint selection metric does not match config.")
 
     model = cifar.build_model()
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(
         device=device,
-        memory_format=(
-            torch.channels_last
-            if cifar.engine.USE_CHANNELS_LAST
-            else torch.contiguous_format
-        ),
+        memory_format=(torch.channels_last if cifar.engine.USE_CHANNELS_LAST else torch.contiguous_format),
     )
-    return model
-
-
-def _classification_rows(
-    confusion: Tensor,
-) -> tuple[dict[str, float], list[dict[str, object]]]:
-    matrix = confusion.to(torch.float64)
-    true_positive = matrix.diag()
-    support = matrix.sum(dim=1)
-    predicted = matrix.sum(dim=0)
-    recall = true_positive / support.clamp_min(1)
-    precision = true_positive / predicted.clamp_min(1)
-    f1 = torch.where(
-        precision + recall > 0,
-        2 * precision * recall / (precision + recall),
-        torch.zeros_like(precision),
-    )
-    summary = {
-        "accuracy": float(true_positive.sum() / matrix.sum().clamp_min(1)),
-        "balanced_accuracy": float(recall.mean()),
-        "macro_recall": float(recall.mean()),
-        "macro_precision": float(precision.mean()),
-        "macro_f1": float(f1.mean()),
+    metadata = {
+        "checkpoint_kind": checkpoint["checkpoint_kind"],
+        "selection_metric": checkpoint["selection_metric"],
+        "epoch": int(checkpoint["epoch"]),
     }
-    per_class = [
-        {
-            "class_id": class_id,
-            "support": int(support[class_id]),
-            "precision": float(precision[class_id]),
-            "recall": float(recall[class_id]),
-            "f1": float(f1[class_id]),
-        }
-        for class_id in range(cifar.NUM_CLASSES)
-    ]
-    return summary, per_class
+    del checkpoint
+    return model, metadata
 
 
 @torch.inference_mode()
-def _evaluate(
-    model: nn.Module,
-    images: Tensor,
-    labels: Tensor,
-    device: torch.device,
-) -> tuple[dict[str, object], list[dict[str, object]]]:
+def _evaluate(model: nn.Module, images: Tensor, labels: Tensor, device: torch.device) -> dict[str, object]:
     model.eval()
     engine = cifar.engine
-    mean = torch.tensor(cifar.CIFAR10_MEAN, device=device).reshape(
-        1, 3, 1, 1
-    )
-    std = torch.tensor(cifar.CIFAR10_STD, device=device).reshape(
-        1, 3, 1, 1
-    )
+    mean, std = engine.normalization_tensors(device)
     criterion = nn.CrossEntropyLoss(reduction="sum")
-    confusion = torch.zeros(
-        (cifar.NUM_CLASSES, cifar.NUM_CLASSES),
-        dtype=torch.long,
-        device=device,
-    )
     loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+    correct_count = torch.zeros((), dtype=torch.long, device=device)
 
     for start in range(0, labels.numel(), TEST_BATCH_SIZE):
         end = min(start + TEST_BATCH_SIZE, labels.numel())
-        batch_images = cifar.preprocess_cifar10(
-            images[start:end],
-            device,
-            mean,
-            std,
-        )
+        batch_images = cifar.preprocess_cifar10(images[start:end], device, mean, std)
         targets = labels[start:end].to(device, non_blocking=True)
-        with torch.autocast(
-            device_type="cuda",
-            dtype=engine.AMP_DTYPE,
-            enabled=engine.USE_AMP,
-        ):
+        with torch.autocast(device_type="cuda", dtype=engine.AMP_DTYPE, enabled=engine.USE_AMP):
             logits = model(batch_images)
             loss = criterion(logits, targets)
-        predictions = logits.argmax(dim=1)
-        flat = targets * cifar.NUM_CLASSES + predictions
-        confusion += torch.bincount(
-            flat,
-            minlength=cifar.NUM_CLASSES * cifar.NUM_CLASSES,
-        ).reshape(cifar.NUM_CLASSES, cifar.NUM_CLASSES)
+        correct_count += logits.argmax(dim=1).eq(targets).sum()
         loss_sum += loss.to(torch.float64)
 
-    summary, per_class = _classification_rows(confusion)
-    return (
-        {
-            "samples": labels.numel(),
-            "loss": float(loss_sum / labels.numel()),
-            **summary,
-        },
-        per_class,
-    )
+    return {"loss": float(loss_sum / labels.numel()), "accuracy": float(correct_count / labels.numel())}
 
 
 def main() -> None:
-    if TEST_BATCH_SIZE <= 0:
-        raise ValueError("TEST_BATCH_SIZE must be positive.")
-    _validate_paths(include_log=False)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     cifar.configure_engine()
@@ -206,48 +103,37 @@ def main() -> None:
     torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
 
     test_images, test_labels = cifar.load_cifar10_evaluation_split("test")
-    if test_images.size(0) != 5_000 or test_labels.size(0) != 5_000:
-        raise RuntimeError("Unexpected held-out CIFAR-10 test size.")
-    model = _load_model(device)
+    model, checkpoint = _load_model(device)
 
-    print(f"device={device} ({torch.cuda.get_device_name(device)})")
-    print(f"initialization={INITIALIZATION}")
-    print(f"checkpoint={FINETUNE_CHECKPOINT_PATH}")
-    print(f"held_out_test_samples={test_labels.numel()}")
+    print(
+        f"device={torch.cuda.get_device_name(device)} initialization={INITIALIZATION} "
+        f"epoch={int(checkpoint['epoch'])} samples={test_labels.numel()}"
+    )
     engine.synchronize(device)
     started = time.perf_counter()
-    summary, per_class = _evaluate(
-        model,
-        test_images,
-        test_labels,
-        device,
-    )
+    summary = _evaluate(model, test_images, test_labels, device)
     engine.synchronize(device)
     elapsed = time.perf_counter() - started
-    summary["elapsed_seconds"] = elapsed
-    if not math.isfinite(float(summary["loss"])):
-        raise RuntimeError("Final test loss is not finite.")
-
+    summary = {
+        "epoch": int(checkpoint["epoch"]),
+        "initialization": INITIALIZATION,
+        "selection": checkpoint["selection_metric"],
+        "loss": summary["loss"],
+        "accuracy": summary["accuracy"],
+        "seconds": elapsed,
+    }
     engine.write_csv(TEST_CSV_PATH, [summary], TEST_FIELDS)
-    engine.write_csv(
-        TEST_PER_CLASS_CSV_PATH,
-        per_class,
-        PER_CLASS_FIELDS,
-    )
     print(
-        f"[FINAL TEST] samples={summary['samples']} "
-        f"loss={float(summary['loss']):.6f} "
-        f"accuracy={float(summary['accuracy']):.6f} "
-        f"balanced_accuracy={float(summary['balanced_accuracy']):.6f} "
-        f"macro_f1={float(summary['macro_f1']):.6f} "
+        f"[TEST] loss={float(summary['loss']):.4f} "
+        f"accuracy={float(summary['accuracy']):.4f} "
         f"seconds={elapsed:.3f}"
     )
-    print(f"test_csv={TEST_CSV_PATH}")
-    print(f"test_per_class_csv={TEST_PER_CLASS_CSV_PATH}")
+    print(f"output={OUTPUT_DIR}")
 
 
 def run_with_file_logging() -> None:
-    _validate_paths(include_log=True)
+    cifar.require_files((FINETUNE_CHECKPOINT_PATH,), stage="Evaluation")
+    cifar.require_available_outputs([TEST_CSV_PATH, RUN_LOG_PATH], overwrite=OVERWRITE, stage="Evaluation")
     cifar.run_with_log(RUN_LOG_PATH, main)
 
 

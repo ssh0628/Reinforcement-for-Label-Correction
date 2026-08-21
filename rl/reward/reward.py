@@ -23,14 +23,8 @@ def soft_kl_divergence(target: Tensor, prediction: Tensor) -> Tensor:
     if target.shape != prediction.shape or target.ndim != 2:
         raise ValueError("target and prediction must have the same [B, C] shape.")
     target = target.float()
-    prediction = prediction.float().clamp_min(
-        torch.finfo(torch.float32).tiny
-    )
-    return F.kl_div(
-        prediction.log(),
-        target,
-        reduction="none",
-    ).sum(dim=1).clamp_min_(0)
+    prediction = prediction.float().clamp_min(torch.finfo(torch.float32).tiny)
+    return F.kl_div(prediction.log(), target, reduction="none").sum(dim=1).clamp_min_(0)
 
 
 class RLNLCReward(nn.Module):
@@ -48,59 +42,27 @@ class RLNLCReward(nn.Module):
         self.state_chunk_size = cfg.policy.correction_chunk_size
 
     def _attention(self, cosine_similarities: Tensor) -> Tensor:
-        return torch.softmax(
-            cosine_similarities.float() / self.temperature,
-            dim=1,
-        )
+        return torch.softmax(cosine_similarities.float() / self.temperature, dim=1)
 
     @staticmethod
-    def _neighbor_prediction(
-        labels: Tensor,
-        neighbor_indices: Tensor,
-        attention_weights: Tensor,
-    ) -> Tensor:
-        return torch.einsum(
-            "bk,bkc->bc",
-            attention_weights,
-            labels[neighbor_indices].float(),
-        )
+    def _neighbor_prediction(labels: Tensor, neighbor_indices: Tensor, attention_weights: Tensor) -> Tensor:
+        return torch.einsum("bk,bkc->bc", attention_weights, labels[neighbor_indices].float())
 
     def _global_consistency(
-        self,
-        labels: Tensor,
-        neighbor_indices: Tensor,
-        cosine_similarities: Tensor,
+        self, labels: Tensor, neighbor_indices: Tensor, cosine_similarities: Tensor
     ) -> tuple[Tensor, Tensor]:
         sample_count = labels.size(0)
         device = labels.device
-        per_sample_kl = torch.empty(
-            sample_count,
-            dtype=torch.float32,
-            device=device,
-        )
+        per_sample_kl = torch.empty(sample_count, dtype=torch.float32, device=device)
         for start in range(0, sample_count, self.state_chunk_size):
             end = min(start + self.state_chunk_size, sample_count)
             indices = neighbor_indices[start:end].to(device=device)
-            attention = self._attention(
-                cosine_similarities[start:end].to(device=device)
-            )
-            prediction = self._neighbor_prediction(
-                labels,
-                indices,
-                attention,
-            )
-            per_sample_kl[start:end] = soft_kl_divergence(
-                labels[start:end],
-                prediction,
-            )
+            attention = self._attention(cosine_similarities[start:end].to(device=device))
+            prediction = self._neighbor_prediction(labels, indices, attention)
+            per_sample_kl[start:end] = soft_kl_divergence(labels[start:end], prediction)
         return -per_sample_kl.mean(), torch.exp(-per_sample_kl)
 
-    def _noisy_alignment(
-        self,
-        labels: Tensor,
-        actions: Tensor,
-        fixed_embeddings: Tensor,
-    ) -> Tensor:
+    def _noisy_alignment(self, labels: Tensor, actions: Tensor, fixed_embeddings: Tensor) -> Tensor:
         clean_knn = build_exact_clean_knn(
             fixed_embeddings,
             actions,
@@ -117,18 +79,9 @@ class RLNLCReward(nn.Module):
             end = min(start + self.state_chunk_size, noisy_count)
             noisy_indices = clean_knn.noisy_indices[start:end]
             neighbor_indices = clean_knn.neighbor_indices[start:end]
-            attention = self._attention(
-                clean_knn.neighbor_cosine_similarities[start:end]
-            )
-            prediction = self._neighbor_prediction(
-                labels,
-                neighbor_indices,
-                attention,
-            )
-            total_kl += soft_kl_divergence(
-                labels[noisy_indices],
-                prediction,
-            ).sum()
+            attention = self._attention(clean_knn.neighbor_cosine_similarities[start:end])
+            prediction = self._neighbor_prediction(labels, neighbor_indices, attention)
+            total_kl += soft_kl_divergence(labels[noisy_indices], prediction).sum()
         return -(total_kl / noisy_count)
 
     @torch.inference_mode()
@@ -153,36 +106,20 @@ class RLNLCReward(nn.Module):
             raise ValueError("actions must be [N].")
         expected_graph_shape = (sample_count, self.k)
         if global_neighbor_indices.shape != expected_graph_shape:
-            raise ValueError(
-                "global_neighbor_indices must have shape "
-                f"{expected_graph_shape}."
-            )
+            raise ValueError(f"global_neighbor_indices must have shape {expected_graph_shape}.")
         if global_neighbor_cosine_similarities.shape != expected_graph_shape:
-            raise ValueError(
-                "global_neighbor_cosine_similarities must have shape "
-                f"{expected_graph_shape}."
-            )
+            raise ValueError(f"global_neighbor_cosine_similarities must have shape {expected_graph_shape}.")
         if global_neighbor_indices.dtype != torch.long:
             raise TypeError("global_neighbor_indices must use torch.long.")
-        if torch.any(global_neighbor_indices < 0) or torch.any(
-            global_neighbor_indices >= sample_count
-        ):
+        if torch.any(global_neighbor_indices < 0) or torch.any(global_neighbor_indices >= sample_count):
             raise ValueError("Global KNN graph contains an out-of-range index.")
 
         labels = next_labels.float()
         label_consistency, per_sample_consistency = self._global_consistency(
-            labels,
-            global_neighbor_indices,
-            global_neighbor_cosine_similarities,
+            labels, global_neighbor_indices, global_neighbor_cosine_similarities
         )
-        noisy_label_alignment = self._noisy_alignment(
-            labels,
-            actions,
-            fixed_embeddings,
-        )
-        total_reward = torch.exp(
-            label_consistency + self.nla_weight * noisy_label_alignment
-        ).clamp(max=1.0)
+        noisy_label_alignment = self._noisy_alignment(labels, actions, fixed_embeddings)
+        total_reward = torch.exp(label_consistency + self.nla_weight * noisy_label_alignment).clamp(max=1.0)
         return RewardOutput(
             label_consistency=label_consistency,
             noisy_label_alignment=noisy_label_alignment,

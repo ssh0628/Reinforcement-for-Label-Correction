@@ -19,15 +19,7 @@ class NPYPathingConfig:
     class_names: tuple[str, ...] = CLASS_NAMES
     split_names: tuple[str, ...] = ("train", "val", "test")
     split_ratios: tuple[float, ...] = (0.70, 0.15, 0.15)
-    image_extensions: tuple[str, ...] = (
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".bmp",
-        ".tif",
-        ".tiff",
-        ".webp",
-    )
+    image_extensions: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
     recursive: bool = True
     seed: int = 42
     overwrite: bool = False
@@ -95,13 +87,7 @@ def scan_dataset(cfg: NPYPathingConfig) -> dict[str, list[SamplePair]]:
             if image_path in used_images:
                 raise ValueError(f"Duplicate image path: {image_path}")
             used_images.add(image_path)
-            class_samples.append(
-                SamplePair(
-                    image_path=image_path,
-                    class_name=class_name,
-                    label=label,
-                )
-            )
+            class_samples.append(SamplePair(image_path=image_path, class_name=class_name, label=label))
 
         if len(class_samples) < len(cfg.split_names):
             raise ValueError(
@@ -113,47 +99,32 @@ def scan_dataset(cfg: NPYPathingConfig) -> dict[str, list[SamplePair]]:
     return samples_by_class
 
 
-def calculate_split_counts(
-    sample_count: int,
-    split_ratios: tuple[float, ...],
-) -> list[int]:
+def calculate_split_counts(sample_count: int, split_ratios: tuple[float, ...]) -> list[int]:
     """Allocate at least one class sample to each split."""
     split_count = len(split_ratios)
     if sample_count < split_count:
-        raise ValueError(
-            f"sample_count={sample_count} is smaller than split_count={split_count}."
-        )
+        raise ValueError(f"sample_count={sample_count} is smaller than split_count={split_count}.")
 
     ratio_sum = sum(split_ratios)
     exact = [sample_count * ratio / ratio_sum for ratio in split_ratios]
     counts = [int(np.floor(value)) for value in exact]
     remainder = sample_count - sum(counts)
-    order = sorted(
-        range(split_count),
-        key=lambda index: (exact[index] - counts[index], -index),
-        reverse=True,
-    )
+    order = sorted(range(split_count), key=lambda index: (exact[index] - counts[index], -index), reverse=True)
     for index in order[:remainder]:
         counts[index] += 1
 
-    for empty_index in [
-        index for index, count in enumerate(counts) if count == 0
-    ]:
+    for empty_index in [index for index, count in enumerate(counts) if count == 0]:
         donors = [index for index, count in enumerate(counts) if count > 1]
         if not donors:
             raise RuntimeError("Could not populate every split.")
-        donor = max(
-            donors,
-            key=lambda index: (counts[index] - exact[index], counts[index]),
-        )
+        donor = max(donors, key=lambda index: (counts[index] - exact[index], counts[index]))
         counts[donor] -= 1
         counts[empty_index] += 1
     return counts
 
 
 def build_stratified_splits(
-    samples_by_class: dict[str, list[SamplePair]],
-    cfg: NPYPathingConfig,
+    samples_by_class: dict[str, list[SamplePair]], cfg: NPYPathingConfig
 ) -> dict[str, list[SamplePair]]:
     splits = {split: [] for split in cfg.split_names}
 
@@ -175,26 +146,15 @@ def build_stratified_splits(
 
 
 def validate_splits(
-    samples_by_class: dict[str, list[SamplePair]],
-    splits: dict[str, list[SamplePair]],
-    cfg: NPYPathingConfig,
+    samples_by_class: dict[str, list[SamplePair]], splits: dict[str, list[SamplePair]], cfg: NPYPathingConfig
 ) -> None:
-    source_paths = {
-        sample.image_path
-        for samples in samples_by_class.values()
-        for sample in samples
-    }
-    split_sets = {
-        split: {sample.image_path for sample in samples}
-        for split, samples in splits.items()
-    }
+    source_paths = {sample.image_path for samples in samples_by_class.values() for sample in samples}
+    split_sets = {split: {sample.image_path for sample in samples} for split, samples in splits.items()}
     for index, left in enumerate(cfg.split_names):
         for right in cfg.split_names[index + 1 :]:
             overlap = split_sets[left] & split_sets[right]
             if overlap:
-                raise RuntimeError(
-                    f"Data leakage between {left} and {right}: {next(iter(overlap))}"
-                )
+                raise RuntimeError(f"Data leakage between {left} and {right}: {next(iter(overlap))}")
     assigned_paths = set().union(*split_sets.values())
     if assigned_paths != source_paths:
         raise RuntimeError("Split assignment did not preserve every source sample.")
@@ -203,20 +163,13 @@ def validate_splits(
         present_labels = {sample.label for sample in samples}
         expected_labels = set(range(len(cfg.class_names)))
         if present_labels != expected_labels:
-            raise RuntimeError(
-                f"{split} does not contain every class: {present_labels}"
-            )
+            raise RuntimeError(f"{split} does not contain every class: {present_labels}")
 
 
 def output_filenames(cfg: NPYPathingConfig) -> list[str]:
     filenames = ["classes.json", "split_config.json"]
     for split in cfg.split_names:
-        filenames.extend(
-            (
-                f"{split}_paths.npy",
-                f"{split}_labels.npy",
-            )
-        )
+        filenames.extend((f"{split}_paths.npy", f"{split}_labels.npy"))
     return filenames
 
 
@@ -228,16 +181,10 @@ def ensure_output_is_writable(cfg: NPYPathingConfig) -> None:
     ]
     if existing and not cfg.overwrite:
         formatted = "\n".join(f"  - {path}" for path in existing)
-        raise FileExistsError(
-            "Output files already exist. Set overwrite=True to replace them:\n"
-            f"{formatted}"
-        )
+        raise FileExistsError(f"Output files already exist. Set overwrite=True to replace them:\n{formatted}")
 
 
-def class_counts(
-    samples: list[SamplePair],
-    class_names: tuple[str, ...],
-) -> dict[str, int]:
+def class_counts(samples: list[SamplePair], class_names: tuple[str, ...]) -> dict[str, int]:
     counts = {class_name: 0 for class_name in class_names}
     for sample in samples:
         counts[sample.class_name] += 1
@@ -245,42 +192,28 @@ def class_counts(
 
 
 def build_report(
-    samples_by_class: dict[str, list[SamplePair]],
-    splits: dict[str, list[SamplePair]],
-    cfg: NPYPathingConfig,
+    samples_by_class: dict[str, list[SamplePair]], splits: dict[str, list[SamplePair]], cfg: NPYPathingConfig
 ) -> dict[str, object]:
     return {
         "dataset_root": str(cfg.dataset_root.resolve()),
         "output_dir": str(cfg.output_dir.resolve()),
         "classes": list(cfg.class_names),
-        "class_to_index": {
-            class_name: index for index, class_name in enumerate(cfg.class_names)
-        },
+        "class_to_index": {class_name: index for index, class_name in enumerate(cfg.class_names)},
         "split_names": list(cfg.split_names),
         "split_ratios": list(cfg.split_ratios),
         "seed": cfg.seed,
         "recursive": cfg.recursive,
         "sampling_strategy": "runtime_sqrt_sampler",
         "static_downsampling": False,
-        "source_counts": {
-            class_name: len(samples_by_class[class_name])
-            for class_name in cfg.class_names
-        },
-        "split_counts": {
-            split: class_counts(samples, cfg.class_names)
-            for split, samples in splits.items()
-        },
-        "split_totals": {
-            split: len(samples) for split, samples in splits.items()
-        },
+        "source_counts": {class_name: len(samples_by_class[class_name]) for class_name in cfg.class_names},
+        "split_counts": {split: class_counts(samples, cfg.class_names) for split, samples in splits.items()},
+        "split_totals": {split: len(samples) for split, samples in splits.items()},
         "total_samples": sum(len(samples) for samples in samples_by_class.values()),
     }
 
 
 def save_outputs(
-    samples_by_class: dict[str, list[SamplePair]],
-    splits: dict[str, list[SamplePair]],
-    cfg: NPYPathingConfig,
+    samples_by_class: dict[str, list[SamplePair]], splits: dict[str, list[SamplePair]], cfg: NPYPathingConfig
 ) -> None:
     ensure_output_is_writable(cfg)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -289,21 +222,15 @@ def save_outputs(
     with TemporaryDirectory(prefix=".npy_pathing_", dir=cfg.output_dir) as temp:
         temp_dir = Path(temp)
         (temp_dir / "classes.json").write_text(
-            json.dumps({"classes": list(cfg.class_names)}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+            json.dumps({"classes": list(cfg.class_names)}, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         (temp_dir / "split_config.json").write_text(
-            json.dumps(report, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
         for split, samples in splits.items():
-            image_paths = np.asarray(
-                [str(sample.image_path) for sample in samples], dtype=np.str_
-            )
-            labels = np.asarray(
-                [sample.label for sample in samples], dtype=np.int64
-            )
+            image_paths = np.asarray([str(sample.image_path) for sample in samples], dtype=np.str_)
+            labels = np.asarray([sample.label for sample in samples], dtype=np.int64)
             if len(image_paths) != len(labels):
                 raise RuntimeError(f"{split}: path/label length mismatch.")
             np.save(temp_dir / f"{split}_paths.npy", image_paths)
@@ -314,9 +241,7 @@ def save_outputs(
 
 
 def print_summary(
-    samples_by_class: dict[str, list[SamplePair]],
-    splits: dict[str, list[SamplePair]],
-    cfg: NPYPathingConfig,
+    samples_by_class: dict[str, list[SamplePair]], splits: dict[str, list[SamplePair]], cfg: NPYPathingConfig
 ) -> None:
     print(f"[OK] dataset_root={cfg.dataset_root.resolve()}")
     print(f"[OK] output_dir={cfg.output_dir.resolve()}")
@@ -327,9 +252,7 @@ def print_summary(
         print(f"  {class_name}: {len(samples_by_class[class_name])}")
     for split in cfg.split_names:
         counts = class_counts(splits[split], cfg.class_names)
-        summary = ", ".join(
-            f"{class_name}={counts[class_name]}" for class_name in cfg.class_names
-        )
+        summary = ", ".join(f"{class_name}={counts[class_name]}" for class_name in cfg.class_names)
         print(f"[{split.upper()}] total={len(splits[split])} | {summary}")
 
 

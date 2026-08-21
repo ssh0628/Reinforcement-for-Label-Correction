@@ -12,10 +12,7 @@ from setting.config import Config
 CONSISTENCY_TOLERANCE = 1e-6
 
 
-def encode_consistency_histogram(
-    consistency_scores: Tensor,
-    num_bins: int,
-) -> Tensor:
+def encode_consistency_histogram(consistency_scores: Tensor, num_bins: int) -> Tensor:
     """Encode Eq. (12) consistency scores using the bins in Eqs. (13)-(14)."""
     if num_bins < 2:
         raise ValueError("num_bins must be at least two.")
@@ -27,23 +24,11 @@ def encode_consistency_histogram(
         raise TypeError("consistency_scores must be floating-point tensors.")
     if not torch.isfinite(consistency_scores).all():
         raise ValueError("consistency_scores contains NaN or infinity.")
-    if torch.any(consistency_scores < 0) or torch.any(
-        consistency_scores > 1.0 + CONSISTENCY_TOLERANCE
-    ):
+    if torch.any(consistency_scores < 0) or torch.any(consistency_scores > 1.0 + CONSISTENCY_TOLERANCE):
         raise ValueError("consistency_scores must be in [0, 1].")
 
-    scores = (
-        consistency_scores.detach()
-        .to(dtype=torch.float32)
-        .clone()
-        .clamp_(0.0, 1.0)
-    )
-    bin_indices = (
-        torch.ceil(scores * num_bins)
-        .to(dtype=torch.long)
-        .sub_(1)
-        .clamp_(0, num_bins - 1)
-    )
+    scores = consistency_scores.detach().to(dtype=torch.float32).clone().clamp_(0.0, 1.0)
+    bin_indices = torch.ceil(scores * num_bins).to(dtype=torch.long).sub_(1).clamp_(0, num_bins - 1)
     sample_count = scores.shape[-1]
 
     if scores.ndim == 1:
@@ -51,13 +36,10 @@ def encode_consistency_histogram(
         return counts.to(torch.float32) / sample_count
 
     batch_size = scores.size(0)
-    offsets = (
-        torch.arange(batch_size, device=scores.device).unsqueeze(1) * num_bins
+    offsets = torch.arange(batch_size, device=scores.device).unsqueeze(1) * num_bins
+    counts = torch.bincount((bin_indices + offsets).flatten(), minlength=batch_size * num_bins).reshape(
+        batch_size, num_bins
     )
-    counts = torch.bincount(
-        (bin_indices + offsets).flatten(),
-        minlength=batch_size * num_bins,
-    ).reshape(batch_size, num_bins)
     return counts.to(torch.float32) / sample_count
 
 
@@ -72,18 +54,13 @@ class StateActionCritic(nn.Module):
         self.value_head = nn.Linear(num_bins, 1)
 
     def encode(self, consistency_scores: Tensor) -> Tensor:
-        return encode_consistency_histogram(
-            consistency_scores,
-            self.num_bins,
-        )
+        return encode_consistency_histogram(consistency_scores, self.num_bins)
 
     def value_from_encoding(self, state_encoding: Tensor) -> Tensor:
         if state_encoding.ndim not in (1, 2):
             raise ValueError("state_encoding must be [H] or [B, H].")
         if state_encoding.shape[-1] != self.num_bins:
-            raise ValueError(
-                "state_encoding last dimension must equal num_bins."
-            )
+            raise ValueError("state_encoding last dimension must equal num_bins.")
         if not state_encoding.is_floating_point():
             raise TypeError("state_encoding must be floating-point.")
         if not torch.isfinite(state_encoding).all():
@@ -98,10 +75,7 @@ def build_critic(cfg: Config) -> StateActionCritic:
     return StateActionCritic(cfg.rl_train.critic_num_bins)
 
 
-def build_critic_optimizer(
-    critic: StateActionCritic,
-    cfg: Config,
-) -> SGD:
+def build_critic_optimizer(critic: StateActionCritic, cfg: Config) -> SGD:
     if cfg.rl_train.critic_optimizer_name.lower() != "sgd":
         raise ValueError("The RL critic optimizer must be SGD.")
     return SGD(
@@ -120,12 +94,7 @@ class TDOutput:
 
 
 def sarsa_td_loss(
-    current_q: Tensor,
-    reward: Tensor,
-    next_q: Tensor,
-    *,
-    discount_factor: float,
-    terminal: bool = False,
+    current_q: Tensor, reward: Tensor, next_q: Tensor, *, discount_factor: float, terminal: bool = False
 ) -> TDOutput:
     """Compute the semi-gradient SARSA update in Eqs. (10)-(11)."""
     if current_q.shape != reward.shape or current_q.shape != next_q.shape:
@@ -139,10 +108,7 @@ def sarsa_td_loss(
         raise ValueError("discount_factor must be in [0, 1].")
     if not isinstance(terminal, bool):
         raise TypeError("terminal must be a boolean.")
-    if not all(
-        torch.isfinite(tensor).all()
-        for tensor in (current_q, reward, next_q)
-    ):
+    if not all(torch.isfinite(tensor).all() for tensor in (current_q, reward, next_q)):
         raise ValueError("SARSA tensors contain NaN or infinity.")
 
     target = reward.detach()
@@ -150,8 +116,4 @@ def sarsa_td_loss(
         target = target + discount_factor * next_q.detach()
     error = target - current_q
     loss = 0.5 * error.square().mean()
-    return TDOutput(
-        target=target,
-        error=error,
-        loss=loss,
-    )
+    return TDOutput(target=target, error=error, loss=loss)

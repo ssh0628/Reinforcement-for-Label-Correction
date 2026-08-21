@@ -15,11 +15,7 @@ class CleanKNNResult:
 
 
 def _validate_inputs(
-    embeddings: Tensor,
-    actions: Tensor,
-    k: int,
-    query_chunk_size: int,
-    reference_chunk_size: int,
+    embeddings: Tensor, actions: Tensor, k: int, query_chunk_size: int, reference_chunk_size: int
 ) -> None:
     if embeddings.ndim != 2:
         raise ValueError(f"embeddings must be [N, D], got {embeddings.shape}.")
@@ -39,21 +35,10 @@ def _validate_inputs(
 
 @torch.inference_mode()
 def build_exact_clean_knn(
-    embeddings: Tensor,
-    actions: Tensor,
-    *,
-    k: int,
-    query_chunk_size: int,
-    reference_chunk_size: int,
+    embeddings: Tensor, actions: Tensor, *, k: int, query_chunk_size: int, reference_chunk_size: int
 ) -> CleanKNNResult:
     """Find each corrected sample's exact neighbors in the clean subset."""
-    _validate_inputs(
-        embeddings,
-        actions,
-        k,
-        query_chunk_size,
-        reference_chunk_size,
-    )
+    _validate_inputs(embeddings, actions, k, query_chunk_size, reference_chunk_size)
     device = embeddings.device
     action_mask = actions.to(device=device, dtype=torch.bool)
     noisy_indices = action_mask.nonzero(as_tuple=False).flatten()
@@ -68,28 +53,12 @@ def build_exact_clean_knn(
         empty_shape = (0, effective_k)
         return CleanKNNResult(
             noisy_indices=noisy_indices,
-            neighbor_indices=torch.empty(
-                empty_shape,
-                dtype=torch.long,
-                device=device,
-            ),
-            neighbor_cosine_similarities=torch.empty(
-                empty_shape,
-                dtype=torch.float32,
-                device=device,
-            ),
+            neighbor_indices=torch.empty(empty_shape, dtype=torch.long, device=device),
+            neighbor_cosine_similarities=torch.empty(empty_shape, dtype=torch.float32, device=device),
         )
 
-    neighbor_indices = torch.empty(
-        (noisy_count, effective_k),
-        dtype=torch.long,
-        device=device,
-    )
-    neighbor_cosine = torch.empty(
-        (noisy_count, effective_k),
-        dtype=torch.float32,
-        device=device,
-    )
+    neighbor_indices = torch.empty((noisy_count, effective_k), dtype=torch.long, device=device)
+    neighbor_cosine = torch.empty((noisy_count, effective_k), dtype=torch.float32, device=device)
 
     for query_start in range(0, noisy_count, query_chunk_size):
         query_end = min(query_start + query_chunk_size, noisy_count)
@@ -97,23 +66,11 @@ def build_exact_clean_knn(
         queries = embeddings[query_ids].float()
         query_norms = queries.square().sum(dim=1, keepdim=True)
         query_count = query_end - query_start
-        best_squared_distances = torch.full(
-            (query_count, effective_k),
-            float("inf"),
-            device=device,
-        )
-        best_indices = torch.full(
-            (query_count, effective_k),
-            -1,
-            dtype=torch.long,
-            device=device,
-        )
+        best_squared_distances = torch.full((query_count, effective_k), float("inf"), device=device)
+        best_indices = torch.full((query_count, effective_k), -1, dtype=torch.long, device=device)
 
         for reference_start in range(0, clean_count, reference_chunk_size):
-            reference_end = min(
-                reference_start + reference_chunk_size,
-                clean_count,
-            )
+            reference_end = min(reference_start + reference_chunk_size, clean_count)
             reference_ids = clean_indices[reference_start:reference_end]
             references = embeddings[reference_ids].float()
             squared_distances = (
@@ -124,38 +81,21 @@ def build_exact_clean_knn(
 
             local_k = min(effective_k, reference_end - reference_start)
             local_distances, local_positions = squared_distances.topk(
-                local_k,
-                dim=1,
-                largest=False,
-                sorted=False,
+                local_k, dim=1, largest=False, sorted=False
             )
             local_indices = reference_ids[local_positions]
-            candidate_distances = torch.cat(
-                (best_squared_distances, local_distances),
-                dim=1,
-            )
-            candidate_indices = torch.cat(
-                (best_indices, local_indices),
-                dim=1,
-            )
+            candidate_distances = torch.cat((best_squared_distances, local_distances), dim=1)
+            candidate_indices = torch.cat((best_indices, local_indices), dim=1)
             best_squared_distances, keep_positions = candidate_distances.topk(
-                effective_k,
-                dim=1,
-                largest=False,
-                sorted=True,
+                effective_k, dim=1, largest=False, sorted=True
             )
             best_indices = candidate_indices.gather(1, keep_positions)
 
-        if torch.any(best_indices < 0) or torch.any(
-            ~torch.isfinite(best_squared_distances)
-        ):
+        if torch.any(best_indices < 0) or torch.any(~torch.isfinite(best_squared_distances)):
             raise RuntimeError("Failed to find valid clean-subset neighbors.")
 
         nearest_features = embeddings[best_indices].float()
-        cosine = (
-            F.normalize(queries, dim=1).unsqueeze(1)
-            * F.normalize(nearest_features, dim=2)
-        ).sum(dim=2)
+        cosine = (F.normalize(queries, dim=1).unsqueeze(1) * F.normalize(nearest_features, dim=2)).sum(dim=2)
         neighbor_indices[query_start:query_end] = best_indices
         neighbor_cosine[query_start:query_end] = cosine
 

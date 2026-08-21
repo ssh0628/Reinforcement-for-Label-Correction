@@ -68,10 +68,7 @@ def _require_tensor(artifact: dict[str, object], key: str) -> Tensor:
     return value
 
 
-def _validate_metadata(
-    artifact: dict[str, object],
-    cfg: Config,
-) -> None:
+def _validate_metadata(artifact: dict[str, object], cfg: Config) -> None:
     if artifact.get("version") != SUPPORTED_ARTIFACT_VERSION:
         raise ValueError(
             "Unsupported global KNN artifact version: "
@@ -80,24 +77,15 @@ def _validate_metadata(
         )
     missing = REQUIRED_KEYS.difference(artifact)
     if missing:
-        raise ValueError(
-            f"Global KNN cache is missing fields: {sorted(missing)}."
-        )
+        raise ValueError(f"Global KNN cache is missing fields: {sorted(missing)}.")
     if artifact["split"] != cfg.global_knn.split:
-        raise ValueError(
-            f"Global KNN cache split mismatch: {artifact['split']} "
-            f"!= {cfg.global_knn.split}."
-        )
+        raise ValueError(f"Global KNN cache split mismatch: {artifact['split']} != {cfg.global_knn.split}.")
     if artifact["k"] != cfg.global_knn.k:
-        raise ValueError(
-            f"Global KNN cache k mismatch: {artifact['k']} != {cfg.global_knn.k}."
-        )
+        raise ValueError(f"Global KNN cache k mismatch: {artifact['k']} != {cfg.global_knn.k}.")
     if tuple(artifact["class_names"]) != cfg.data.class_names:
         raise ValueError("Global KNN cache class names do not match the current config.")
     if artifact["model_name"] != cfg.model.name:
-        raise ValueError(
-            f"Global KNN cache model mismatch: {artifact['model_name']} != {cfg.model.name}."
-        )
+        raise ValueError(f"Global KNN cache model mismatch: {artifact['model_name']} != {cfg.model.name}.")
 
     checkpoint_sha256 = file_sha256(cfg.global_knn.checkpoint_path)
     if artifact["checkpoint_sha256"] != checkpoint_sha256:
@@ -105,14 +93,9 @@ def _validate_metadata(
             "Global KNN cache was built from different warmup weights. "
             "Rebuild the cache with the current checkpoint."
         )
-    expected_preprocessing = evaluation_preprocessing_signature(
-        cfg.data,
-        cfg.model.name,
-    )
+    expected_preprocessing = evaluation_preprocessing_signature(cfg.data, cfg.model.name)
     if artifact["preprocessing"] != expected_preprocessing:
-        raise ValueError(
-            "Global KNN cache preprocessing does not match the current config."
-        )
+        raise ValueError("Global KNN cache preprocessing does not match the current config.")
     provenance = {
         "version": SUPPORTED_ARTIFACT_VERSION,
         "split": cfg.global_knn.split,
@@ -139,8 +122,7 @@ def _validate_tensors(
     k = cfg.global_knn.k
     if embeddings.ndim != 2 or embeddings.size(0) != sample_count:
         raise ValueError(
-            f"Global KNN cache embeddings must be [{sample_count}, D], "
-            f"got {tuple(embeddings.shape)}."
+            f"Global KNN cache embeddings must be [{sample_count}, D], got {tuple(embeddings.shape)}."
         )
     if not embeddings.is_floating_point() or embeddings.size(1) == 0:
         raise TypeError("Global KNN cache embeddings must be non-empty floating tensors.")
@@ -166,13 +148,11 @@ def _validate_tensors(
 
     if artifact["sample_count"] != sample_count:
         raise ValueError(
-            f"Global KNN cache sample count mismatch: {artifact['sample_count']} "
-            f"!= {sample_count}."
+            f"Global KNN cache sample count mismatch: {artifact['sample_count']} != {sample_count}."
         )
     if artifact["feature_dim"] != embeddings.size(1):
         raise ValueError(
-            f"Global KNN cache feature dimension mismatch: {artifact['feature_dim']} "
-            f"!= {embeddings.size(1)}."
+            f"Global KNN cache feature dimension mismatch: {artifact['feature_dim']} != {embeddings.size(1)}."
         )
     if not torch.equal(labels.cpu(), dataset.targets):
         raise ValueError("Global KNN cache labels do not match train_labels.npy order.")
@@ -192,9 +172,7 @@ def _validate_tensors(
         sorted_indices = index_chunk.sort(dim=1).values
         if torch.any(sorted_indices[:, 1:] == sorted_indices[:, :-1]):
             raise ValueError("Global KNN cache KNN graph contains duplicate neighbors.")
-        if not torch.isfinite(cosine_chunk).all() or torch.any(
-            cosine_chunk.abs() > 1.00001
-        ):
+        if not torch.isfinite(cosine_chunk).all() or torch.any(cosine_chunk.abs() > 1.00001):
             raise ValueError("Global KNN cache cosine similarities are invalid.")
 
 
@@ -205,11 +183,7 @@ def load_global_knn_cache(cfg: Config) -> GlobalKNNCache:
     if not artifact_path.is_file():
         raise FileNotFoundError(f"Global KNN cache not found: {artifact_path}")
 
-    artifact = torch.load(
-        artifact_path,
-        map_location="cpu",
-        weights_only=True,
-    )
+    artifact = torch.load(artifact_path, map_location="cpu", weights_only=True)
     if not isinstance(artifact, dict):
         raise TypeError("Global KNN cache must contain a dictionary.")
     _validate_metadata(artifact, cfg)
@@ -217,26 +191,13 @@ def load_global_knn_cache(cfg: Config) -> GlobalKNNCache:
     dataset = NPYPathDataset(cfg.data, cfg.global_knn.split)
     current_fingerprint = dataset_manifest_fingerprint(dataset.paths)
     if artifact["dataset_manifest_sha256"] != current_fingerprint:
-        raise ValueError(
-            "Global KNN cache dataset manifest does not match the current images."
-        )
+        raise ValueError("Global KNN cache dataset manifest does not match the current images.")
 
     embeddings = _require_tensor(artifact, "embeddings")
     neighbor_indices = _require_tensor(artifact, "neighbor_indices")
-    neighbor_cosine = _require_tensor(
-        artifact,
-        "neighbor_cosine_similarities",
-    )
+    neighbor_cosine = _require_tensor(artifact, "neighbor_cosine_similarities")
     labels = _require_tensor(artifact, "labels")
-    _validate_tensors(
-        embeddings,
-        neighbor_indices,
-        neighbor_cosine,
-        labels,
-        artifact,
-        dataset,
-        cfg,
-    )
+    _validate_tensors(embeddings, neighbor_indices, neighbor_cosine, labels, artifact, dataset, cfg)
     return GlobalKNNCache(
         cache_path=artifact_path,
         provenance_sha256=str(artifact["provenance_sha256"]),

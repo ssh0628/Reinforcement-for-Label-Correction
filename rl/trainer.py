@@ -13,24 +13,14 @@ from torch.utils.data import DataLoader, Sampler
 
 from rl.actor.actor import PolicyActor, load_policy_actor
 from rl.actor.policy_knn import build_policy_knn
-from rl.critic.critic import (
-    StateActionCritic,
-    build_critic,
-    build_critic_optimizer,
-    sarsa_td_loss,
-)
+from rl.critic.critic import StateActionCritic, build_critic, build_critic_optimizer, sarsa_td_loss
 from rl.reward.global_knn_cache import GlobalKNNCache, load_global_knn_cache
 from rl.reward.reward import RLNLCReward, RewardOutput
 from rl.state import LabelState
 from setting.config import Config
 from setting.dataset import NPYPathDataset, build_transforms
 from setup.global_knn import extract_embeddings
-from setup.warmup import (
-    loader_worker_options,
-    resolve_device,
-    seed_everything,
-    worker_init_fn,
-)
+from setup.warmup import loader_worker_options, resolve_device, seed_everything, worker_init_fn
 
 
 TRAINER_CHECKPOINT_VERSION = 5
@@ -114,16 +104,10 @@ class RLTrainingResult:
 
 
 def build_rl_loader(
-    actor: PolicyActor,
-    cfg: Config,
-    device: torch.device,
+    actor: PolicyActor, cfg: Config, device: torch.device
 ) -> tuple[NPYPathDataset, MutableIndexSampler, DataLoader]:
     _, eval_transform = build_transforms(actor.feature_extractor, cfg.data)
-    dataset = NPYPathDataset(
-        cfg.data,
-        cfg.global_knn.split,
-        transform=eval_transform,
-    )
+    dataset = NPYPathDataset(cfg.data, cfg.global_knn.split, transform=eval_transform)
     sampler = MutableIndexSampler(len(dataset))
     loader_generator = torch.Generator().manual_seed(cfg.runtime.seed)
     loader = DataLoader(
@@ -151,13 +135,7 @@ def build_actor_policy_graph(
     """Extract the current actor embeddings and their exact KNN graph."""
     actor.eval()
     sampler.set_sequential()
-    embeddings = extract_embeddings(
-        actor.feature_extractor,
-        loader,
-        device,
-        cfg,
-        progress=False,
-    ).to(device)
+    embeddings = extract_embeddings(actor.feature_extractor, loader, device, cfg, progress=False).to(device)
     if embeddings.size(0) != sample_count:
         raise RuntimeError("Policy embedding count does not match the dataset.")
     return embeddings, build_policy_knn(embeddings, cfg)
@@ -166,15 +144,8 @@ def build_actor_policy_graph(
 def build_rl_scheduler(optimizer: Optimizer, cfg: Config) -> MultiStepLR:
     if cfg.rl_train.scheduler_name != "step_halfway":
         raise ValueError("The RL scheduler must be step_halfway.")
-    milestone = max(
-        1,
-        math.ceil(cfg.rl_train.epochs * cfg.rl_train.lr_decay_fraction),
-    )
-    return MultiStepLR(
-        optimizer,
-        milestones=[milestone],
-        gamma=cfg.rl_train.lr_decay_factor,
-    )
+    milestone = max(1, math.ceil(cfg.rl_train.epochs * cfg.rl_train.lr_decay_fraction))
+    return MultiStepLR(optimizer, milestones=[milestone], gamma=cfg.rl_train.lr_decay_factor)
 
 
 def build_rl_training_signature(cfg: Config) -> dict[str, object]:
@@ -198,9 +169,7 @@ def build_rl_training_signature(cfg: Config) -> dict[str, object]:
         "trajectory_length": train.trajectory_length,
         "discount_factor": train.discount_factor,
         "critic_num_bins": train.critic_num_bins,
-        "initial_state_randomization_rate": (
-            train.initial_state_randomization_rate
-        ),
+        "initial_state_randomization_rate": (train.initial_state_randomization_rate),
         "actor_optimizer_name": train.actor_optimizer_name,
         "actor_lr": train.actor_lr,
         "actor_weight_decay": train.actor_weight_decay,
@@ -215,9 +184,7 @@ def build_rl_training_signature(cfg: Config) -> dict[str, object]:
         "lr_decay_factor": train.lr_decay_factor,
         "policy_update_mode": train.policy_update_mode,
         "policy_update_subset_size": (
-            train.policy_update_subset_size
-            if train.policy_update_mode == "subset"
-            else None
+            train.policy_update_subset_size if train.policy_update_mode == "subset" else None
         ),
         "policy_update_batch_size": train.policy_update_batch_size,
     }
@@ -230,10 +197,7 @@ def validate_rl_destination(cfg: Config) -> None:
     if resume_path is not None:
         if not resume_path.is_file():
             raise FileNotFoundError(f"RL resume checkpoint not found: {resume_path}")
-        different_existing_output = (
-            output_path.is_file()
-            and output_path.resolve() != resume_path.resolve()
-        )
+        different_existing_output = output_path.is_file() and output_path.resolve() != resume_path.resolve()
         if different_existing_output and not cfg.rl_train.overwrite:
             raise FileExistsError(
                 f"RL output checkpoint already exists: {output_path}. "
@@ -302,29 +266,16 @@ class RLTrainer:
         self.critic.to(device)
         self.reward.to(device)
         try:
-            self.fixed_embeddings = cache.fixed_embeddings.to(
-                device=device,
-                dtype=torch.float32,
-            )
+            self.fixed_embeddings = cache.fixed_embeddings.to(device=device, dtype=torch.float32)
         except RuntimeError as exc:
-            raise RuntimeError(
-                "Could not cache fixed reward embeddings on the RL device."
-            ) from exc
+            raise RuntimeError("Could not cache fixed reward embeddings on the RL device.") from exc
 
-    def _decode_history(
-        self,
-        value: object,
-        completed_epochs: int,
-    ) -> list[RLStepMetrics]:
+    def _decode_history(self, value: object, completed_epochs: int) -> list[RLStepMetrics]:
         if not isinstance(value, list):
             raise TypeError("RL checkpoint history must be a list.")
-        expected_count = (
-            completed_epochs * self.cfg.rl_train.trajectory_length
-        )
+        expected_count = completed_epochs * self.cfg.rl_train.trajectory_length
         if len(value) != expected_count:
-            raise ValueError(
-                "RL checkpoint history length does not match its epoch."
-            )
+            raise ValueError("RL checkpoint history length does not match its epoch.")
 
         history: list[RLStepMetrics] = []
         for position, raw_metrics in enumerate(value):
@@ -334,16 +285,9 @@ class RLTrainer:
                 metrics = RLStepMetrics(**dict(raw_metrics))
             except TypeError as exc:
                 raise ValueError("Invalid RL history item fields.") from exc
-            expected_epoch = (
-                position // self.cfg.rl_train.trajectory_length + 1
-            )
-            expected_step = (
-                position % self.cfg.rl_train.trajectory_length + 1
-            )
-            if (
-                metrics.epoch != expected_epoch
-                or metrics.trajectory_step != expected_step
-            ):
+            expected_epoch = position // self.cfg.rl_train.trajectory_length + 1
+            expected_step = position % self.cfg.rl_train.trajectory_length + 1
+            if metrics.epoch != expected_epoch or metrics.trajectory_step != expected_step:
                 raise ValueError("RL checkpoint history order is invalid.")
             history.append(metrics)
         return history
@@ -353,25 +297,16 @@ class RLTrainer:
         if not checkpoint_path.is_absolute():
             raise ValueError("RL resume checkpoint path must be absolute.")
         if not checkpoint_path.is_file():
-            raise FileNotFoundError(
-                f"RL resume checkpoint not found: {checkpoint_path}"
-            )
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=True,
-        )
+            raise FileNotFoundError(f"RL resume checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         if not isinstance(checkpoint, dict):
             raise TypeError("RL checkpoint must contain a dictionary.")
         missing = REQUIRED_CHECKPOINT_KEYS.difference(checkpoint)
         if missing:
-            raise ValueError(
-                f"RL checkpoint is missing fields: {sorted(missing)}."
-            )
+            raise ValueError(f"RL checkpoint is missing fields: {sorted(missing)}.")
         if checkpoint["version"] != TRAINER_CHECKPOINT_VERSION:
             raise ValueError(
-                "Unsupported RL checkpoint version: "
-                f"{checkpoint['version']} != {TRAINER_CHECKPOINT_VERSION}."
+                f"Unsupported RL checkpoint version: {checkpoint['version']} != {TRAINER_CHECKPOINT_VERSION}."
             )
         if tuple(checkpoint["class_names"]) != self.cfg.data.class_names:
             raise ValueError("RL checkpoint class names do not match config.")
@@ -380,16 +315,9 @@ class RLTrainer:
 
         saved_cache_path = Path(str(checkpoint["global_knn_cache"]))
         if saved_cache_path.resolve() != self.cache.cache_path.resolve():
-            raise ValueError(
-                "RL checkpoint global KNN cache does not match the loaded cache."
-            )
-        if (
-            checkpoint["global_knn_provenance_sha256"]
-            != self.cache.provenance_sha256
-        ):
-            raise ValueError(
-                "RL checkpoint was trained with a different Global KNN cache."
-            )
+            raise ValueError("RL checkpoint global KNN cache does not match the loaded cache.")
+        if checkpoint["global_knn_provenance_sha256"] != self.cache.provenance_sha256:
+            raise ValueError("RL checkpoint was trained with a different Global KNN cache.")
         saved_signature = checkpoint["training_signature"]
         expected_signature = build_rl_training_signature(self.cfg)
         if not isinstance(saved_signature, Mapping):
@@ -400,10 +328,7 @@ class RLTrainer:
             if saved_signature.get(key) != expected_signature.get(key)
         )
         if mismatches:
-            raise ValueError(
-                "RL resume settings differ from the checkpoint: "
-                f"{mismatches}."
-            )
+            raise ValueError(f"RL resume settings differ from the checkpoint: {mismatches}.")
 
         completed_epochs = checkpoint["epoch"]
         if (
@@ -412,25 +337,16 @@ class RLTrainer:
             or not 0 < completed_epochs <= self.cfg.rl_train.epochs
         ):
             raise ValueError("RL checkpoint epoch is invalid.")
-        history = self._decode_history(
-            checkpoint["history"],
-            completed_epochs,
-        )
+        history = self._decode_history(checkpoint["history"], completed_epochs)
         label_state_value = checkpoint["label_state"]
         if not isinstance(label_state_value, Mapping):
             raise TypeError("RL checkpoint label_state must be a mapping.")
-        label_state = LabelState.from_state_dict(
-            label_state_value,
-            device=self.device,
-        )
+        label_state = LabelState.from_state_dict(label_state_value, device=self.device)
         if (
             label_state.sample_count != len(self.dataset)
             or label_state.num_classes != self.cfg.num_classes
             or label_state.step != self.cfg.rl_train.trajectory_length
-            or not torch.equal(
-                label_state.noisy_labels,
-                self.cache.labels.to(self.device),
-            )
+            or not torch.equal(label_state.noisy_labels, self.cache.labels.to(self.device))
         ):
             raise ValueError("RL checkpoint label state is incompatible.")
 
@@ -443,19 +359,12 @@ class RLTrainer:
         ):
             raise TypeError("RL checkpoint CPU RNG state is invalid.")
         if not isinstance(cuda_rng_states, list) or not all(
-            isinstance(state, Tensor)
-            and state.dtype == torch.uint8
-            and state.ndim == 1
+            isinstance(state, Tensor) and state.dtype == torch.uint8 and state.ndim == 1
             for state in cuda_rng_states
         ):
             raise TypeError("RL checkpoint CUDA RNG states are invalid.")
-        if (
-            self.device.type == "cuda"
-            and len(cuda_rng_states) != torch.cuda.device_count()
-        ):
-            raise ValueError(
-                "RL checkpoint CUDA RNG state count does not match visible GPUs."
-            )
+        if self.device.type == "cuda" and len(cuda_rng_states) != torch.cuda.device_count():
+            raise ValueError("RL checkpoint CUDA RNG state count does not match visible GPUs.")
 
         self.actor.load_state_dict(checkpoint["actor"], strict=True)
         self.critic.load_state_dict(checkpoint["critic"], strict=True)
@@ -476,84 +385,47 @@ class RLTrainer:
 
     def _initial_state(self) -> LabelState:
         noisy_labels = self.cache.labels.to(self.device)
-        state = LabelState.from_noisy_labels(
-            noisy_labels,
-            self.cfg.num_classes,
-        )
+        state = LabelState.from_noisy_labels(noisy_labels, self.cfg.num_classes)
         rate = self.cfg.rl_train.initial_state_randomization_rate
-        random_count = min(
-            state.sample_count,
-            max(1, round(state.sample_count * rate)),
-        )
-        selected = torch.randperm(
-            state.sample_count,
-            device=self.device,
-        )[:random_count]
+        random_count = min(state.sample_count, max(1, round(state.sample_count * rate)))
+        selected = torch.randperm(state.sample_count, device=self.device)[:random_count]
         randomized_hard_labels = state.noisy_labels.clone()
         original = randomized_hard_labels[selected]
-        alternatives = torch.randint(
-            self.cfg.num_classes - 1,
-            (random_count,),
-            device=self.device,
-        )
+        alternatives = torch.randint(self.cfg.num_classes - 1, (random_count,), device=self.device)
         alternatives += alternatives.ge(original)
         randomized_hard_labels[selected] = alternatives
         randomized_labels = torch.nn.functional.one_hot(
-            randomized_hard_labels,
-            num_classes=self.cfg.num_classes,
+            randomized_hard_labels, num_classes=self.cfg.num_classes
         ).to(torch.float32)
-        return LabelState(
-            noisy_labels=state.noisy_labels,
-            current_labels=randomized_labels,
-            step=0,
-        )
+        return LabelState(noisy_labels=state.noisy_labels, current_labels=randomized_labels, step=0)
 
     def _extract_policy_graph(self) -> tuple[Tensor, Tensor]:
         return build_actor_policy_graph(
-            self.actor,
-            self.sampler,
-            self.loader,
-            len(self.dataset),
-            self.device,
-            self.cfg,
+            self.actor, self.sampler, self.loader, len(self.dataset), self.device, self.cfg
         )
 
     def _select_policy_samples(self) -> Tensor:
         dataset_size = len(self.dataset)
         if self.cfg.rl_train.policy_update_mode == "full":
             return torch.arange(dataset_size)
-        sample_count = min(
-            dataset_size,
-            self.cfg.rl_train.policy_update_subset_size,
-        )
+        sample_count = min(dataset_size, self.cfg.rl_train.policy_update_subset_size)
         if sample_count == dataset_size:
             return torch.arange(dataset_size)
         selected = torch.randperm(len(self.dataset))[:sample_count]
         return selected.sort().values
 
-    def _load_query_images(
-        self,
-        requested_indices: Tensor,
-    ) -> Tensor:
+    def _load_query_images(self, requested_indices: Tensor) -> Tensor:
         if requested_indices.ndim != 1:
             raise ValueError("requested_indices must be [B].")
-        requested_indices = requested_indices.to(
-            dtype=torch.long,
-            device="cpu",
-        )
+        requested_indices = requested_indices.to(dtype=torch.long, device="cpu")
         self.sampler.set_indices(requested_indices)
 
         image_chunks: list[Tensor] = []
         samples_seen = 0
         for images, _, sample_indices in self.loader:
             next_samples_seen = samples_seen + sample_indices.numel()
-            if not torch.equal(
-                sample_indices,
-                requested_indices[samples_seen:next_samples_seen],
-            ):
-                raise RuntimeError(
-                    "Policy image loader changed the requested order."
-                )
+            if not torch.equal(sample_indices, requested_indices[samples_seen:next_samples_seen]):
+                raise RuntimeError("Policy image loader changed the requested order.")
             image_chunks.append(images)
             samples_seen = next_samples_seen
         if not image_chunks:
@@ -572,17 +444,10 @@ class RLTrainer:
         actions: Tensor,
         q_value: Tensor,
     ) -> float:
-        if (
-            policy_embeddings.ndim != 2
-            or policy_embeddings.size(0) != len(self.dataset)
-        ):
-            raise ValueError(
-                "policy_embeddings must be [N, D] for the full dataset."
-            )
+        if policy_embeddings.ndim != 2 or policy_embeddings.size(0) != len(self.dataset):
+            raise ValueError("policy_embeddings must be [N, D] for the full dataset.")
         if policy_embeddings.device != self.device:
-            raise ValueError(
-                "policy_embeddings must already be on the actor device."
-            )
+            raise ValueError("policy_embeddings must already be on the actor device.")
         selected_cpu = self._select_policy_samples()
         selected = selected_cpu.to(self.device)
         selected_neighbors = policy_neighbor_indices[selected]
@@ -616,19 +481,13 @@ class RLTrainer:
                 state.current_labels[batch_neighbors],
                 actions=actions[batch_indices],
             )
-            loss = -(
-                q_value.detach()
-                * policy_step.log_probabilities.sum()
-                / selected_count
-            )
+            loss = -(q_value.detach() * policy_step.log_probabilities.sum() / selected_count)
             loss.backward()
             total_loss += loss.detach()
 
         if embedding_leaf.grad is None:
             raise RuntimeError("Policy loss produced no embedding gradient.")
-        selected_embedding_gradient = (
-            embedding_leaf.grad[selected].detach().clone()
-        )
+        selected_embedding_gradient = embedding_leaf.grad[selected].detach().clone()
         del embedding_leaf
 
         for start in range(0, selected_count, batch_size):
@@ -637,31 +496,17 @@ class RLTrainer:
                 images = image_bank[start:end]
             else:
                 images = self._load_query_images(selected_cpu[start:end])
-            images = images.to(
-                self.device,
-                non_blocking=self.device.type == "cuda",
-            )
-            with torch.autocast(
-                device_type=self.device.type,
-                enabled=self.amp_enabled,
-            ):
+            images = images.to(self.device, non_blocking=self.device.type == "cuda")
+            with torch.autocast(device_type=self.device.type, enabled=self.amp_enabled):
                 encoded = self.actor.encode(images)
-                surrogate = (
-                    encoded.float()
-                    * selected_embedding_gradient[start:end].float()
-                ).sum()
+                surrogate = (encoded.float() * selected_embedding_gradient[start:end].float()).sum()
             self.scaler.scale(surrogate).backward()
 
         self.scaler.step(self.actor_optimizer)
         self.scaler.update()
         return float(total_loss)
 
-    def _update_critic(
-        self,
-        encoding: Tensor,
-        reward: Tensor,
-        next_encoding: Tensor | None,
-    ) -> float:
+    def _update_critic(self, encoding: Tensor, reward: Tensor, next_encoding: Tensor | None) -> float:
         self.critic_optimizer.zero_grad(set_to_none=True)
         current_q = self.critic.value_from_encoding(encoding)
         if next_encoding is None:
@@ -679,12 +524,7 @@ class RLTrainer:
         self.critic_optimizer.step()
         return float(td.loss.detach())
 
-    def _save_checkpoint(
-        self,
-        epoch: int,
-        state: LabelState,
-        history: list[RLStepMetrics],
-    ) -> Path:
+    def _save_checkpoint(self, epoch: int, state: LabelState, history: list[RLStepMetrics]) -> Path:
         output_dir = self.cfg.rl_train.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = output_dir / self.cfg.rl_train.checkpoint_filename
@@ -706,18 +546,10 @@ class RLTrainer:
                     "class_names": self.cfg.data.class_names,
                     "model_name": self.cfg.model.name,
                     "global_knn_cache": str(self.cache.cache_path),
-                    "global_knn_provenance_sha256": (
-                        self.cache.provenance_sha256
-                    ),
-                    "training_signature": build_rl_training_signature(
-                        self.cfg
-                    ),
+                    "global_knn_provenance_sha256": (self.cache.provenance_sha256),
+                    "training_signature": build_rl_training_signature(self.cfg),
                     "cpu_rng_state": torch.get_rng_state(),
-                    "cuda_rng_states": (
-                        torch.cuda.get_rng_state_all()
-                        if self.device.type == "cuda"
-                        else []
-                    ),
+                    "cuda_rng_states": (torch.cuda.get_rng_state_all() if self.device.type == "cuda" else []),
                 },
                 temporary_path,
             )
@@ -728,9 +560,7 @@ class RLTrainer:
 
     @staticmethod
     def _print_metrics(metrics: RLStepMetrics) -> None:
-        critic_loss = (
-            "-" if metrics.critic_loss is None else f"{metrics.critic_loss:.6f}"
-        )
+        critic_loss = "-" if metrics.critic_loss is None else f"{metrics.critic_loss:.6f}"
         print(
             f"[RL] epoch={metrics.epoch} step={metrics.trajectory_step} "
             f"reward={metrics.reward:.6f} q={metrics.q_value:.6f} "
@@ -743,15 +573,11 @@ class RLTrainer:
         history = list(self._resume_history)
         checkpoint_path = (
             self._resume_checkpoint_path
-            or self.cfg.rl_train.output_dir
-            / self.cfg.rl_train.checkpoint_filename
+            or self.cfg.rl_train.output_dir / self.cfg.rl_train.checkpoint_filename
         )
         final_state = self._resume_state
 
-        for epoch_index in range(
-            self.completed_epochs,
-            self.cfg.rl_train.epochs,
-        ):
+        for epoch_index in range(self.completed_epochs, self.cfg.rl_train.epochs):
             epoch = epoch_index + 1
             state = self._initial_state()
             previous_encoding: Tensor | None = None
@@ -760,9 +586,7 @@ class RLTrainer:
             for trajectory_index in range(self.cfg.rl_train.trajectory_length):
                 policy_embeddings, policy_neighbors = self._extract_policy_graph()
                 correction = self.actor.policy.correct_all(
-                    policy_embeddings,
-                    state.current_labels,
-                    policy_neighbors,
+                    policy_embeddings, state.current_labels, policy_neighbors
                 )
                 reward_output: RewardOutput = self.reward(
                     correction.corrected_labels,
@@ -771,42 +595,22 @@ class RLTrainer:
                     self.cache.neighbor_indices,
                     self.cache.neighbor_cosine_similarities,
                 )
-                encoding = self.critic.encode(
-                    reward_output.per_sample_consistency
-                ).detach()
+                encoding = self.critic.encode(reward_output.per_sample_consistency).detach()
                 with torch.no_grad():
                     q_value = self.critic.value_from_encoding(encoding)
                 actor_loss = self._update_actor(
-                    state,
-                    policy_embeddings,
-                    policy_neighbors,
-                    correction.actions,
-                    q_value,
+                    state, policy_embeddings, policy_neighbors, correction.actions, q_value
                 )
                 del policy_embeddings, policy_neighbors
 
                 critic_losses: list[float] = []
                 if previous_encoding is not None and previous_reward is not None:
-                    critic_losses.append(
-                        self._update_critic(
-                            previous_encoding,
-                            previous_reward,
-                            encoding,
-                        )
-                    )
+                    critic_losses.append(self._update_critic(previous_encoding, previous_reward, encoding))
 
                 state = state.transition(correction.corrected_labels)
-                is_terminal = (
-                    trajectory_index + 1 == self.cfg.rl_train.trajectory_length
-                )
+                is_terminal = trajectory_index + 1 == self.cfg.rl_train.trajectory_length
                 if is_terminal:
-                    critic_losses.append(
-                        self._update_critic(
-                            encoding,
-                            reward_output.total_reward,
-                            None,
-                        )
-                    )
+                    critic_losses.append(self._update_critic(encoding, reward_output.total_reward, None))
                 else:
                     previous_encoding = encoding
                     previous_reward = reward_output.total_reward.detach()
@@ -816,16 +620,10 @@ class RLTrainer:
                     trajectory_step=trajectory_index + 1,
                     reward=float(reward_output.total_reward),
                     label_consistency=float(reward_output.label_consistency),
-                    noisy_label_alignment=float(
-                        reward_output.noisy_label_alignment
-                    ),
+                    noisy_label_alignment=float(reward_output.noisy_label_alignment),
                     q_value=float(q_value.detach()),
                     actor_loss=actor_loss,
-                    critic_loss=(
-                        sum(critic_losses) / len(critic_losses)
-                        if critic_losses
-                        else None
-                    ),
+                    critic_loss=(sum(critic_losses) / len(critic_losses) if critic_losses else None),
                     action_rate=float(correction.actions.float().mean()),
                     correction_rate=state.correction_rate,
                 )
@@ -835,15 +633,8 @@ class RLTrainer:
             self.actor_scheduler.step()
             self.critic_scheduler.step()
             final_state = state
-            if (
-                epoch % self.cfg.rl_train.checkpoint_interval == 0
-                or epoch == self.cfg.rl_train.epochs
-            ):
-                checkpoint_path = self._save_checkpoint(
-                    epoch,
-                    state,
-                    history,
-                )
+            if epoch % self.cfg.rl_train.checkpoint_interval == 0 or epoch == self.cfg.rl_train.epochs:
+                checkpoint_path = self._save_checkpoint(epoch, state, history)
                 self._resume_checkpoint_path = checkpoint_path
             self.completed_epochs = epoch
             self._resume_history = list(history)
@@ -852,9 +643,7 @@ class RLTrainer:
         if final_state is None:
             raise RuntimeError("RL training completed without a label state.")
         return RLTrainingResult(
-            final_state=final_state,
-            history=tuple(history),
-            checkpoint_path=checkpoint_path,
+            final_state=final_state, history=tuple(history), checkpoint_path=checkpoint_path
         )
 
 

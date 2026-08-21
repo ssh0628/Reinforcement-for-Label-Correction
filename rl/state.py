@@ -11,21 +11,10 @@ from rl.actor.policy import initialize_label_state
 
 STATE_VERSION = 1
 PROBABILITY_TOLERANCE = 1e-5
-REQUIRED_STATE_KEYS = frozenset(
-    {
-        "version",
-        "step",
-        "noisy_labels",
-        "current_labels",
-    }
-)
+REQUIRED_STATE_KEYS = frozenset({"version", "step", "noisy_labels", "current_labels"})
 
 
-def _validate_state(
-    noisy_labels: Tensor,
-    current_labels: Tensor,
-    step: int,
-) -> None:
+def _validate_state(noisy_labels: Tensor, current_labels: Tensor, step: int) -> None:
     if not isinstance(step, int) or isinstance(step, bool) or step < 0:
         raise ValueError("state step must be a non-negative integer.")
     if noisy_labels.ndim != 1 or noisy_labels.numel() == 0:
@@ -42,21 +31,14 @@ def _validate_state(
         raise TypeError("current_labels must use torch.float32.")
     if current_labels.device != noisy_labels.device:
         raise ValueError("State labels must share the same device.")
-    if torch.any(noisy_labels < 0) or torch.any(
-        noisy_labels >= current_labels.shape[1]
-    ):
+    if torch.any(noisy_labels < 0) or torch.any(noisy_labels >= current_labels.shape[1]):
         raise ValueError("noisy_labels contains an out-of-range class index.")
     if not torch.isfinite(current_labels).all():
         raise ValueError("current_labels contains NaN or infinity.")
     if torch.any(current_labels < 0.0) or torch.any(current_labels > 1.0):
         raise ValueError("current_labels contains an invalid probability.")
     row_sums = current_labels.sum(dim=1)
-    if not torch.allclose(
-        row_sums,
-        torch.ones_like(row_sums),
-        rtol=0.0,
-        atol=PROBABILITY_TOLERANCE,
-    ):
+    if not torch.allclose(row_sums, torch.ones_like(row_sums), rtol=0.0, atol=PROBABILITY_TOLERANCE):
         raise ValueError("Every current_labels row must sum to one.")
 
 
@@ -69,19 +51,11 @@ class LabelState:
     step: int = 0
 
     def __post_init__(self) -> None:
-        _validate_state(
-            self.noisy_labels,
-            self.current_labels,
-            self.step,
-        )
+        _validate_state(self.noisy_labels, self.current_labels, self.step)
 
     @classmethod
     def from_noisy_labels(
-        cls,
-        noisy_labels: Tensor,
-        num_classes: int,
-        *,
-        device: torch.device | str | None = None,
+        cls, noisy_labels: Tensor, num_classes: int, *, device: torch.device | str | None = None
     ) -> LabelState:
         if not isinstance(noisy_labels, Tensor):
             raise TypeError("noisy_labels must be a tensor.")
@@ -129,36 +103,16 @@ class LabelState:
             )
         if next_labels.device != self.device:
             raise ValueError("next_labels must be on the state device.")
-        committed_labels = (
-            next_labels.detach()
-            .to(dtype=torch.float32)
-            .contiguous()
-            .clone()
-        )
-        return LabelState(
-            noisy_labels=self.noisy_labels,
-            current_labels=committed_labels,
-            step=self.step + 1,
-        )
+        committed_labels = next_labels.detach().to(dtype=torch.float32).contiguous().clone()
+        return LabelState(noisy_labels=self.noisy_labels, current_labels=committed_labels, step=self.step + 1)
 
-    def to(
-        self,
-        device: torch.device | str,
-        *,
-        non_blocking: bool = False,
-    ) -> LabelState:
+    def to(self, device: torch.device | str, *, non_blocking: bool = False) -> LabelState:
         target_device = torch.device(device)
         if target_device == self.device:
             return self
         return LabelState(
-            noisy_labels=self.noisy_labels.to(
-                device=target_device,
-                non_blocking=non_blocking,
-            ),
-            current_labels=self.current_labels.to(
-                device=target_device,
-                non_blocking=non_blocking,
-            ),
+            noisy_labels=self.noisy_labels.to(device=target_device, non_blocking=non_blocking),
+            current_labels=self.current_labels.to(device=target_device, non_blocking=non_blocking),
             step=self.step,
         )
 
@@ -172,26 +126,17 @@ class LabelState:
 
     @classmethod
     def from_state_dict(
-        cls,
-        state_dict: Mapping[str, object],
-        *,
-        device: torch.device | str = "cpu",
+        cls, state_dict: Mapping[str, object], *, device: torch.device | str = "cpu"
     ) -> LabelState:
         missing = REQUIRED_STATE_KEYS.difference(state_dict)
         if missing:
             raise ValueError(f"Label state is missing fields: {sorted(missing)}.")
         if state_dict["version"] != STATE_VERSION:
-            raise ValueError(
-                "Unsupported label state version: "
-                f"{state_dict['version']} != {STATE_VERSION}."
-            )
+            raise ValueError(f"Unsupported label state version: {state_dict['version']} != {STATE_VERSION}.")
         noisy_labels = state_dict["noisy_labels"]
         current_labels = state_dict["current_labels"]
         step = state_dict["step"]
-        if not isinstance(noisy_labels, Tensor) or not isinstance(
-            current_labels,
-            Tensor,
-        ):
+        if not isinstance(noisy_labels, Tensor) or not isinstance(current_labels, Tensor):
             raise TypeError("Saved label state values must be tensors.")
         if not isinstance(step, int) or isinstance(step, bool):
             raise TypeError("Saved label state step must be an integer.")

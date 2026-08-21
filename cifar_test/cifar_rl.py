@@ -26,6 +26,11 @@ RL_OUTPUT_PATHS = (
     OUTPUT_DIR / cifar.engine.TRAIN_CSV_FILENAME,
     OUTPUT_DIR / cifar.engine.TIMING_CSV_FILENAME,
     OUTPUT_DIR / cifar.engine.RUN_SUMMARY_CSV_FILENAME,
+    *(
+        (OUTPUT_DIR / cifar.engine.CHANGE_DIAGNOSTICS_CSV_FILENAME,)
+        if CONFIG.rl.record_change_diagnostics
+        else ()
+    ),
     CONFIG.actor_best_checkpoint_path,
     CONFIG.actor_last_checkpoint_path,
     CONFIG.critic_best_checkpoint_path,
@@ -33,28 +38,9 @@ RL_OUTPUT_PATHS = (
 )
 
 
-def _validate_input_artifacts() -> None:
-    cifar.require_files(
-        (
-            cifar.NOISY_LABELS_PATH,
-            cifar.NOISE_MASK_PATH,
-            cifar.WARMUP_CHECKPOINT_PATH,
-        ),
-        stage="RL",
-    )
-
-
-def _validate_output_destination() -> None:
-    cifar.require_available_outputs(
-        RL_OUTPUT_PATHS,
-        overwrite=CONFIG.runtime.overwrite_rl,
-        stage="RL",
-    )
-
-
 def main() -> None:
-    _validate_input_artifacts()
-    _validate_output_destination()
+    cifar.require_files((*cifar.NOISE_ARTIFACT_PATHS, cifar.WARMUP_CHECKPOINT_PATH), stage="RL")
+    cifar.require_available_outputs(RL_OUTPUT_PATHS, overwrite=CONFIG.runtime.overwrite_rl, stage="RL")
     cifar.configure_engine()
     cifar.engine.run_with_file_logging()
 
