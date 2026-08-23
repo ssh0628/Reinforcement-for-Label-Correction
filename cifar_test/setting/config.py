@@ -13,12 +13,11 @@ class DataConfig:
     download: bool = True
 
     classes: tuple[int, ...] = tuple(range(10))
-    train_samples: int = 10_000
+    train_samples: int = 50_000
     subset_seed: int = 0
     noise_rate: float = 0.50
 
     seed: int = 0
-    image_size: int = 32
     mean: tuple[float, float, float] = (0.4914, 0.4822, 0.4465)
     std: tuple[float, float, float] = (0.2470, 0.2435, 0.2616)
 
@@ -72,6 +71,7 @@ class RLConfig:
     update_batch_size: int = 512
     record_change_diagnostics: bool = True
     change_diagnostic_probe_size: int = 50_000
+    record_reward_diagnostics: bool = True
 
     actor_optimizer: str = "sgd"
     actor_learning_rate: float = 1e-2
@@ -83,6 +83,7 @@ class RLConfig:
     critic_momentum: float = 0.9
     critic_weight_decay: float = 5e-4
     critic_num_bins: int = 100
+    critic_hidden_dims: tuple[int, ...] = (128, 64)
 
     discount_factor: float = 0.9
     reward_nla_weight: float = 0.5
@@ -93,6 +94,15 @@ class RLConfig:
 @dataclass(frozen=True, slots=True)
 class CorrectionConfig:
     trajectory_length: int = 25
+
+
+@dataclass(frozen=True, slots=True)
+class KNNQualityConfig:
+    visualization_samples: int = 10_000
+    pca_dimensions: int = 50
+    umap_neighbors: int = 15
+    umap_min_dist: float = 0.1
+    seed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +147,7 @@ class RuntimeConfig:
     overwrite_correction: bool = False
     overwrite_finetune: bool = False
     overwrite_evaluate: bool = False
+    overwrite_knn_quality: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +159,7 @@ class ResNet18CIFARConfig:
     knn: KNNConfig = field(default_factory=KNNConfig)
     rl: RLConfig = field(default_factory=RLConfig)
     correction: CorrectionConfig = field(default_factory=CorrectionConfig)
+    knn_quality: KNNQualityConfig = field(default_factory=KNNQualityConfig)
     finetune: FineTuneConfig = field(default_factory=FineTuneConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -191,6 +203,10 @@ class ResNet18CIFARConfig:
     @property
     def warmup_checkpoint_path(self) -> Path:
         return self.warmup_model_dir / self.output.warmup_checkpoint_name
+
+    @property
+    def knn_quality_visualization_samples(self) -> int:
+        return min(self.knn_quality.visualization_samples, self.data.train_samples)
 
     @property
     def mode_output_dir(self) -> Path:
@@ -292,6 +308,14 @@ class ResNet18CIFARConfig:
             raise ValueError("Data and output roots must be absolute paths.")
         if self.model.pretrained:
             raise ValueError("The paper-style ResNet-18 must not be pretrained.")
+        optimizers = (
+            self.warmup.optimizer,
+            self.rl.actor_optimizer,
+            self.rl.critic_optimizer,
+            self.finetune.optimizer,
+        )
+        if any(name.lower() != "sgd" for name in optimizers):
+            raise ValueError("CIFAR warm-up, actor, critic, and fine-tuning optimizers must be SGD.")
         if self.data.classes != tuple(range(10)):
             raise ValueError("CIFAR-10 classes must be 0 through 9.")
         if not 0 < self.data.train_samples <= 50_000 or self.data.train_samples % 10:
@@ -312,6 +336,8 @@ class ResNet18CIFARConfig:
             raise ValueError("initial_state_randomization_rate must be in (0, 1).")
         if not 0 <= self.rl.discount_factor <= 1:
             raise ValueError("discount_factor must be in [0, 1].")
+        if not self.rl.critic_hidden_dims or any(width <= 0 for width in self.rl.critic_hidden_dims):
+            raise ValueError("critic_hidden_dims must contain positive widths.")
         if self.runtime.amp_dtype not in {"float16", "bfloat16"}:
             raise ValueError("amp_dtype must be float16 or bfloat16.")
 
@@ -325,6 +351,9 @@ class ResNet18CIFARConfig:
             self.rl.update_batch_size,
             self.rl.change_diagnostic_probe_size,
             self.correction.trajectory_length,
+            self.knn_quality.visualization_samples,
+            self.knn_quality.pca_dimensions,
+            self.knn_quality.umap_neighbors,
             self.finetune.epochs,
             self.finetune.batch_size,
             self.runtime.evaluate_batch_size,
@@ -340,6 +369,12 @@ class ResNet18CIFARConfig:
         )
         if any(value <= 0 for value in positive):
             raise ValueError("Epochs, batch sizes, chunk sizes, and learning rates must be positive.")
+        if self.knn_quality_visualization_samples % len(self.data.classes):
+            raise ValueError("KNN visualization samples must be divisible by the number of classes.")
+        if self.knn_quality.umap_neighbors >= self.knn_quality_visualization_samples:
+            raise ValueError("UMAP neighbors must be smaller than visualization samples.")
+        if not 0 <= self.knn_quality.umap_min_dist <= 1:
+            raise ValueError("UMAP min_dist must be in [0, 1].")
 
 
 CONFIG = ResNet18CIFARConfig()

@@ -7,8 +7,6 @@ importing one another.
 
 from __future__ import annotations
 
-import sys
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Callable
 
@@ -17,9 +15,10 @@ import torch
 from torch import Tensor, nn
 from torchvision.datasets import CIFAR10
 
-from cifar_test import rl_engine as engine
-from cifar_test.cifar_config import CONFIG
-from cifar_test.resnet import build_cifar_resnet18
+from cifar_test.rl import engine
+from cifar_test.log.common import run_with_log as _run_with_log
+from cifar_test.setting.config import CONFIG
+from cifar_test.setting.model import build_cifar_resnet18
 
 
 CIFAR10_ROOT = CONFIG.data_root
@@ -39,7 +38,6 @@ SEED = CONFIG.data.seed
 
 MODEL_NAME = CONFIG.model.name
 PRETRAINED = CONFIG.model.pretrained
-IMAGE_SIZE = CONFIG.data.image_size
 CIFAR10_MEAN = CONFIG.data.mean
 CIFAR10_STD = CONFIG.data.std
 
@@ -61,13 +59,7 @@ def require_available_outputs(paths: list[Path] | tuple[Path, ...], *, overwrite
 
 
 def run_with_log(log_path: Path, operation: Callable[[], None]) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8", buffering=1) as handle:
-        stdout = engine.TeeStream(sys.stdout, handle)
-        stderr = engine.TeeStream(sys.stderr, handle)
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            print(f"run_log={log_path}")
-            operation()
+    _run_with_log(log_path, operation)
 
 
 def build_balanced_training_indices(labels: Tensor) -> Tensor:
@@ -207,6 +199,7 @@ def configure_engine() -> None:
     engine.POLICY_UPDATE_SAMPLES = CONFIG.actor_update_samples
     engine.RECORD_CHANGE_DIAGNOSTICS = CONFIG.rl.record_change_diagnostics
     engine.CHANGE_DIAGNOSTIC_PROBE_SIZE = CONFIG.change_diagnostic_probe_size
+    engine.RECORD_REWARD_DIAGNOSTICS = CONFIG.rl.record_reward_diagnostics
     engine.OUTPUT_DIR = CONFIG.rl_output_dir
     engine.MODEL_OUTPUT_DIR = CONFIG.rl_model_dir
     engine.ACTOR_BEST_CHECKPOINT_FILENAME = CONFIG.output.actor_best_checkpoint_name
@@ -220,7 +213,6 @@ def configure_engine() -> None:
     engine.WARMUP_MODEL_ID = CONFIG.warmup.model_id
     engine.MODEL_FACTORY = build_cifar_resnet18
     engine.PRETRAINED = PRETRAINED
-    engine.IMAGE_SIZE = IMAGE_SIZE
     engine.DATA_MEAN = CIFAR10_MEAN
     engine.DATA_STD = CIFAR10_STD
     engine.TRAIN_AUGMENTATION_ENABLED = CONFIG.augmentation.enabled
@@ -252,6 +244,7 @@ def configure_engine() -> None:
     engine.CRITIC_MOMENTUM = CONFIG.rl.critic_momentum
     engine.CRITIC_WEIGHT_DECAY = CONFIG.rl.critic_weight_decay
     engine.CRITIC_NUM_BINS = CONFIG.rl.critic_num_bins
+    engine.CRITIC_HIDDEN_DIMS = CONFIG.rl.critic_hidden_dims
     engine.DISCOUNT_FACTOR = CONFIG.rl.discount_factor
     engine.NLA_WEIGHT = CONFIG.rl.reward_nla_weight
     engine.LR_DECAY_FACTOR = CONFIG.rl.lr_decay_factor
