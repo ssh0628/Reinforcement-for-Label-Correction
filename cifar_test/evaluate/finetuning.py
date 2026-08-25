@@ -1,9 +1,8 @@
-"""Fine-tune an RLNLC CIFAR-10 model on corrected soft labels.
+"""Fine-tune a CIFAR-10 model on RL or weighted-KNN soft labels.
 
-The last RL actor always supplies the corrected labels. The initial model is
-selected in ``cifar_test.setting.config`` as warmup, best_actor, or last_actor. Separate
-best checkpoints are saved for clean-validation accuracy and loss, along with
-the final-epoch model.
+The label source and initial model are selected in ``cifar_test.setting.config``.
+Separate best checkpoints are saved for clean-validation accuracy and loss,
+along with the final-epoch model.
 """
 
 from __future__ import annotations
@@ -27,7 +26,8 @@ from cifar_test.setting import data as cifar
 CONFIG = cifar.CONFIG
 INITIALIZATION = CONFIG.finetune.initialization
 INITIAL_CHECKPOINT_PATH = CONFIG.finetune_initial_checkpoint_path
-CORRECTED_LABELS_PATH = CONFIG.corrected_labels_path
+LABEL_SOURCE = CONFIG.finetune.corrected_label_source
+CORRECTED_LABELS_PATH = CONFIG.finetune_corrected_labels_path
 OUTPUT_DIR = CONFIG.finetune_output_dir
 
 FINETUNE_EPOCHS = CONFIG.finetune.epochs
@@ -64,7 +64,7 @@ def _load_corrected_soft_labels(clean_labels: Tensor) -> Tensor:
     if not np.issubdtype(array.dtype, np.floating):
         raise TypeError(
             "Corrected labels must be a floating-point soft-label array. "
-            "Run cifar_correction.py again with the current code."
+            "Run the selected RL or KNN correction stage again."
         )
     labels = torch.from_numpy(array).to(torch.float32).contiguous()
     validate_soft_labels(labels, clean_labels.numel(), cifar.NUM_CLASSES)
@@ -123,6 +123,7 @@ def _save_checkpoint(
         "model_name": cifar.MODEL_NAME,
         "num_classes": cifar.NUM_CLASSES,
         "initialization": INITIALIZATION,
+        "corrected_label_source": LABEL_SOURCE,
         "source_checkpoint": str(INITIAL_CHECKPOINT_PATH),
         "corrected_labels": str(CORRECTED_LABELS_PATH),
         "optimizer": CONFIG.finetune.optimizer,
@@ -178,7 +179,10 @@ def main() -> None:
     scaler = engine.build_grad_scaler()
     write_csv(TRAIN_CSV_PATH, [], TRAIN_FIELDS)
 
-    print(f"device={torch.cuda.get_device_name(device)} initialization={INITIALIZATION}")
+    print(
+        f"device={torch.cuda.get_device_name(device)} initialization={INITIALIZATION} "
+        f"label_source={LABEL_SOURCE}"
+    )
     print(
         f"epochs={FINETUNE_EPOCHS} batch={TRAIN_BATCH_SIZE} lr={LEARNING_RATE} decay_epoch={LR_DECAY_EPOCH}"
     )

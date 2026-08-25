@@ -100,6 +100,7 @@ LR_DECAY_FACTOR = CONFIG.rl.lr_decay_factor
 USE_AMP = CONFIG.runtime.use_amp
 AMP_DTYPE = getattr(torch, CONFIG.runtime.amp_dtype)
 USE_CHANNELS_LAST = CONFIG.runtime.use_channels_last
+CUDNN_BENCHMARK = CONFIG.runtime.cudnn_benchmark
 
 
 def seed_everything(seed: int) -> None:

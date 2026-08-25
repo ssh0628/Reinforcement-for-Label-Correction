@@ -107,6 +107,7 @@ class KNNQualityConfig:
 
 @dataclass(frozen=True, slots=True)
 class FineTuneConfig:
+    corrected_label_source: str = "rl" # knn, rl
     initialization: str = "warmup"
     evaluation_checkpoint: str = "accuracy"
     epochs: int = 100
@@ -129,6 +130,7 @@ class OutputConfig:
     critic_best_checkpoint_name: str = "critic_best.pt"
     critic_last_checkpoint_name: str = "critic_last.pt"
     corrected_labels_name: str = "train_corrected_soft_labels.npy"
+    knn_corrected_labels_name: str = "train_knn_corrected_soft_labels.npy"
     finetune_best_accuracy_checkpoint_name: str = "finetune_best_accuracy.pt"
     finetune_best_loss_checkpoint_name: str = "finetune_best_loss.pt"
     finetune_last_checkpoint_name: str = "finetune_last.pt"
@@ -145,6 +147,7 @@ class RuntimeConfig:
     overwrite_warmup: bool = False
     overwrite_rl: bool = False
     overwrite_correction: bool = False
+    overwrite_knn_correction: bool = False
     overwrite_finetune: bool = False
     overwrite_evaluate: bool = False
     overwrite_knn_quality: bool = False
@@ -265,6 +268,29 @@ class ResNet18CIFARConfig:
         return self.rl_model_dir / self.output.corrected_labels_name
 
     @property
+    def knn_output_dir(self) -> Path:
+        return self.experiment_output_dir / "knn"
+
+    @property
+    def knn_correction_output_dir(self) -> Path:
+        return self.knn_output_dir / "logs" / "correction"
+
+    @property
+    def knn_corrected_labels_path(self) -> Path:
+        return self.knn_output_dir / "model" / self.output.knn_corrected_labels_name
+
+    @property
+    def finetune_corrected_labels_path(self) -> Path:
+        return {
+            "rl": self.corrected_labels_path,
+            "knn": self.knn_corrected_labels_path,
+        }[self.finetune.corrected_label_source]
+
+    @property
+    def finetune_source_output_dir(self) -> Path:
+        return self.mode_output_dir if self.finetune.corrected_label_source == "rl" else self.knn_output_dir
+
+    @property
     def finetune_initial_checkpoint_path(self) -> Path:
         return {
             "warmup": self.warmup_checkpoint_path,
@@ -274,15 +300,15 @@ class ResNet18CIFARConfig:
 
     @property
     def finetune_output_dir(self) -> Path:
-        return self.log_output_dir / "finetune"
+        return self.finetune_source_output_dir / "logs" / "finetune"
 
     @property
     def finetune_model_dir(self) -> Path:
-        return self.mode_output_dir / "model_finetune"
+        return self.finetune_source_output_dir / "model_finetune"
 
     @property
     def evaluate_output_dir(self) -> Path:
-        return self.log_output_dir / "evaluate"
+        return self.finetune_source_output_dir / "logs" / "evaluate"
 
     @property
     def finetune_best_accuracy_checkpoint_path(self) -> Path:
@@ -328,6 +354,8 @@ class ResNet18CIFARConfig:
             raise ValueError("subset_size must be in [1, train_samples].")
         if self.finetune.initialization not in {"warmup", "best_actor", "last_actor"}:
             raise ValueError("Invalid fine-tuning initialization.")
+        if self.finetune.corrected_label_source not in {"rl", "knn"}:
+            raise ValueError("corrected_label_source must be 'rl' or 'knn'.")
         if self.finetune.evaluation_checkpoint not in {"accuracy", "loss"}:
             raise ValueError("evaluation_checkpoint must be accuracy or loss.")
         if self.knn.k >= self.data.train_samples:
