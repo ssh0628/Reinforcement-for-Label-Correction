@@ -6,18 +6,13 @@ only the untouched 5,000-image half is used here to avoid validation leakage.
 
 from __future__ import annotations
 
-import sys
 import time
-from pathlib import Path
 
 import torch
 from torch import Tensor, nn
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from cifar_test.log.common import write_csv
+from cifar_test.log.common import run_with_log, write_csv
+from cifar_test.rl import engine
 from cifar_test.setting import data as cifar
 
 
@@ -50,8 +45,8 @@ def _load_model(device: torch.device) -> tuple[nn.Module, dict[str, object]]:
     if int(checkpoint["num_classes"]) != cifar.NUM_CLASSES:
         raise ValueError("Checkpoint class count does not match CIFAR-10.")
     if checkpoint.get("initialization") != INITIALIZATION:
-        raise ValueError("Checkpoint initialization does not match the configured ablation.")
-    cifar.engine.validate_training_data_checkpoint(checkpoint)
+        raise ValueError("Checkpoint initialization does not match the configured initialization.")
+    engine.validate_training_data_checkpoint(checkpoint)
     if checkpoint.get("checkpoint_kind") != "best":
         raise ValueError("Final evaluation must use the fine-tuning best model.")
     if checkpoint.get("selection_metric") != FINETUNE_SELECTION_METRIC:
@@ -61,7 +56,7 @@ def _load_model(device: torch.device) -> tuple[nn.Module, dict[str, object]]:
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(
         device=device,
-        memory_format=(torch.channels_last if cifar.engine.USE_CHANNELS_LAST else torch.contiguous_format),
+        memory_format=(torch.channels_last if engine.USE_CHANNELS_LAST else torch.contiguous_format),
     )
     metadata = {
         "checkpoint_kind": checkpoint["checkpoint_kind"],
@@ -75,7 +70,6 @@ def _load_model(device: torch.device) -> tuple[nn.Module, dict[str, object]]:
 @torch.inference_mode()
 def _evaluate(model: nn.Module, images: Tensor, labels: Tensor, device: torch.device) -> dict[str, object]:
     model.eval()
-    engine = cifar.engine
     mean, std = engine.normalization_tensors(device)
     criterion = nn.CrossEntropyLoss(reduction="sum")
     loss_sum = torch.zeros((), dtype=torch.float64, device=device)
@@ -97,8 +91,6 @@ def _evaluate(model: nn.Module, images: Tensor, labels: Tensor, device: torch.de
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    cifar.configure_engine()
-    engine = cifar.engine
     device = engine.resolve_local_device()
     engine.seed_everything(SEED)
     torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
@@ -135,7 +127,7 @@ def main() -> None:
 def run_with_file_logging() -> None:
     cifar.require_files((FINETUNE_CHECKPOINT_PATH,), stage="Evaluation")
     cifar.require_available_outputs([TEST_CSV_PATH, RUN_LOG_PATH], overwrite=OVERWRITE, stage="Evaluation")
-    cifar.run_with_log(RUN_LOG_PATH, main)
+    run_with_log(RUN_LOG_PATH, main)
 
 
 if __name__ == "__main__":

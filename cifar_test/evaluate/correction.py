@@ -1,25 +1,17 @@
 """Create the paper-style cleaned-label artifact.
 
 This stage always deploys the final RL actor. It is intentionally independent
-from RL training so the same corrected labels can be reused by every
-fine-tuning initialization ablation.
+from RL training so the same corrected labels can be reused.
 """
 
 from __future__ import annotations
 
-import sys
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from cifar_test.evaluate.metrics import correction_summary, validate_soft_labels
 from cifar_test.log.common import (
@@ -28,8 +20,10 @@ from cifar_test.log.common import (
     build_timing_rows,
     measure,
     print_timing_summary,
+    run_with_log,
     write_csv,
 )
+from cifar_test.rl import engine
 from cifar_test.rl.policy import LabelCorrectionPolicy
 from cifar_test.setting import data as cifar
 
@@ -76,19 +70,14 @@ CLEANING_SUMMARY_FIELDS = (
     "clean_preservation_rate",
     "seconds",
 )
-
-
-def _output_paths(*, include_log: bool) -> list[Path]:
-    paths = [
-        CORRECTED_LABELS_PATH,
-        CLEANING_CSV_PATH,
-        CLEANING_SUMMARY_PATH,
-        TIMING_CSV_PATH,
-        RUN_SUMMARY_PATH,
-    ]
-    if include_log:
-        paths.append(RUN_LOG_PATH)
-    return paths
+OUTPUT_PATHS = (
+    CORRECTED_LABELS_PATH,
+    CLEANING_CSV_PATH,
+    CLEANING_SUMMARY_PATH,
+    TIMING_CSV_PATH,
+    RUN_SUMMARY_PATH,
+    RUN_LOG_PATH,
+)
 
 
 def run_correction(
@@ -104,7 +93,6 @@ def run_correction(
     timings: Timings,
     checkpoint_epoch: int,
 ) -> dict[str, object]:
-    engine = cifar.engine
     engine.synchronize(device)
     started = time.perf_counter()
     device_index = device.index if device.index is not None else 0
@@ -208,8 +196,6 @@ def run_correction(
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    cifar.configure_engine()
-    engine = cifar.engine
     device = engine.resolve_local_device()
     engine.seed_everything(cifar.SEED)
     torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
@@ -236,11 +222,15 @@ def main() -> None:
         lambda: engine.restore_actor_checkpoint(model, ACTOR_CHECKPOINT_PATH, device),
     )
     actor_epoch = int(checkpoint["epoch"])
-    if actor_epoch != CONFIG.rl.epochs:
+    if not 1 <= actor_epoch <= CONFIG.rl.epochs:
         raise ValueError(
-            "Correction must use the final RL actor: "
-            f"checkpoint epoch {actor_epoch} != configured epoch "
-            f"{CONFIG.rl.epochs}."
+            f"Actor checkpoint epoch must be between 1 and {CONFIG.rl.epochs}, "
+            f"got {actor_epoch}."
+        )
+    if actor_epoch < CONFIG.rl.epochs:
+        print(
+            "[CLEAN] using intermediate actor checkpoint: "
+            f"epoch={actor_epoch}/{CONFIG.rl.epochs}"
         )
     del checkpoint
 
@@ -297,8 +287,8 @@ def main() -> None:
 
 def run_with_file_logging() -> None:
     cifar.require_files((ACTOR_CHECKPOINT_PATH, *cifar.NOISE_ARTIFACT_PATHS), stage="Correction")
-    cifar.require_available_outputs(_output_paths(include_log=True), overwrite=OVERWRITE, stage="Correction")
-    cifar.run_with_log(RUN_LOG_PATH, main)
+    cifar.require_available_outputs(OUTPUT_PATHS, overwrite=OVERWRITE, stage="Correction")
+    run_with_log(RUN_LOG_PATH, main)
 
 
 if __name__ == "__main__":

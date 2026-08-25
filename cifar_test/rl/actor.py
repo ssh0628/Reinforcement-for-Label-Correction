@@ -98,7 +98,7 @@ def update_actor(
     encode: Encode,
     change_recorder: ChangeRecorder | None = None,
 ) -> float:
-    """Apply one paper-style policy-gradient update to full data or a subset."""
+    """Apply one policy-gradient update to full data or a subset."""
     sample_count = raw_images.size(0)
     model.eval()
     optimizer.zero_grad(set_to_none=True)
@@ -121,6 +121,7 @@ def update_actor(
     neighbor_indices = selected_neighbors_cpu.to(device=device, non_blocking=True)
 
     total_loss = torch.zeros((), device=device)
+    signal = q_value.detach()
     for start in range(0, query_count, batch_size):
         end = min(start + batch_size, query_count)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
@@ -131,7 +132,7 @@ def update_actor(
                 label_state[neighbor_indices[start:end]],
                 actions=actions[query_indices[start:end]],
             )
-            total_loss = total_loss - q_value.detach() * policy_step.log_probabilities.sum() / query_count
+            total_loss = total_loss - signal * policy_step.log_probabilities.sum() / query_count
 
     scaler.scale(total_loss).backward()
 
@@ -140,5 +141,4 @@ def update_actor(
         change_recorder.capture_unscaled_gradient()
     scaler.step(optimizer)
     scaler.update()
-    print(f"[ACTOR UPDATE] queries={query_count} unique_images={unique_indices_cpu.numel()}")
     return float(total_loss.detach())

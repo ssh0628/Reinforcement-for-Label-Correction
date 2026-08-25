@@ -65,6 +65,16 @@ def append_csv(path: Path, rows: list[dict[str, object]], fieldnames: tuple[str,
         writer.writerows(rows)
 
 
+def save_torch(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    try:
+        torch.save(payload, temporary_path)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def measure(
     stage: str,
     device: torch.device,

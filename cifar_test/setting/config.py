@@ -6,7 +6,6 @@ from pathlib import Path
 
 PROJECT_ROOT = Path("/root/project/rlnlc")
 
-
 @dataclass(frozen=True, slots=True)
 class DataConfig:
     root: Path = PROJECT_ROOT / "cifar10"
@@ -67,11 +66,12 @@ class RLConfig:
     feature_batch_size: int = 1_024
     update_mode: str = "full"
     subset_size: int = 5_000
+    use_remaining_horizon: bool = False
+    use_terminal_critic_update: bool = False
 
     update_batch_size: int = 512
     record_change_diagnostics: bool = True
     change_diagnostic_probe_size: int = 50_000
-    record_reward_diagnostics: bool = True
 
     actor_optimizer: str = "sgd"
     actor_learning_rate: float = 1e-2
@@ -375,7 +375,5 @@ class ResNet18CIFARConfig:
             raise ValueError("UMAP neighbors must be smaller than visualization samples.")
         if not 0 <= self.knn_quality.umap_min_dist <= 1:
             raise ValueError("UMAP min_dist must be in [0, 1].")
-
-
 CONFIG = ResNet18CIFARConfig()
 CONFIG.validate()

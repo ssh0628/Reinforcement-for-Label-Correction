@@ -9,7 +9,6 @@ the final-epoch model.
 from __future__ import annotations
 
 import math
-import sys
 import time
 from pathlib import Path
 
@@ -19,12 +18,9 @@ from torch import Tensor, nn
 from torch.optim import SGD
 from torch.optim.lr_scheduler import MultiStepLR
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from cifar_test.evaluate.metrics import validate_soft_labels
-from cifar_test.log.common import append_csv, write_csv
+from cifar_test.log.common import append_csv, run_with_log, save_torch, write_csv
+from cifar_test.rl import engine
 from cifar_test.setting import data as cifar
 
 
@@ -65,7 +61,6 @@ TRAIN_FIELDS = (
 
 def _load_corrected_soft_labels(clean_labels: Tensor) -> Tensor:
     array = np.load(CORRECTED_LABELS_PATH, allow_pickle=False)
-    array = np.asarray(array)
     if not np.issubdtype(array.dtype, np.floating):
         raise TypeError(
             "Corrected labels must be a floating-point soft-label array. "
@@ -73,7 +68,7 @@ def _load_corrected_soft_labels(clean_labels: Tensor) -> Tensor:
         )
     labels = torch.from_numpy(array).to(torch.float32).contiguous()
     validate_soft_labels(labels, clean_labels.numel(), cifar.NUM_CLASSES)
-    return cifar.engine.pin_for_cuda(labels)
+    return cifar.pin_for_cuda(labels)
 
 
 def _load_initial_model(device: torch.device) -> nn.Module:
@@ -90,8 +85,8 @@ def _load_initial_model(device: torch.device) -> nn.Module:
         raise ValueError("Initial checkpoint class count does not match CIFAR-10.")
     if INITIALIZATION == "warmup" and (checkpoint.get("warmup_model_id") != CONFIG.warmup.model_id):
         raise ValueError("Warmup checkpoint model ID does not match config.")
-    cifar.engine.validate_training_augmentation_checkpoint(checkpoint)
-    cifar.engine.validate_training_data_checkpoint(checkpoint)
+    engine.validate_training_augmentation_checkpoint(checkpoint)
+    engine.validate_training_data_checkpoint(checkpoint)
     if INITIALIZATION == "last_actor" and int(checkpoint["epoch"]) != CONFIG.rl.epochs:
         raise ValueError("last_actor initialization must use the configured final RL epoch.")
 
@@ -102,7 +97,7 @@ def _load_initial_model(device: torch.device) -> nn.Module:
         raise RuntimeError("The initial checkpoint does not contain the classifier head.") from error
     model.to(
         device=device,
-        memory_format=(torch.channels_last if cifar.engine.USE_CHANNELS_LAST else torch.contiguous_format),
+        memory_format=(torch.channels_last if engine.USE_CHANNELS_LAST else torch.contiguous_format),
     )
     return model
 
@@ -116,7 +111,6 @@ def _save_checkpoint(
     selection_metric: str | None,
     validation: dict[str, float],
 ) -> None:
-    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     payload = {
         "epoch": epoch,
         "checkpoint_kind": checkpoint_kind,
@@ -135,15 +129,11 @@ def _save_checkpoint(
         "learning_rate": LEARNING_RATE,
         "momentum": MOMENTUM,
         "weight_decay": WEIGHT_DECAY,
-        "training_augmentation": (cifar.engine.training_augmentation_metadata()),
-        "training_data": cifar.engine.training_data_metadata(),
+        "training_augmentation": engine.training_augmentation_metadata(),
+        "training_data": engine.training_data_metadata(),
         "model": model.state_dict(),
     }
-    try:
-        torch.save(payload, temporary_path)
-        temporary_path.replace(path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
+    save_torch(path, payload)
 
 
 @torch.inference_mode()
@@ -151,7 +141,6 @@ def _evaluate_validation(
     model: nn.Module, images: Tensor, labels: Tensor, device: torch.device, mean: Tensor, std: Tensor
 ) -> dict[str, float]:
     model.eval()
-    engine = cifar.engine
     loss_sum = torch.zeros((), dtype=torch.float64, device=device)
     correct_count = torch.zeros((), dtype=torch.long, device=device)
 
@@ -172,8 +161,6 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     BEST_ACCURACY_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    cifar.configure_engine()
-    engine = cifar.engine
     device = engine.resolve_local_device()
     engine.seed_everything(SEED)
     torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
@@ -218,7 +205,7 @@ def main() -> None:
         for start in range(0, permutation.numel(), TRAIN_BATCH_SIZE):
             end = min(start + TRAIN_BATCH_SIZE, permutation.numel())
             indices = permutation[start:end]
-            images = engine.preprocess_training(
+            images = cifar.preprocess_cifar10_training(
                 train_images[indices], device, mean, std, augmentation_generator
             )
             targets = corrected_labels[indices].to(device, non_blocking=True)
@@ -316,7 +303,7 @@ def run_with_file_logging() -> None:
         overwrite=OVERWRITE,
         stage="Fine-tuning",
     )
-    cifar.run_with_log(RUN_LOG_PATH, main)
+    run_with_log(RUN_LOG_PATH, main)
 
 
 if __name__ == "__main__":

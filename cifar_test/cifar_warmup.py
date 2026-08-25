@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from cifar_test.setting.warmup import main
+from cifar_test.setting.warmup import run_with_file_logging as main
 
 
 if __name__ == "__main__":

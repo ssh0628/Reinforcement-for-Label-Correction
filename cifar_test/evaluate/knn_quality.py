@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 
@@ -12,12 +11,8 @@ from PIL import Image, ImageDraw, ImageFont
 from torch import Tensor
 from torch.nn import functional as F
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from cifar_test.log.common import write_csv
+from cifar_test.log.common import run_with_log, write_csv
+from cifar_test.rl import engine
 from cifar_test.setting import data as cifar
 
 
@@ -267,8 +262,6 @@ def render_projection_png(
 
 
 def main() -> None:
-    cifar.configure_engine()
-    engine = cifar.engine
     device = engine.resolve_local_device()
     engine.seed_everything(CONFIG.knn_quality.seed)
     torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
@@ -339,7 +332,7 @@ def run_with_file_logging() -> None:
     cifar.require_available_outputs(
         OUTPUT_PATHS, overwrite=CONFIG.runtime.overwrite_knn_quality, stage="KNN quality"
     )
-    cifar.run_with_log(RUN_LOG_PATH, main)
+    run_with_log(RUN_LOG_PATH, main)
 
 
 if __name__ == "__main__":

@@ -7,17 +7,9 @@ independently.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import torch
 from torchvision.datasets import CIFAR10
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from cifar_test.setting import data as cifar
 
@@ -33,39 +25,24 @@ EXPECTED_SAMPLES = CONFIG.data.train_samples
 DOWNLOAD_CIFAR10 = CONFIG.data.download
 OVERWRITE = CONFIG.runtime.overwrite_noise
 
-TRAIN_INDICES_FILENAME = cifar.TRAIN_INDICES_PATH.name
-NOISY_LABELS_FILENAME = cifar.NOISY_LABELS_PATH.name
-NOISE_MASK_FILENAME = cifar.NOISE_MASK_PATH.name
-
 
 def main() -> None:
-    output_paths = (
-        OUTPUT_DIR / TRAIN_INDICES_FILENAME,
-        OUTPUT_DIR / NOISY_LABELS_FILENAME,
-        OUTPUT_DIR / NOISE_MASK_FILENAME,
-    )
-    existing = [path for path in output_paths if path.exists()]
-    if existing and not OVERWRITE:
-        raise FileExistsError(
-            f"Noise artifacts already exist: {existing}. Set OVERWRITE=True "
-            "only when replacement is intentional."
-        )
+    cifar.require_available_outputs(cifar.NOISE_ARTIFACT_PATHS, overwrite=OVERWRITE, stage="Noise")
 
     dataset = CIFAR10(root=CIFAR10_ROOT, train=True, download=DOWNLOAD_CIFAR10)
     source_labels = torch.tensor(dataset.targets, dtype=torch.long)
     training_indices = cifar.build_balanced_training_indices(source_labels)
     clean_labels = source_labels[training_indices].contiguous()
 
-    cifar.configure_engine()
-    noisy_labels, noise_mask = cifar.engine.inject_stratified_symmetric_noise(clean_labels)
+    noisy_labels, noise_mask = cifar.inject_stratified_symmetric_noise(clean_labels)
     indices_array = training_indices.numpy().astype(np.int64, copy=False)
     noisy_array = noisy_labels.numpy().astype(np.int64, copy=False)
     mask_array = noise_mask.numpy().astype(np.bool_, copy=False)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    np.save(output_paths[0], indices_array, allow_pickle=False)
-    np.save(output_paths[1], noisy_array, allow_pickle=False)
-    np.save(output_paths[2], mask_array, allow_pickle=False)
+    np.save(cifar.TRAIN_INDICES_PATH, indices_array, allow_pickle=False)
+    np.save(cifar.NOISY_LABELS_PATH, noisy_array, allow_pickle=False)
+    np.save(cifar.NOISE_MASK_PATH, mask_array, allow_pickle=False)
 
     print(f"output_dir={OUTPUT_DIR}")
     print(
@@ -74,7 +51,7 @@ def main() -> None:
         f"subset_seed={SUBSET_SEED}"
     )
     print(f"noise_rate={NOISE_RATE:.2f} noise_count={int(mask_array.sum())} seed={SEED}")
-    for path in output_paths:
+    for path in cifar.NOISE_ARTIFACT_PATHS:
         print(f"saved={path}")
 
 

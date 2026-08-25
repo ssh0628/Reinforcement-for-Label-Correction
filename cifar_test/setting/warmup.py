@@ -6,7 +6,6 @@ Both full and subset RL runs load the checkpoint produced here.
 from __future__ import annotations
 
 import math
-import sys
 import time
 from pathlib import Path
 
@@ -15,10 +14,6 @@ from torch import Tensor, nn
 from torch.optim import SGD
 from torch.optim.lr_scheduler import MultiStepLR
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from cifar_test.log.common import (
     TIMING_FIELDS,
     Timings,
@@ -26,18 +21,23 @@ from cifar_test.log.common import (
     build_timing_rows,
     measure,
     print_timing_summary,
+    run_with_log,
+    save_torch,
     write_csv,
 )
+from cifar_test.rl import engine
 from cifar_test.setting import data as cifar
 
 
+CONFIG = cifar.CONFIG
+WARMUP = CONFIG.warmup
 WARMUP_CHECKPOINT_PATH = cifar.WARMUP_CHECKPOINT_PATH
-OUTPUT_DIR = cifar.CONFIG.warmup_log_dir
+OUTPUT_DIR = CONFIG.warmup_log_dir
 
 RUN_LOG_PATH = OUTPUT_DIR / "run.log"
 WARMUP_CSV_PATH = OUTPUT_DIR / "warmup.csv"
 TIMING_CSV_PATH = OUTPUT_DIR / "timing.csv"
-OVERWRITE = cifar.CONFIG.runtime.overwrite_warmup
+OVERWRITE = CONFIG.runtime.overwrite_warmup
 
 WARMUP_FIELDS = (
     "epoch",
@@ -62,13 +62,12 @@ def evaluate(
     std: Tensor,
     criterion: nn.CrossEntropyLoss,
 ) -> dict[str, float]:
-    engine = cifar.engine
     model.eval()
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     noisy_correct = torch.zeros((), device=device, dtype=torch.long)
     clean_correct = torch.zeros((), device=device, dtype=torch.long)
-    for start in range(0, images.size(0), engine.WARMUP_EVAL_BATCH_SIZE):
-        end = min(start + engine.WARMUP_EVAL_BATCH_SIZE, images.size(0))
+    for start in range(0, images.size(0), WARMUP.eval_batch_size):
+        end = min(start + WARMUP.eval_batch_size, images.size(0))
         batch = engine.preprocess(images[start:end], device, mean, std)
         noisy_targets = noisy_labels[start:end].to(device, non_blocking=True)
         clean_targets = clean_labels[start:end].to(device, non_blocking=True)
@@ -94,32 +93,26 @@ def save_checkpoint(
     noisy_accuracy: float,
     clean_accuracy: float,
 ) -> None:
-    engine = cifar.engine
-    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-    try:
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_name": engine.MODEL_NAME,
-                "num_classes": engine.NUM_CLASSES,
-                "model": model.state_dict(),
-                "noisy_validation_accuracy": noisy_accuracy,
-                "clean_validation_accuracy": clean_accuracy,
-                "noise_rate": engine.NOISE_RATE,
-                "pretrained": engine.PRETRAINED,
-                "warmup_model_id": engine.WARMUP_MODEL_ID,
-                "training_data": engine.training_data_metadata(),
-                "training_augmentation": engine.training_augmentation_metadata(),
-                "selection": "best",
-                "best_epoch": epoch,
-                "best_noisy_validation_accuracy": noisy_accuracy,
-                "best_clean_validation_accuracy": clean_accuracy,
-            },
-            temporary_path,
-        )
-        temporary_path.replace(path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
+    save_torch(
+        path,
+        {
+            "epoch": epoch,
+            "model_name": cifar.MODEL_NAME,
+            "num_classes": cifar.NUM_CLASSES,
+            "model": model.state_dict(),
+            "noisy_validation_accuracy": noisy_accuracy,
+            "clean_validation_accuracy": clean_accuracy,
+            "noise_rate": CONFIG.data.noise_rate,
+            "pretrained": cifar.PRETRAINED,
+            "warmup_model_id": WARMUP.model_id,
+            "training_data": engine.training_data_metadata(),
+            "training_augmentation": engine.training_augmentation_metadata(),
+            "selection": "best",
+            "best_epoch": epoch,
+            "best_noisy_validation_accuracy": noisy_accuracy,
+            "best_clean_validation_accuracy": clean_accuracy,
+        },
+    )
 
 
 def train_warmup(
@@ -133,23 +126,22 @@ def train_warmup(
     mean: Tensor,
     std: Tensor,
 ) -> dict[str, object]:
-    engine = cifar.engine
     criterion = nn.CrossEntropyLoss()
     scaler = engine.build_grad_scaler()
     optimizer = SGD(
         model.parameters(),
-        lr=engine.WARMUP_LR,
-        momentum=engine.WARMUP_MOMENTUM,
-        weight_decay=engine.WARMUP_WEIGHT_DECAY,
+        lr=WARMUP.learning_rate,
+        momentum=WARMUP.momentum,
+        weight_decay=WARMUP.weight_decay,
     )
-    milestone = max(1, math.ceil(engine.WARMUP_EPOCHS * engine.WARMUP_LR_DECAY_FRACTION))
-    scheduler = MultiStepLR(optimizer, milestones=[milestone], gamma=engine.WARMUP_LR_DECAY_FACTOR)
+    milestone = max(1, math.ceil(WARMUP.epochs * WARMUP.lr_decay_fraction))
+    scheduler = MultiStepLR(optimizer, milestones=[milestone], gamma=WARMUP.lr_decay_factor)
     write_csv(WARMUP_CSV_PATH, [], WARMUP_FIELDS)
     best_noisy_accuracy = float("-inf")
     best_clean_accuracy = float("nan")
     best_epoch = 0
 
-    for epoch in range(1, engine.WARMUP_EPOCHS + 1):
+    for epoch in range(1, WARMUP.epochs + 1):
         started = time.perf_counter()
         model.train()
         generator = torch.Generator().manual_seed(cifar.SEED + epoch)
@@ -158,9 +150,9 @@ def train_warmup(
         loss_sum = torch.zeros((), device=device, dtype=torch.float64)
         correct_count = torch.zeros((), device=device, dtype=torch.long)
 
-        for start in range(0, permutation.numel(), engine.WARMUP_BATCH_SIZE):
-            indices = permutation[start : start + engine.WARMUP_BATCH_SIZE]
-            images = engine.preprocess_training(
+        for start in range(0, permutation.numel(), WARMUP.batch_size):
+            indices = permutation[start : start + WARMUP.batch_size]
+            images = cifar.preprocess_cifar10_training(
                 train_images[indices], device, mean, std, augmentation_generator
             )
             targets = train_noisy_labels[indices].to(device, non_blocking=True)
@@ -189,7 +181,7 @@ def train_warmup(
         }
         append_csv(WARMUP_CSV_PATH, [row], WARMUP_FIELDS)
         print(
-            f"[WARMUP] epoch={epoch}/{engine.WARMUP_EPOCHS} lr={float(row['lr']):.6g} "
+            f"[WARMUP] epoch={epoch}/{WARMUP.epochs} lr={float(row['lr']):.6g} "
             f"train_loss={float(row['train_loss']):.4f} "
             f"train_acc={float(row['train_accuracy']):.4f} "
             f"val_noisy_acc={float(row['val_noisy_accuracy']):.4f} "
@@ -212,10 +204,10 @@ def train_warmup(
         f"[WARMUP] deployment=best deployment_epoch={deployed_epoch} best_epoch={best_epoch} "
         f"val_noisy_acc={best_noisy_accuracy:.4f} val_clean_acc={best_clean_accuracy:.4f}"
     )
-    if best_noisy_accuracy < engine.WARMUP_MIN_NOISY_VALIDATION_ACCURACY:
+    if best_noisy_accuracy < WARMUP.min_noisy_validation_accuracy:
         raise RuntimeError(
             "Warmup quality is too low to build a semantic RL reward graph: "
-            f"{best_noisy_accuracy:.4f} < {engine.WARMUP_MIN_NOISY_VALIDATION_ACCURACY:.4f}."
+            f"{best_noisy_accuracy:.4f} < {WARMUP.min_noisy_validation_accuracy:.4f}."
         )
     return {
         "best_epoch": best_epoch,
@@ -227,9 +219,6 @@ def train_warmup(
 
 
 def main() -> None:
-    cifar.configure_engine()
-    engine = cifar.engine
-
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     WARMUP_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -243,10 +232,11 @@ def main() -> None:
     noisy_labels, noise_mask = measure(
         "noise_load", device, timings, lambda: engine.load_noisy_label_artifacts(clean_labels)
     )
-    evaluation_splits = measure("val_load", device, timings, cifar.load_cifar10_validation)
-    val_images, val_clean_labels = evaluation_splits["val"]
+    val_images, val_clean_labels = measure(
+        "val_load", device, timings, lambda: cifar.load_cifar10_evaluation_split("val")
+    )
     val_noisy_labels, _ = measure(
-        "val_noise", device, timings, lambda: engine.inject_stratified_symmetric_noise(val_clean_labels)
+        "val_noise", device, timings, lambda: cifar.inject_stratified_symmetric_noise(val_clean_labels)
     )
 
     engine.print_configuration(device, clean_labels.numel())
@@ -266,7 +256,9 @@ def main() -> None:
         "gpu_warmup",
         device,
         timings,
-        lambda: engine.warm_device_kernels(model, raw_images, device, mean, std),
+        lambda: engine.warm_device_kernels(
+            model, raw_images, device, mean, std, update_batch_size=WARMUP.batch_size
+        ),
     )
     result = measure(
         "warmup_train",
@@ -299,7 +291,7 @@ def run_with_file_logging() -> None:
         overwrite=OVERWRITE,
         stage="Warmup",
     )
-    cifar.run_with_log(RUN_LOG_PATH, main)
+    run_with_log(RUN_LOG_PATH, main)
 
 
 if __name__ == "__main__":

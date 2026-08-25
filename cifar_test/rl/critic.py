@@ -24,33 +24,54 @@ def encode_consistency_histogram(scores: Tensor, num_bins: int) -> Tensor:
 
 
 class StateActionCritic(nn.Module):
-    """MLP Q-value estimator over the deterministic next-state histogram."""
+    """MLP Q-value estimator over the configured state encoding."""
 
-    def __init__(self, num_bins: int, hidden_dims: tuple[int, ...]) -> None:
+    def __init__(
+        self,
+        num_bins: int,
+        hidden_dims: tuple[int, ...],
+        *,
+        use_remaining_horizon: bool = True,
+    ) -> None:
         super().__init__()
         self.num_bins = num_bins
+        self.use_remaining_horizon = use_remaining_horizon
         layers: list[nn.Module] = []
-        input_width = num_bins
+        input_width = num_bins + int(use_remaining_horizon)
         for output_width in hidden_dims:
             layers.extend((nn.Linear(input_width, output_width), nn.ReLU()))
             input_width = output_width
         layers.append(nn.Linear(input_width, 1))
         self.value_head = nn.Sequential(*layers)
 
-    def encode(self, consistency_scores: Tensor) -> Tensor:
-        return encode_consistency_histogram(consistency_scores, self.num_bins)
+    def encode(self, consistency_scores: Tensor, remaining_horizon: float) -> Tensor:
+        histogram = encode_consistency_histogram(consistency_scores, self.num_bins)
+        if not self.use_remaining_horizon:
+            return histogram
+        horizon = histogram.new_full((*histogram.shape[:-1], 1), remaining_horizon)
+        return torch.cat((histogram, horizon), dim=-1)
 
     def value_from_encoding(self, encoding: Tensor) -> Tensor:
-        if encoding.shape[-1] != self.num_bins:
-            raise ValueError("Critic encoding width does not match num_bins.")
+        expected_width = self.num_bins + int(self.use_remaining_horizon)
+        if encoding.shape[-1] != expected_width:
+            raise ValueError(f"Critic encoding width must be {expected_width}.")
         return self.value_head(encoding).squeeze(-1)
 
-    def forward(self, consistency_scores: Tensor) -> Tensor:
-        return self.value_from_encoding(self.encode(consistency_scores))
+    def forward(self, consistency_scores: Tensor, remaining_horizon: float) -> Tensor:
+        return self.value_from_encoding(self.encode(consistency_scores, remaining_horizon))
 
 
-def build_critic(num_bins: int, hidden_dims: tuple[int, ...]) -> StateActionCritic:
-    return StateActionCritic(num_bins, hidden_dims)
+def build_critic(
+    num_bins: int,
+    hidden_dims: tuple[int, ...],
+    *,
+    use_remaining_horizon: bool = True,
+) -> StateActionCritic:
+    return StateActionCritic(
+        num_bins,
+        hidden_dims,
+        use_remaining_horizon=use_remaining_horizon,
+    )
 
 
 def build_critic_optimizer(
@@ -86,8 +107,12 @@ def sarsa_td_loss(
 
 
 @torch.no_grad()
-def encode_state_action(critic: StateActionCritic, consistency: Tensor) -> tuple[Tensor, Tensor]:
-    encoding = critic.encode(consistency).detach()
+def encode_state_action(
+    critic: StateActionCritic, consistency: Tensor, remaining_horizon: float
+) -> tuple[Tensor, Tensor]:
+    if not 0.0 <= remaining_horizon <= 1.0:
+        raise ValueError("remaining_horizon must be normalized to [0, 1].")
+    encoding = critic.encode(consistency, remaining_horizon).detach()
     return encoding, critic.value_from_encoding(encoding)
 
 
@@ -96,14 +121,22 @@ def update_critic(
     optimizer: torch.optim.Optimizer,
     encoding: Tensor,
     reward: Tensor,
-    next_encoding: Tensor,
+    next_encoding: Tensor | None,
     *,
     discount_factor: float,
+    terminal: bool = False,
 ) -> CriticUpdateOutput:
     optimizer.zero_grad(set_to_none=True)
     current_q = critic.value_from_encoding(encoding)
-    next_q = critic.value_from_encoding(next_encoding)
-    td = sarsa_td_loss(current_q, reward, next_q, discount_factor=discount_factor)
+    if terminal:
+        next_q = torch.zeros_like(current_q)
+    else:
+        if next_encoding is None:
+            raise ValueError("Non-terminal critic updates require the next encoding.")
+        next_q = critic.value_from_encoding(next_encoding)
+    td = sarsa_td_loss(
+        current_q, reward, next_q, discount_factor=discount_factor, terminal=terminal
+    )
     td.loss.backward()
     optimizer.step()
     loss, current, following, target, error = torch.stack(

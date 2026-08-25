@@ -1,22 +1,18 @@
-"""Shared CIFAR-10 data, model, preprocessing, and engine configuration.
+"""Shared CIFAR-10 data loading, preprocessing, and model construction.
 
-This module has no executable stage of its own.  Keeping these primitives here
-prevents warm-up, RL, correction, fine-tuning, and evaluation entry points from
-importing one another.
+This module has no executable stage of its own.
 """
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 import torch
 from torch import Tensor, nn
 from torchvision.datasets import CIFAR10
 
-from cifar_test.rl import engine
-from cifar_test.log.common import run_with_log as _run_with_log
 from cifar_test.setting.config import CONFIG
 from cifar_test.setting.model import build_cifar_resnet18
 
@@ -32,7 +28,6 @@ WARMUP_CHECKPOINT_PATH = CONFIG.warmup_checkpoint_path
 CLASSES = CONFIG.data.classes
 NUM_CLASSES = len(CLASSES)
 EXPECTED_SAMPLES = CONFIG.data.train_samples
-NATIVE_TRAIN_SAMPLES = 50_000
 SUBSET_SEED = CONFIG.data.subset_seed
 SEED = CONFIG.data.seed
 
@@ -40,6 +35,10 @@ MODEL_NAME = CONFIG.model.name
 PRETRAINED = CONFIG.model.pretrained
 CIFAR10_MEAN = CONFIG.data.mean
 CIFAR10_STD = CONFIG.data.std
+
+
+def pin_for_cuda(tensor: Tensor) -> Tensor:
+    return tensor.pin_memory() if torch.cuda.is_available() else tensor
 
 
 def require_files(paths: tuple[Path, ...], *, stage: str) -> None:
@@ -58,14 +57,10 @@ def require_available_outputs(paths: list[Path] | tuple[Path, ...], *, overwrite
         )
 
 
-def run_with_log(log_path: Path, operation: Callable[[], None]) -> None:
-    _run_with_log(log_path, operation)
-
-
 def build_balanced_training_indices(labels: Tensor) -> Tensor:
     samples_per_class = EXPECTED_SAMPLES // NUM_CLASSES
-    if EXPECTED_SAMPLES == NATIVE_TRAIN_SAMPLES:
-        return torch.arange(NATIVE_TRAIN_SAMPLES, dtype=torch.long)
+    if EXPECTED_SAMPLES == 50_000:
+        return torch.arange(50_000, dtype=torch.long)
 
     generator = torch.Generator().manual_seed(SUBSET_SEED)
     selected = []
@@ -99,8 +94,8 @@ def load_selected_cifar10_train() -> tuple[Tensor, Tensor]:
     source_labels = torch.tensor(dataset.targets, dtype=torch.long)
     indices = load_training_indices(source_labels)
     source_images = torch.from_numpy(dataset.data).permute(0, 3, 1, 2)
-    images = engine.pin_for_cuda(source_images[indices].contiguous())
-    labels = engine.pin_for_cuda(source_labels[indices].contiguous())
+    images = pin_for_cuda(source_images[indices].contiguous())
+    labels = pin_for_cuda(source_labels[indices].contiguous())
     return images, labels
 
 
@@ -128,17 +123,40 @@ def load_cifar10_evaluation_split(split: str) -> tuple[Tensor, Tensor]:
     all_images = torch.from_numpy(dataset.data).permute(0, 3, 1, 2)
     all_labels = torch.tensor(dataset.targets, dtype=torch.long)
     indices = _evaluation_indices(all_labels)[split]
-    images = engine.pin_for_cuda(all_images[indices].contiguous())
-    labels = engine.pin_for_cuda(all_labels[indices].contiguous())
+    images = pin_for_cuda(all_images[indices].contiguous())
+    labels = pin_for_cuda(all_labels[indices].contiguous())
     return images, labels
-
-
-def load_cifar10_validation() -> dict[str, tuple[Tensor, Tensor]]:
-    return {"val": load_cifar10_evaluation_split("val")}
 
 
 def build_model(pretrained: bool = PRETRAINED, num_classes: int = NUM_CLASSES) -> nn.Module:
     return build_cifar_resnet18(pretrained, num_classes)
+
+
+def inject_stratified_symmetric_noise(clean_labels: Tensor) -> tuple[Tensor, Tensor]:
+    generator = torch.Generator().manual_seed(SEED)
+    noisy_labels = clean_labels.clone()
+    noise_mask = torch.zeros_like(clean_labels, dtype=torch.bool)
+    class_sizes = [int(clean_labels.eq(class_id).sum()) for class_id in CLASSES]
+    exact_counts = [size * CONFIG.data.noise_rate for size in class_sizes]
+    noise_counts = [math.floor(count) for count in exact_counts]
+    remainder = round(clean_labels.numel() * CONFIG.data.noise_rate) - sum(noise_counts)
+    allocation_order = sorted(
+        range(NUM_CLASSES), key=lambda index: exact_counts[index] - noise_counts[index], reverse=True
+    )
+    for index in allocation_order[:remainder]:
+        noise_counts[index] += 1
+
+    for class_id, noise_count in zip(CLASSES, noise_counts):
+        if noise_count == 0:
+            continue
+        class_indices = clean_labels.eq(class_id).nonzero(as_tuple=False).flatten()
+        selected = class_indices[torch.randperm(class_indices.numel(), generator=generator)[:noise_count]]
+        alternatives = torch.randint(NUM_CLASSES - 1, (noise_count,), generator=generator)
+        alternatives += alternatives.ge(clean_labels[selected])
+        noisy_labels[selected] = alternatives
+        noise_mask[selected] = True
+
+    return pin_for_cuda(noisy_labels), pin_for_cuda(noise_mask)
 
 
 def preprocess_cifar10(images: Tensor, device: torch.device, mean: Tensor, std: Tensor) -> Tensor:
@@ -146,7 +164,9 @@ def preprocess_cifar10(images: Tensor, device: torch.device, mean: Tensor, std: 
         device=device,
         dtype=torch.float32,
         non_blocking=True,
-        memory_format=(torch.channels_last if engine.USE_CHANNELS_LAST else torch.contiguous_format),
+        memory_format=(
+            torch.channels_last if CONFIG.runtime.use_channels_last else torch.contiguous_format
+        ),
     )
     return images.div_(255.0).sub_(mean).div_(std)
 
@@ -182,80 +202,8 @@ def preprocess_cifar10_training(
         batch = torch.where(flip_mask[:, None, None, None], batch.flip(-1), batch)
 
     batch = batch.contiguous(
-        memory_format=(torch.channels_last if engine.USE_CHANNELS_LAST else torch.contiguous_format)
+        memory_format=(
+            torch.channels_last if CONFIG.runtime.use_channels_last else torch.contiguous_format
+        )
     )
     return batch.div_(255.0).sub_(mean).div_(std)
-
-
-def configure_engine() -> None:
-    engine.DATASET_NAME = "CIFAR-10"
-    engine.CLASS_IDS = CLASSES
-    engine.NUM_CLASSES = NUM_CLASSES
-    engine.EXPECTED_SAMPLES = EXPECTED_SAMPLES
-    engine.TRAIN_SUBSET_SEED = SUBSET_SEED
-    engine.NOISE_RATE = CONFIG.data.noise_rate
-    engine.SEED = SEED
-    engine.ACTOR_UPDATE_MODE = CONFIG.rl.update_mode
-    engine.POLICY_UPDATE_SAMPLES = CONFIG.actor_update_samples
-    engine.RECORD_CHANGE_DIAGNOSTICS = CONFIG.rl.record_change_diagnostics
-    engine.CHANGE_DIAGNOSTIC_PROBE_SIZE = CONFIG.change_diagnostic_probe_size
-    engine.RECORD_REWARD_DIAGNOSTICS = CONFIG.rl.record_reward_diagnostics
-    engine.OUTPUT_DIR = CONFIG.rl_output_dir
-    engine.MODEL_OUTPUT_DIR = CONFIG.rl_model_dir
-    engine.ACTOR_BEST_CHECKPOINT_FILENAME = CONFIG.output.actor_best_checkpoint_name
-    engine.ACTOR_LAST_CHECKPOINT_FILENAME = CONFIG.output.actor_last_checkpoint_name
-    engine.CRITIC_BEST_CHECKPOINT_FILENAME = CONFIG.output.critic_best_checkpoint_name
-    engine.CRITIC_LAST_CHECKPOINT_FILENAME = CONFIG.output.critic_last_checkpoint_name
-    engine.EXTERNAL_NOISY_LABELS_PATH = NOISY_LABELS_PATH
-    engine.EXTERNAL_NOISE_MASK_PATH = NOISE_MASK_PATH
-    engine.EXTERNAL_WARMUP_CHECKPOINT_PATH = WARMUP_CHECKPOINT_PATH
-    engine.MODEL_NAME = MODEL_NAME
-    engine.WARMUP_MODEL_ID = CONFIG.warmup.model_id
-    engine.MODEL_FACTORY = build_cifar_resnet18
-    engine.PRETRAINED = PRETRAINED
-    engine.DATA_MEAN = CIFAR10_MEAN
-    engine.DATA_STD = CIFAR10_STD
-    engine.TRAIN_AUGMENTATION_ENABLED = CONFIG.augmentation.enabled
-    engine.TRAIN_RANDOM_CROP_PADDING = CONFIG.augmentation.random_crop_padding
-    engine.TRAIN_HORIZONTAL_FLIP_PROBABILITY = CONFIG.augmentation.horizontal_flip_probability
-    engine.WARMUP_EPOCHS = CONFIG.warmup.epochs
-    engine.WARMUP_BATCH_SIZE = CONFIG.warmup.batch_size
-    engine.WARMUP_EVAL_BATCH_SIZE = CONFIG.warmup.eval_batch_size
-    engine.WARMUP_LR = CONFIG.warmup.learning_rate
-    engine.WARMUP_WEIGHT_DECAY = CONFIG.warmup.weight_decay
-    engine.WARMUP_MOMENTUM = CONFIG.warmup.momentum
-    engine.WARMUP_LR_DECAY_FRACTION = CONFIG.warmup.lr_decay_fraction
-    engine.WARMUP_LR_DECAY_FACTOR = CONFIG.warmup.lr_decay_factor
-    engine.WARMUP_MIN_NOISY_VALIDATION_ACCURACY = CONFIG.warmup.min_noisy_validation_accuracy
-    engine.RL_EPOCHS = CONFIG.rl.epochs
-    engine.TRAJECTORY_LENGTH = CONFIG.rl.trajectory_length
-    engine.INITIAL_STATE_RANDOMIZATION_RATE = CONFIG.rl.initial_state_randomization_rate
-    engine.FEATURE_BATCH_SIZE = CONFIG.rl.feature_batch_size
-    engine.POLICY_UPDATE_BATCH_SIZE = CONFIG.actor_update_batch_size
-    engine.K = CONFIG.knn.k
-    engine.TEMPERATURE = CONFIG.knn.temperature
-    engine.KNN_QUERY_CHUNK_SIZE = CONFIG.knn.query_chunk_size
-    engine.KNN_REFERENCE_CHUNK_SIZE = CONFIG.knn.reference_chunk_size
-    engine.CORRECTION_CHUNK_SIZE = CONFIG.knn.correction_chunk_size
-    engine.ACTOR_LR = CONFIG.rl.actor_learning_rate
-    engine.ACTOR_MOMENTUM = CONFIG.rl.actor_momentum
-    engine.ACTOR_WEIGHT_DECAY = CONFIG.rl.actor_weight_decay
-    engine.CRITIC_LR = CONFIG.rl.critic_learning_rate
-    engine.CRITIC_MOMENTUM = CONFIG.rl.critic_momentum
-    engine.CRITIC_WEIGHT_DECAY = CONFIG.rl.critic_weight_decay
-    engine.CRITIC_NUM_BINS = CONFIG.rl.critic_num_bins
-    engine.CRITIC_HIDDEN_DIMS = CONFIG.rl.critic_hidden_dims
-    engine.DISCOUNT_FACTOR = CONFIG.rl.discount_factor
-    engine.NLA_WEIGHT = CONFIG.rl.reward_nla_weight
-    engine.LR_DECAY_FACTOR = CONFIG.rl.lr_decay_factor
-    engine.LR_DECAY_FRACTION = CONFIG.rl.lr_decay_fraction
-    engine.USE_AMP = CONFIG.runtime.use_amp
-    engine.AMP_DTYPE = getattr(torch, CONFIG.runtime.amp_dtype)
-    engine.USE_CHANNELS_LAST = CONFIG.runtime.use_channels_last
-    engine.CUDNN_BENCHMARK = CONFIG.runtime.cudnn_benchmark
-
-    engine.TRAIN_DATA_LOADER = load_selected_cifar10_train
-    engine.EVALUATION_DATA_LOADER = load_cifar10_validation
-    engine.PREPROCESS_FUNCTION = preprocess_cifar10
-    engine.TRAIN_PREPROCESS_FUNCTION = preprocess_cifar10_training
-    engine.CONFIGURED = True
