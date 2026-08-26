@@ -91,7 +91,10 @@ KNN_QUERY_CHUNK_SIZE = CONFIG.knn.query_chunk_size
 KNN_REFERENCE_CHUNK_SIZE = CONFIG.knn.reference_chunk_size
 CORRECTION_CHUNK_SIZE = CONFIG.knn.correction_chunk_size
 ACTOR_LR = CONFIG.rl.actor_learning_rate
-CRITIC_LR = CONFIG.rl.critic_learning_rate
+CRITIC_OPTIMIZER = CONFIG.rl.critic_optimizer
+CRITIC_LR, CRITIC_MOMENTUM, CRITIC_WEIGHT_DECAY, CRITIC_LR_DECAY = (
+    CONFIG.rl.effective_critic_options
+)
 CRITIC_NUM_BINS = CONFIG.rl.critic_num_bins
 CRITIC_HIDDEN_DIMS = CONFIG.rl.critic_hidden_dims
 DISCOUNT_FACTOR = CONFIG.rl.discount_factor
@@ -352,6 +355,11 @@ def _save_rl_checkpoints(
         "epoch": epoch,
         "num_bins": CRITIC_NUM_BINS,
         "hidden_dims": CRITIC_HIDDEN_DIMS,
+        "optimizer": CRITIC_OPTIMIZER,
+        "learning_rate": CRITIC_LR,
+        "momentum": CRITIC_MOMENTUM,
+        "weight_decay": CRITIC_WEIGHT_DECAY,
+        "lr_decay": CRITIC_LR_DECAY,
         "validation": validation_metrics,
         "remaining_horizon": USE_REMAINING_HORIZON,
         "terminal_update": USE_TERMINAL_CRITIC_UPDATE,
@@ -526,11 +534,13 @@ def print_configuration(device: torch.device, sample_count: int) -> None:
     )
     print(
         f"rl={RL_EPOCHS}x{TRAJECTORY_LENGTH} update={ACTOR_UPDATE_MODE}:{POLICY_UPDATE_SAMPLES} "
-        f"batch={POLICY_UPDATE_BATCH_SIZE} actor_lr={ACTOR_LR} critic_lr={CRITIC_LR}"
+        f"batch={POLICY_UPDATE_BATCH_SIZE} actor_lr={ACTOR_LR}"
     )
     critic_input = CRITIC_NUM_BINS + int(USE_REMAINING_HORIZON)
     print(
         f"critic=mlp:{critic_input}->{ '->'.join(map(str, CRITIC_HIDDEN_DIMS)) }->1 "
+        f"optimizer={CRITIC_OPTIMIZER} lr={CRITIC_LR} momentum={CRITIC_MOMENTUM} "
+        f"weight_decay={CRITIC_WEIGHT_DECAY} lr_decay={CRITIC_LR_DECAY} "
         f"horizon={USE_REMAINING_HORIZON} terminal={USE_TERMINAL_CRITIC_UPDATE}"
     )
     print(
@@ -617,9 +627,10 @@ def main() -> None:
     ).to(device)
     critic_optimizer = build_critic_optimizer(
         critic,
+        name=CRITIC_OPTIMIZER,
         learning_rate=CRITIC_LR,
-        momentum=CONFIG.rl.critic_momentum,
-        weight_decay=CONFIG.rl.critic_weight_decay,
+        momentum=CRITIC_MOMENTUM,
+        weight_decay=CRITIC_WEIGHT_DECAY,
     )
     actor_optimizer = SGD(
         model.parameters(),
@@ -629,7 +640,11 @@ def main() -> None:
     )
     scheduler_milestone = max(1, math.ceil(RL_EPOCHS * CONFIG.rl.lr_decay_fraction))
     actor_scheduler = MultiStepLR(actor_optimizer, milestones=[scheduler_milestone], gamma=LR_DECAY_FACTOR)
-    critic_scheduler = MultiStepLR(critic_optimizer, milestones=[scheduler_milestone], gamma=LR_DECAY_FACTOR)
+    critic_scheduler = (
+        MultiStepLR(critic_optimizer, milestones=[scheduler_milestone], gamma=LR_DECAY_FACTOR)
+        if CRITIC_LR_DECAY
+        else None
+    )
     scaler = build_grad_scaler()
     change_recorder: ChangeDiagnosticsRecorder | None = None
     if RECORD_CHANGE_DIAGNOSTICS:
@@ -911,7 +926,8 @@ def main() -> None:
         if epoch_change_rows:
             append_csv(change_diagnostics_path, epoch_change_rows, CHANGE_DIAGNOSTIC_FIELDS)
         actor_scheduler.step()
-        critic_scheduler.step()
+        if critic_scheduler is not None:
+            critic_scheduler.step()
         mean_critic_loss = (
             sum(epoch_critic_losses) / len(epoch_critic_losses) if epoch_critic_losses else None
         )
@@ -1013,7 +1029,11 @@ def main() -> None:
                 "steps": TRAJECTORY_LENGTH,
                 "k": K,
                 "actor_lr": ACTOR_LR,
+                "critic_optimizer": CRITIC_OPTIMIZER,
                 "critic_lr": CRITIC_LR,
+                "critic_momentum": CRITIC_MOMENTUM,
+                "critic_weight_decay": CRITIC_WEIGHT_DECAY,
+                "critic_lr_decay": CRITIC_LR_DECAY,
                 "critic_hidden_dims": "x".join(map(str, CRITIC_HIDDEN_DIMS)),
                 "best_epoch": best_rl_epoch,
                 "best_val_accuracy": best_validation_summary["accuracy"],

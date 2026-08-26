@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
-from torch.optim import SGD
+from torch.optim import Adam, Optimizer, SGD
 
 
 def encode_consistency_histogram(scores: Tensor, num_bins: int) -> Tensor:
@@ -75,9 +75,18 @@ def build_critic(
 
 
 def build_critic_optimizer(
-    critic: StateActionCritic, *, learning_rate: float, momentum: float, weight_decay: float
-) -> SGD:
-    return SGD(critic.parameters(), lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
+    critic: StateActionCritic,
+    *,
+    name: str,
+    learning_rate: float,
+    momentum: float,
+    weight_decay: float,
+) -> Optimizer:
+    if name == "sgd":
+        return SGD(critic.parameters(), lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
+    if name == "adam":
+        return Adam(critic.parameters(), lr=learning_rate)
+    raise ValueError(f"Unsupported critic optimizer: {name!r}.")
 
 
 @dataclass(frozen=True, slots=True)

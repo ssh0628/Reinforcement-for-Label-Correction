@@ -36,9 +36,9 @@ class TrainingAugmentationConfig:
 
 @dataclass(frozen=True, slots=True)
 class WarmupConfig:
-    model_id: str = "exp1_warmup"
+    model_id: str = "exp2_warmup"
     epochs: int = 50
-    batch_size: int = 128
+    batch_size: int = 1_024 # 128
     eval_batch_size: int = 1_024
     optimizer: str = "sgd"
     learning_rate: float = 1e-2
@@ -53,9 +53,9 @@ class WarmupConfig:
 class KNNConfig:
     k: int = 10
     temperature: float = 0.5
-    query_chunk_size: int = 4_096
+    query_chunk_size: int = 8_192 # 4_096, 8_192
     reference_chunk_size: int = 65_536
-    correction_chunk_size: int = 16_384
+    correction_chunk_size: int = 50_000 # 16_382, 50_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,13 +63,13 @@ class RLConfig:
     epochs: int = 500
     trajectory_length: int = 10
     initial_state_randomization_rate: float = 0.10
-    feature_batch_size: int = 1_024
-    update_mode: str = "full"
+    feature_batch_size: int = 8_192 # 8_192, 1_024
+    update_mode: str = "subset" # subset, full
     subset_size: int = 5_000
     use_remaining_horizon: bool = False
     use_terminal_critic_update: bool = False
 
-    update_batch_size: int = 512
+    update_batch_size: int = 1_024 # 512, 1_024
     record_change_diagnostics: bool = True
     change_diagnostic_probe_size: int = 50_000
 
@@ -78,8 +78,9 @@ class RLConfig:
     actor_momentum: float = 0.9
     actor_weight_decay: float = 5e-4
 
-    critic_optimizer: str = "sgd"
+    critic_optimizer: str = "adam"  # sgd, adam: lr=1e-3, no momentum/weight decay/LR decay
     critic_learning_rate: float = 1e-2
+    critic_adam_learning_rate: float = 1e-3
     critic_momentum: float = 0.9
     critic_weight_decay: float = 5e-4
     critic_num_bins: int = 100
@@ -89,6 +90,12 @@ class RLConfig:
     reward_nla_weight: float = 0.5
     lr_decay_fraction: float = 0.5
     lr_decay_factor: float = 0.1
+
+    @property
+    def effective_critic_options(self) -> tuple[float, float, float, bool]:
+        if self.critic_optimizer == "adam":
+            return self.critic_adam_learning_rate, 0.0, 0.0, False
+        return self.critic_learning_rate, self.critic_momentum, self.critic_weight_decay, True
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,10 +115,10 @@ class KNNQualityConfig:
 @dataclass(frozen=True, slots=True)
 class FineTuneConfig:
     corrected_label_source: str = "rl" # knn, rl
-    initialization: str = "warmup"
+    initialization: str = "last_actor" # warmup, best_actor, last_actor
     evaluation_checkpoint: str = "accuracy"
     epochs: int = 100
-    batch_size: int = 128
+    batch_size: int = 1_024 # 128, 1_024
     optimizer: str = "sgd"
     learning_rate: float = 1e-2
     momentum: float = 0.9
@@ -123,7 +130,7 @@ class FineTuneConfig:
 @dataclass(frozen=True, slots=True)
 class OutputConfig:
     root: Path = PROJECT_ROOT / "cifar_output"
-    experiment_name: str = "exp1"
+    experiment_name: str = "exp2"
     warmup_checkpoint_name: str = "warmup.pt"
     actor_best_checkpoint_name: str = "actor_best.pt"
     actor_last_checkpoint_name: str = "actor_last.pt"
@@ -334,14 +341,11 @@ class ResNet18CIFARConfig:
             raise ValueError("Data and output roots must be absolute paths.")
         if self.model.pretrained:
             raise ValueError("The paper-style ResNet-18 must not be pretrained.")
-        optimizers = (
-            self.warmup.optimizer,
-            self.rl.actor_optimizer,
-            self.rl.critic_optimizer,
-            self.finetune.optimizer,
-        )
-        if any(name.lower() != "sgd" for name in optimizers):
-            raise ValueError("CIFAR warm-up, actor, critic, and fine-tuning optimizers must be SGD.")
+        sgd_optimizers = (self.warmup.optimizer, self.rl.actor_optimizer, self.finetune.optimizer)
+        if any(name.lower() != "sgd" for name in sgd_optimizers):
+            raise ValueError("CIFAR warm-up, actor, and fine-tuning optimizers must be SGD.")
+        if self.rl.critic_optimizer not in {"sgd", "adam"}:
+            raise ValueError("critic_optimizer must be 'sgd' or 'adam'.")
         if self.data.classes != tuple(range(10)):
             raise ValueError("CIFAR-10 classes must be 0 through 9.")
         if not 0 < self.data.train_samples <= 50_000 or self.data.train_samples % 10:
@@ -393,6 +397,7 @@ class ResNet18CIFARConfig:
             self.warmup.learning_rate,
             self.rl.actor_learning_rate,
             self.rl.critic_learning_rate,
+            self.rl.critic_adam_learning_rate,
             self.finetune.learning_rate,
         )
         if any(value <= 0 for value in positive):
