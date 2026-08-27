@@ -13,8 +13,9 @@ SUMMARY_FIELDS = (
 
 RUN_SUMMARY_FIELDS = (
     "dataset", "model", "samples", "noise_type", "noise_rate", "actual_noise_rate",
-    "idn_flip_rate_std", "seed", "actor_batch_size",
-    "actor_optimizer_steps_per_rl_step", "remaining_horizon", "terminal_update",
+    "idn_flip_rate_std", "seed", "actor_update_samples", "actor_microbatch_size",
+    "actor_microbatches_per_rl_step", "actor_optimizer_steps_per_rl_step",
+    "remaining_horizon", "terminal_update",
     "warmup_epoch", "epochs", "steps", "k",
     "actor_lr", "critic_optimizer", "critic_lr", "critic_momentum", "critic_weight_decay",
     "critic_lr_decay", "lr_decay_epoch", "lr_decay_factor", "critic_hidden_dims", "best_epoch",

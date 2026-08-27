@@ -19,6 +19,7 @@ python cifar_evaluate.py
 `knn_correction.py` provides the weighted-KNN baseline and
 `cifar_knn_quality.py` evaluates the warm-up feature space.
 
-The RL environment always computes features, KNN, label correction, reward,
-and Q over the configured training set. The Actor then samples one random
-mini-batch and performs exactly one optimizer update per trajectory step.
+The RL environment computes features, KNN, label correction, reward, Q, and
+the Actor policy loss over the entire configured training set. Actor gradients
+are accumulated in memory-bounded microbatches, followed by exactly one
+optimizer update per trajectory step.

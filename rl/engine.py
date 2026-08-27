@@ -31,7 +31,7 @@ from log.common import (
     save_torch,
     write_csv,
 )
-from rl.actor import correct_from_embeddings, select_queries, update_actor
+from rl.actor import correct_from_embeddings, update_actor
 from rl.critic import StateActionCritic, build_critic_optimizer, encode_state_action, update_critic
 from log.rl import (
     RUN_LOG_FILENAME,
@@ -71,7 +71,7 @@ NOISE_RATE = CONFIG.data.noise_rate
 NOISE_TYPE = CONFIG.data.noise_type
 USE_REMAINING_HORIZON = CONFIG.rl.use_remaining_horizon
 USE_TERMINAL_CRITIC_UPDATE = CONFIG.rl.use_terminal_critic_update
-ACTOR_BATCH_SIZE = CONFIG.rl.actor_batch_size
+ACTOR_MICROBATCH_SIZE = CONFIG.rl.actor_microbatch_size
 OUTPUT_DIR = CONFIG.rl_output_dir
 TRAIN_AUGMENTATION_ENABLED = CONFIG.augmentation.enabled
 RL_EPOCHS = CONFIG.rl.epochs
@@ -345,7 +345,11 @@ def _save_rl_checkpoints(
         "validation": validation_metrics,
         "training_augmentation": training_augmentation_metadata(),
         "training_data": training_data_metadata(),
-        "actor_batch_size": ACTOR_BATCH_SIZE,
+        "actor_update_samples": EXPECTED_SAMPLES,
+        "actor_microbatch_size": ACTOR_MICROBATCH_SIZE,
+        "actor_microbatches_per_rl_step": math.ceil(
+            EXPECTED_SAMPLES / ACTOR_MICROBATCH_SIZE
+        ),
         "actor_optimizer_steps_per_rl_step": 1,
         "remaining_horizon": USE_REMAINING_HORIZON,
         "terminal_update": USE_TERMINAL_CRITIC_UPDATE,
@@ -532,8 +536,10 @@ def print_configuration(device: torch.device, sample_count: int, actual_noise_ra
         f"augmentation={TRAIN_AUGMENTATION_ENABLED} pretrained={PRETRAINED}"
     )
     print(
-        f"rl={RL_EPOCHS}x{TRAJECTORY_LENGTH} actor_batch={ACTOR_BATCH_SIZE} "
-        f"actor_steps_per_rl_step=1 actor_lr={ACTOR_LR} "
+        f"rl={RL_EPOCHS}x{TRAJECTORY_LENGTH} actor_update={sample_count} "
+        f"microbatch={ACTOR_MICROBATCH_SIZE} "
+        f"microbatches={math.ceil(sample_count / ACTOR_MICROBATCH_SIZE)} "
+        f"optimizer_steps_per_rl_step=1 actor_lr={ACTOR_LR} "
         f"lr_decay={LR_DECAY_EPOCH}:{LR_DECAY_FACTOR}"
     )
     critic_input = CRITIC_NUM_BINS + int(USE_REMAINING_HORIZON)
@@ -598,7 +604,7 @@ def main() -> None:
         device,
         timings,
         lambda: warm_device_kernels(
-            model, raw_images, device, mean, std, update_batch_size=ACTOR_BATCH_SIZE
+            model, raw_images, device, mean, std, update_batch_size=ACTOR_MICROBATCH_SIZE
         ),
     )
 
@@ -727,15 +733,6 @@ def main() -> None:
                 lambda: correct_from_embeddings(policy, policy_embeddings, label_state, policy_neighbors),
                 step=global_step,
             )
-            policy_neighbors_cpu = measure(
-                "knn_to_cpu",
-                device,
-                timings,
-                lambda: pin_for_cuda(policy_neighbors.detach().cpu()),
-                step=global_step,
-            )
-            del policy_embeddings, policy_neighbors
-
             reward_output = measure(
                 "reward",
                 device,
@@ -761,12 +758,6 @@ def main() -> None:
                 ),
                 step=global_step,
             )
-            query_indices_cpu = select_queries(
-                EXPECTED_SAMPLES,
-                ACTOR_BATCH_SIZE,
-                SEED,
-                global_step,
-            )
             actor_loss = measure(
                 "actor_update",
                 device,
@@ -778,14 +769,14 @@ def main() -> None:
                     scaler,
                     raw_images,
                     label_state,
-                    policy_neighbors_cpu,
+                    policy_embeddings,
+                    policy_neighbors,
                     correction.actions,
                     q_value,
-                    query_indices_cpu,
                     device,
                     mean,
                     std,
-                    encoding_batch_size=ACTOR_BATCH_SIZE,
+                    microbatch_size=ACTOR_MICROBATCH_SIZE,
                     use_amp=USE_AMP,
                     amp_dtype=AMP_DTYPE,
                     preprocess=preprocess,
@@ -793,7 +784,7 @@ def main() -> None:
                 ),
                 step=global_step,
             )
-            del policy_neighbors_cpu
+            del policy_embeddings, policy_neighbors
 
             critic_update = None
             if previous_encoding is not None and previous_reward is not None:
@@ -986,7 +977,11 @@ def main() -> None:
                     CONFIG.data.idn_flip_rate_std if NOISE_TYPE == "idn" else ""
                 ),
                 "seed": SEED,
-                "actor_batch_size": ACTOR_BATCH_SIZE,
+                "actor_update_samples": EXPECTED_SAMPLES,
+                "actor_microbatch_size": ACTOR_MICROBATCH_SIZE,
+                "actor_microbatches_per_rl_step": math.ceil(
+                    EXPECTED_SAMPLES / ACTOR_MICROBATCH_SIZE
+                ),
                 "actor_optimizer_steps_per_rl_step": 1,
                 "remaining_horizon": USE_REMAINING_HORIZON,
                 "terminal_update": USE_TERMINAL_CRITIC_UPDATE,

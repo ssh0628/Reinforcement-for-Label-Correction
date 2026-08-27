@@ -41,8 +41,8 @@ class TrainingAugmentationConfig:
 class WarmupConfig:
     model_id: str = "exp12_warmup"
     epochs: int = 50  # warm-up 학습 길이
-    batch_size: int = 1_024  # 메모리에 맞춰 128, 512, 1_024
-    eval_batch_size: int = 1_024  # 성능에는 영향 없음; 메모리·속도 조절
+    batch_size: int = 1_024  # 학습 hyperparameter; 변경 시 LR과 함께 재검토
+    eval_batch_size: int = 4_096  # H100 93GB 평가 전용값; 성능에는 영향 없음
     optimizer: str = "sgd"
     learning_rate: float = 1e-2  # SGD 후보: 1e-3, 3e-3, 1e-2
     momentum: float = 0.9  # SGD momentum: 보통 0.9
@@ -56,8 +56,8 @@ class WarmupConfig:
 class KNNConfig:
     k: int = 10  # 이웃 수: 5, 10, 20
     temperature: float = 0.5  # 거리 가중치 온도; 작을수록 가까운 이웃 강조
-    query_chunk_size: int = 8_192  # 결과에는 영향 없음; KNN 검색 메모리·속도 조절
-    reference_chunk_size: int = 65_536  # 결과에는 영향 없음; KNN 기준 청크 크기
+    query_chunk_size: int = 16_384  # H100 93GB exact-KNN query chunk
+    reference_chunk_size: int = 50_000  # 전체 CIFAR-10 train reference를 한 번에 사용
     correction_chunk_size: int = 50_000  # 결과에는 영향 없음; correction 메모리·속도 조절
 
 
@@ -66,8 +66,8 @@ class RLConfig:
     epochs: int = 500  # 빠른 검증 100, 중간 200, 최종 재현 500
     trajectory_length: int = 10  # 한 epoch의 label-correction step 수
     initial_state_randomization_rate: float = 0.10  # 매 trajectory 초기 라벨 교란 비율
-    feature_batch_size: int = 8_192  # 결과에는 영향 없음; feature 추출 메모리·속도 조절
-    actor_batch_size: int = 128  # step당 Actor optimizer 미니배치: 128, 256, 512
+    feature_batch_size: int = 16_384  # H100 93GB inference feature batch
+    actor_microbatch_size: int = 4_096  # H100 93GB 전체 gradient 누적용 메모리 배치
     use_remaining_horizon: bool = True
     use_terminal_critic_update: bool = True
 
@@ -116,7 +116,7 @@ class FineTuneConfig:
     initialization: str = "last_actor"
     evaluation_checkpoint: str = "accuracy"
     epochs: int = 100  # corrected label fine-tuning 길이
-    batch_size: int = 1_024  # 메모리에 맞춰 128, 512, 1_024
+    batch_size: int = 1_024  # 학습 hyperparameter; 변경 시 LR과 함께 재검토
     optimizer: str = "sgd"
     learning_rate: float = 1e-2  # SGD 후보: 1e-3, 3e-3, 1e-2
     momentum: float = 0.9  # SGD momentum: 보통 0.9
@@ -148,7 +148,7 @@ class RuntimeConfig:
     amp_dtype: str = "bfloat16"
     use_channels_last: bool = True
     cudnn_benchmark: bool = True
-    evaluate_batch_size: int = 1_024  # 성능에는 영향 없음; 평가 메모리·속도 조절
+    evaluate_batch_size: int = 4_096  # H100 93GB 평가 전용값; 성능에는 영향 없음
     overwrite_noise: bool = False
     overwrite_warmup: bool = False
     overwrite_rl: bool = False
@@ -345,8 +345,8 @@ class CIFARConfig:
             raise ValueError("noise_type must be 'symmetric' or 'idn'.")
         if self.data.idn_flip_rate_std <= 0:
             raise ValueError("idn_flip_rate_std must be positive.")
-        if not 0 < self.rl.actor_batch_size <= self.data.train_samples:
-            raise ValueError("actor_batch_size must be in [1, train_samples].")
+        if not 0 < self.rl.actor_microbatch_size <= self.data.train_samples:
+            raise ValueError("actor_microbatch_size must be in [1, train_samples].")
         if self.finetune.initialization not in {"warmup", "best_actor", "last_actor"}:
             raise ValueError("Invalid fine-tuning initialization.")
         if self.finetune.corrected_label_source not in {"rl", "knn"}:
@@ -375,7 +375,7 @@ class CIFARConfig:
             self.rl.epochs,
             self.rl.trajectory_length,
             self.rl.feature_batch_size,
-            self.rl.actor_batch_size,
+            self.rl.actor_microbatch_size,
             self.correction.trajectory_length,
             self.knn_quality.visualization_samples,
             self.knn_quality.pca_dimensions,
