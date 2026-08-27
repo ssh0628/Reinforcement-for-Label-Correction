@@ -118,12 +118,16 @@ def _evaluation_indices(labels: Tensor) -> dict[str, Tensor]:
 
 
 def load_cifar10_evaluation_split(split: str) -> tuple[Tensor, Tensor]:
-    if split not in {"val", "test"}:
-        raise ValueError("split must be 'val' or 'test'.")
+    if split not in {"val", "test", "all"}:
+        raise ValueError("split must be 'val', 'test', or 'all'.")
     dataset = CIFAR10(root=CIFAR10_ROOT, train=False, download=DOWNLOAD_CIFAR10)
     all_images = torch.from_numpy(dataset.data).permute(0, 3, 1, 2)
     all_labels = torch.tensor(dataset.targets, dtype=torch.long)
-    indices = _evaluation_indices(all_labels)[split]
+    indices = (
+        torch.arange(all_labels.numel(), dtype=torch.long)
+        if split == "all"
+        else _evaluation_indices(all_labels)[split]
+    )
     images = pin_for_cuda(all_images[indices].contiguous())
     labels = pin_for_cuda(all_labels[indices].contiguous())
     return images, labels

@@ -32,16 +32,16 @@ class ModelConfig:
 
 @dataclass(frozen=True, slots=True)
 class TrainingAugmentationConfig:
-    enabled: bool = True
-    random_crop_padding: int = 4  # CIFAR 표준값; 0이면 crop 증강 제거
-    horizontal_flip_probability: float = 0.5  # 0.0~1.0
+    enabled: bool = False
+    random_crop_padding: int = 0  # CIFAR 표준값; 0이면 crop 증강 제거
+    horizontal_flip_probability: float = 0  # 0.0~1.0
 
 
 @dataclass(frozen=True, slots=True)
 class WarmupConfig:
     model_id: str = "exp12_warmup"
     epochs: int = 50  # warm-up 학습 길이
-    batch_size: int = 1_024  # 학습 hyperparameter; 변경 시 LR과 함께 재검토
+    batch_size: int = 128  # 학습 hyperparameter; 변경 시 LR과 함께 재검토, 1_024, 128
     eval_batch_size: int = 4_096  # H100 93GB 평가 전용값; 성능에는 영향 없음
     optimizer: str = "sgd"
     learning_rate: float = 1e-2  # SGD 후보: 1e-3, 3e-3, 1e-2
@@ -114,9 +114,9 @@ class KNNQualityConfig:
 class FineTuneConfig:
     corrected_label_source: str = "rl"
     initialization: str = "last_actor"
-    evaluation_checkpoint: str = "accuracy"
+    evaluation_checkpoint: str = "last"
     epochs: int = 100  # corrected label fine-tuning 길이
-    batch_size: int = 1_024  # 학습 hyperparameter; 변경 시 LR과 함께 재검토
+    batch_size: int = 128  # 학습 hyperparameter; 변경 시 LR과 함께 재검토 1_024, 128
     optimizer: str = "sgd"
     learning_rate: float = 1e-2  # SGD 후보: 1e-3, 3e-3, 1e-2
     momentum: float = 0.9  # SGD momentum: 보통 0.9
@@ -129,7 +129,7 @@ class FineTuneConfig:
 class OutputConfig:
     root: Path = PROJECT_ROOT / "cifar_output"
     experiment_name: str = "exp13"
-    warmup_experiment_name: str = "exp12"
+    warmup_experiment_name: str = "exp13"
     warmup_checkpoint_name: str = "warmup.pt"
     actor_best_checkpoint_name: str = "actor_best.pt"
     actor_last_checkpoint_name: str = "actor_last.pt"
@@ -321,6 +321,7 @@ class CIFARConfig:
         return {
             "accuracy": self.finetune_best_accuracy_checkpoint_path,
             "loss": self.finetune_best_loss_checkpoint_path,
+            "last": self.finetune_last_checkpoint_path,
         }[self.finetune.evaluation_checkpoint]
 
     def validate(self) -> None:
@@ -351,8 +352,8 @@ class CIFARConfig:
             raise ValueError("Invalid fine-tuning initialization.")
         if self.finetune.corrected_label_source not in {"rl", "knn"}:
             raise ValueError("corrected_label_source must be 'rl' or 'knn'.")
-        if self.finetune.evaluation_checkpoint not in {"accuracy", "loss"}:
-            raise ValueError("evaluation_checkpoint must be accuracy or loss.")
+        if self.finetune.evaluation_checkpoint not in {"accuracy", "loss", "last"}:
+            raise ValueError("evaluation_checkpoint must be accuracy, loss, or last.")
         if self.knn.k >= self.data.train_samples:
             raise ValueError("k must be smaller than train_samples.")
         if not 0 < self.rl.initial_state_randomization_rate < 1:

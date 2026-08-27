@@ -1,8 +1,4 @@
-"""Evaluate the fine-tuned model on the held-out clean CIFAR-10 test split.
-
-The other half of the official CIFAR-10 test set is used for validation, so
-only the untouched 5,000-image half is used here to avoid validation leakage.
-"""
+"""Evaluate the selected fine-tuned model on all 10,000 CIFAR-10 test images."""
 
 from __future__ import annotations
 
@@ -17,7 +13,7 @@ from setting import data as cifar
 
 
 CONFIG = cifar.CONFIG
-FINETUNE_SELECTION_METRIC = CONFIG.finetune.evaluation_checkpoint
+FINETUNE_SELECTION = CONFIG.finetune.evaluation_checkpoint
 FINETUNE_CHECKPOINT_PATH = CONFIG.finetune_evaluation_checkpoint_path
 INITIALIZATION = CONFIG.finetune.initialization
 OUTPUT_DIR = CONFIG.evaluate_output_dir
@@ -47,10 +43,14 @@ def _load_model(device: torch.device) -> tuple[nn.Module, dict[str, object]]:
     if checkpoint.get("initialization") != INITIALIZATION:
         raise ValueError("Checkpoint initialization does not match the configured initialization.")
     engine.validate_training_data_checkpoint(checkpoint)
-    if checkpoint.get("checkpoint_kind") != "best":
-        raise ValueError("Final evaluation must use the fine-tuning best model.")
-    if checkpoint.get("selection_metric") != FINETUNE_SELECTION_METRIC:
-        raise ValueError("Fine-tuning checkpoint selection metric does not match config.")
+    expected_kind = "last" if FINETUNE_SELECTION == "last" else "best"
+    expected_metric = None if FINETUNE_SELECTION == "last" else FINETUNE_SELECTION
+    if checkpoint.get("checkpoint_kind") != expected_kind:
+        raise ValueError(f"Final evaluation requires the fine-tuning {expected_kind} model.")
+    if checkpoint.get("selection_metric") != expected_metric:
+        raise ValueError("Fine-tuning checkpoint selection does not match config.")
+    if expected_kind == "last" and int(checkpoint["epoch"]) != CONFIG.finetune.epochs:
+        raise ValueError("Fine-tuning last checkpoint must come from the configured final epoch.")
 
     model = cifar.build_model()
     model.load_state_dict(checkpoint["model"], strict=True)
@@ -92,7 +92,7 @@ def main() -> None:
     engine.seed_everything(SEED)
     torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
 
-    test_images, test_labels = cifar.load_cifar10_evaluation_split("test")
+    test_images, test_labels = cifar.load_cifar10_evaluation_split("all")
     model, checkpoint = _load_model(device)
 
     print(
@@ -107,7 +107,7 @@ def main() -> None:
     summary = {
         "epoch": int(checkpoint["epoch"]),
         "initialization": INITIALIZATION,
-        "selection": checkpoint["selection_metric"],
+        "selection": FINETUNE_SELECTION,
         "loss": summary["loss"],
         "accuracy": summary["accuracy"],
         "seconds": elapsed,
