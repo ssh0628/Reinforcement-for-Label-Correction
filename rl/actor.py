@@ -21,7 +21,7 @@ def select_queries(sample_count: int, batch_size: int, seed: int, step: int) -> 
     if not 0 < batch_size <= sample_count:
         raise ValueError("batch_size must be in [1, sample_count].")
     generator = torch.Generator().manual_seed(seed + step)
-    return torch.randperm(sample_count, generator=generator)[:batch_size].sort().values
+    return torch.randperm(sample_count, generator=generator)[:batch_size]
 
 
 @torch.inference_mode()

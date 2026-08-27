@@ -7,7 +7,6 @@ and logging live in their stage-specific modules.
 
 from __future__ import annotations
 
-import math
 import random
 import time
 from pathlib import Path
@@ -90,6 +89,7 @@ CRITIC_HIDDEN_DIMS = CONFIG.rl.critic_hidden_dims
 DISCOUNT_FACTOR = CONFIG.rl.discount_factor
 NLA_WEIGHT = CONFIG.rl.reward_nla_weight
 LR_DECAY_FACTOR = CONFIG.rl.lr_decay_factor
+LR_DECAY_EPOCH = CONFIG.rl.lr_decay_epoch
 USE_AMP = CONFIG.runtime.use_amp
 AMP_DTYPE = getattr(torch, CONFIG.runtime.amp_dtype)
 USE_CHANNELS_LAST = CONFIG.runtime.use_channels_last
@@ -526,7 +526,8 @@ def print_configuration(device: torch.device, sample_count: int) -> None:
     )
     print(
         f"rl={RL_EPOCHS}x{TRAJECTORY_LENGTH} actor_batch={ACTOR_BATCH_SIZE} "
-        f"actor_steps_per_rl_step=1 actor_lr={ACTOR_LR}"
+        f"actor_steps_per_rl_step=1 actor_lr={ACTOR_LR} "
+        f"lr_decay={LR_DECAY_EPOCH}:{LR_DECAY_FACTOR}"
     )
     critic_input = CRITIC_NUM_BINS + int(USE_REMAINING_HORIZON)
     print(
@@ -626,10 +627,11 @@ def main() -> None:
         momentum=CONFIG.rl.actor_momentum,
         weight_decay=CONFIG.rl.actor_weight_decay,
     )
-    scheduler_milestone = max(1, math.ceil(RL_EPOCHS * CONFIG.rl.lr_decay_fraction))
-    actor_scheduler = MultiStepLR(actor_optimizer, milestones=[scheduler_milestone], gamma=LR_DECAY_FACTOR)
+    actor_scheduler = MultiStepLR(
+        actor_optimizer, milestones=[LR_DECAY_EPOCH], gamma=LR_DECAY_FACTOR
+    )
     critic_scheduler = (
-        MultiStepLR(critic_optimizer, milestones=[scheduler_milestone], gamma=LR_DECAY_FACTOR)
+        MultiStepLR(critic_optimizer, milestones=[LR_DECAY_EPOCH], gamma=LR_DECAY_FACTOR)
         if CRITIC_LR_DECAY
         else None
     )
@@ -985,6 +987,8 @@ def main() -> None:
                 "critic_momentum": CRITIC_MOMENTUM,
                 "critic_weight_decay": CRITIC_WEIGHT_DECAY,
                 "critic_lr_decay": CRITIC_LR_DECAY,
+                "lr_decay_epoch": LR_DECAY_EPOCH,
+                "lr_decay_factor": LR_DECAY_FACTOR,
                 "critic_hidden_dims": "x".join(map(str, CRITIC_HIDDEN_DIMS)),
                 "best_epoch": best_rl_epoch,
                 "best_val_accuracy": best_validation_summary["accuracy"],

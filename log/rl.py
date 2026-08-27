@@ -16,7 +16,7 @@ RUN_SUMMARY_FIELDS = (
     "actor_optimizer_steps_per_rl_step", "remaining_horizon", "terminal_update",
     "warmup_epoch", "epochs", "steps", "k",
     "actor_lr", "critic_optimizer", "critic_lr", "critic_momentum", "critic_weight_decay",
-    "critic_lr_decay", "critic_hidden_dims", "best_epoch",
+    "critic_lr_decay", "lr_decay_epoch", "lr_decay_factor", "critic_hidden_dims", "best_epoch",
     "best_val_accuracy", "best_val_loss", "last_val_accuracy", "last_val_loss", "total_seconds",
     "mean_epoch_seconds", "gpu_memory_gib", "actor_last", "critic_last",
 )

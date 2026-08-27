@@ -61,7 +61,7 @@ class KNNConfig:
 
 @dataclass(frozen=True, slots=True)
 class RLConfig:
-    epochs: int = 100  # 빠른 검증 100, 중간 200, 최종 재현 500
+    epochs: int = 500  # 빠른 검증 100, 중간 200, 최종 재현 500
     trajectory_length: int = 10  # 한 epoch의 label-correction step 수
     initial_state_randomization_rate: float = 0.10  # 매 trajectory 초기 라벨 교란 비율
     feature_batch_size: int = 8_192  # 결과에는 영향 없음; feature 추출 메모리·속도 조절
@@ -84,7 +84,7 @@ class RLConfig:
 
     discount_factor: float = 0.9  # TD discount gamma: 0.0~1.0
     reward_nla_weight: float = 0.5  # log_reward에서 NLA 항의 가중치
-    lr_decay_fraction: float = 0.5  # SGD Actor/Critic LR 감소 시점 비율
+    lr_decay_epoch: int = 250  # 총 epoch와 무관한 SGD Actor/Critic LR 감소 epoch
     lr_decay_factor: float = 0.1  # SGD LR 감소 배율; Adam Critic에는 미적용
 
     @property
@@ -126,7 +126,7 @@ class FineTuneConfig:
 @dataclass(frozen=True, slots=True)
 class OutputConfig:
     root: Path = PROJECT_ROOT / "cifar_output"
-    experiment_name: str = "exp9"
+    experiment_name: str = "exp11"
     warmup_experiment_name: str = "exp1"
     warmup_checkpoint_name: str = "warmup.pt"
     actor_best_checkpoint_name: str = "actor_best.pt"
@@ -347,6 +347,10 @@ class ResNet18CIFARConfig:
             raise ValueError("initial_state_randomization_rate must be in (0, 1).")
         if not 0 <= self.rl.discount_factor <= 1:
             raise ValueError("discount_factor must be in [0, 1].")
+        if not 1 <= self.rl.lr_decay_epoch <= self.rl.epochs:
+            raise ValueError("lr_decay_epoch must be in [1, rl.epochs].")
+        if not 0 < self.rl.lr_decay_factor <= 1:
+            raise ValueError("rl.lr_decay_factor must be in (0, 1].")
         if not self.rl.critic_hidden_dims or any(width <= 0 for width in self.rl.critic_hidden_dims):
             raise ValueError("critic_hidden_dims must contain positive widths.")
         if self.runtime.amp_dtype not in {"float16", "bfloat16"}:
