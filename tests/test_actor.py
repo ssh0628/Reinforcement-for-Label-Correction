@@ -46,11 +46,17 @@ class ActorGradientAccumulationTest(unittest.TestCase):
         torch.manual_seed(7)
         sample_count = 8
         raw_images = torch.randn(sample_count, 4)
-        labels = F.one_hot(torch.arange(sample_count) % 3, num_classes=3).float()
-        neighbors = torch.tensor(
-            [[1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 0], [0, 1]]
-        )
-        actions = torch.tensor([True, False, True, True, False, True, False, True])
+        with torch.inference_mode():
+            inference_labels = F.one_hot(torch.arange(sample_count) % 3, num_classes=3).float()
+            inference_neighbors = torch.tensor(
+                [[1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 0], [0, 1]]
+            )
+            inference_actions = torch.tensor(
+                [True, False, True, True, False, True, False, True]
+            )
+        labels = inference_labels.clone()
+        neighbors = inference_neighbors.clone()
+        actions = inference_actions.clone()
         q_value = torch.tensor(1.7)
         policy = LabelCorrectionPolicy(temperature=0.5, correction_chunk_size=sample_count)
 
@@ -81,10 +87,10 @@ class ActorGradientAccumulationTest(unittest.TestCase):
             accumulated_optimizer,
             torch.amp.GradScaler("cuda", enabled=False),
             raw_images,
-            labels,
+            inference_labels,
             detached_embeddings,
-            neighbors,
-            actions,
+            inference_neighbors,
+            inference_actions,
             q_value,
             torch.device("cpu"),
             torch.empty(0),

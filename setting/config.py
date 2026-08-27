@@ -68,8 +68,8 @@ class RLConfig:
     initial_state_randomization_rate: float = 0.10  # 매 trajectory 초기 라벨 교란 비율
     feature_batch_size: int = 16_384  # H100 93GB inference feature batch
     actor_microbatch_size: int = 4_096  # H100 93GB 전체 gradient 누적용 메모리 배치
-    use_remaining_horizon: bool = True
-    use_terminal_critic_update: bool = True
+    use_remaining_horizon: bool = False
+    use_terminal_critic_update: bool = False
 
     actor_optimizer: str = "sgd"
     actor_learning_rate: float = 1e-2  # SGD 후보: 1e-3, 3e-3, 1e-2
@@ -128,7 +128,7 @@ class FineTuneConfig:
 @dataclass(frozen=True, slots=True)
 class OutputConfig:
     root: Path = PROJECT_ROOT / "cifar_output"
-    experiment_name: str = "exp12"
+    experiment_name: str = "exp13"
     warmup_experiment_name: str = "exp12"
     warmup_checkpoint_name: str = "warmup.pt"
     actor_best_checkpoint_name: str = "actor_best.pt"

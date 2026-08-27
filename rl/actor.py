@@ -39,7 +39,10 @@ def _policy_embedding_gradients(
     """Differentiate the dataset-level policy loss with respect to all embeddings."""
     sample_count = embeddings.size(0)
     embedding_leaf = embeddings.detach().clone().requires_grad_(True)
-    detached_q = q_value.detach()
+    label_state = label_state.detach().clone()
+    neighbors = neighbors.detach().clone()
+    actions = actions.detach().clone()
+    detached_q = q_value.detach().clone()
     total_loss = 0.0
     for start in range(0, sample_count, microbatch_size):
         end = min(start + microbatch_size, sample_count)
