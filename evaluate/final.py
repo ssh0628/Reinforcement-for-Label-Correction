@@ -54,10 +54,7 @@ def _load_model(device: torch.device) -> tuple[nn.Module, dict[str, object]]:
 
     model = cifar.build_model()
     model.load_state_dict(checkpoint["model"], strict=True)
-    model.to(
-        device=device,
-        memory_format=(torch.channels_last if engine.USE_CHANNELS_LAST else torch.contiguous_format),
-    )
+    cifar.move_model_to_device(model, device)
     metadata = {
         "checkpoint_kind": checkpoint["checkpoint_kind"],
         "selection_metric": checkpoint["selection_metric"],

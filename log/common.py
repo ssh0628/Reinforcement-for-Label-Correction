@@ -9,6 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Callable, TextIO, TypeVar
 
+import numpy as np
 import torch
 
 
@@ -70,6 +71,17 @@ def save_torch(path: Path, payload: object) -> None:
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     try:
         torch.save(payload, temporary_path)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def save_numpy(path: Path, array: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    try:
+        with temporary_path.open("wb") as handle:
+            np.save(handle, array, allow_pickle=False)
         temporary_path.replace(path)
     finally:
         temporary_path.unlink(missing_ok=True)

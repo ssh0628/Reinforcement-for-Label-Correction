@@ -1,4 +1,4 @@
-"""Create the fixed CIFAR-10 ResNet-18 warm-up artifact.
+"""Create the fixed CIFAR-10 warm-up artifact.
 
 All RL runs load the checkpoint produced here.
 """
@@ -236,20 +236,20 @@ def main() -> None:
         "val_load", device, timings, lambda: cifar.load_cifar10_evaluation_split("val")
     )
     val_noisy_labels, _ = measure(
-        "val_noise", device, timings, lambda: cifar.inject_stratified_symmetric_noise(val_clean_labels)
+        "val_noise",
+        device,
+        timings,
+        lambda: cifar.inject_configured_noise(val_images, val_clean_labels, seed=cifar.SEED),
     )
 
-    engine.print_configuration(device, clean_labels.numel())
+    engine.print_configuration(device, clean_labels.numel(), float(noise_mask.float().mean()))
     print(f"output={OUTPUT_DIR}")
 
     model = measure(
         "model_init",
         device,
         timings,
-        lambda: cifar.build_model().to(
-            device=device,
-            memory_format=(torch.channels_last if engine.USE_CHANNELS_LAST else torch.contiguous_format),
-        ),
+        lambda: cifar.build_model(device=device),
     )
     mean, std = engine.normalization_tensors(device)
     measure(

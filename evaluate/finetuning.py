@@ -95,11 +95,7 @@ def _load_initial_model(device: torch.device) -> nn.Module:
         model.load_state_dict(checkpoint["model"], strict=True)
     except RuntimeError as error:
         raise RuntimeError("The initial checkpoint does not contain the classifier head.") from error
-    model.to(
-        device=device,
-        memory_format=(torch.channels_last if engine.USE_CHANNELS_LAST else torch.contiguous_format),
-    )
-    return model
+    return cifar.move_model_to_device(model, device)
 
 
 def _save_checkpoint(

@@ -10,11 +10,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy import stats
 from torch import Tensor, nn
 from torchvision.datasets import CIFAR10
 
 from setting.config import CONFIG
-from setting.model import build_cifar_resnet18
+from setting.model import build_cifar_resnet
 
 
 CIFAR10_ROOT = CONFIG.data_root
@@ -128,12 +129,25 @@ def load_cifar10_evaluation_split(split: str) -> tuple[Tensor, Tensor]:
     return images, labels
 
 
-def build_model(pretrained: bool = PRETRAINED, num_classes: int = NUM_CLASSES) -> nn.Module:
-    return build_cifar_resnet18(pretrained, num_classes)
+def move_model_to_device(model: nn.Module, device: torch.device) -> nn.Module:
+    memory_format = torch.channels_last if CONFIG.runtime.use_channels_last else torch.contiguous_format
+    return model.to(device=device, memory_format=memory_format)
 
 
-def inject_stratified_symmetric_noise(clean_labels: Tensor) -> tuple[Tensor, Tensor]:
-    generator = torch.Generator().manual_seed(SEED)
+def build_model(
+    pretrained: bool = PRETRAINED,
+    num_classes: int = NUM_CLASSES,
+    *,
+    device: torch.device | None = None,
+) -> nn.Module:
+    model = build_cifar_resnet(MODEL_NAME, pretrained, num_classes)
+    return move_model_to_device(model, device) if device is not None else model
+
+
+def inject_stratified_symmetric_noise(
+    clean_labels: Tensor, *, seed: int = SEED
+) -> tuple[Tensor, Tensor]:
+    generator = torch.Generator().manual_seed(seed)
     noisy_labels = clean_labels.clone()
     noise_mask = torch.zeros_like(clean_labels, dtype=torch.bool)
     class_sizes = [int(clean_labels.eq(class_id).sum()) for class_id in CLASSES]
@@ -157,6 +171,59 @@ def inject_stratified_symmetric_noise(clean_labels: Tensor) -> tuple[Tensor, Ten
         noise_mask[selected] = True
 
     return pin_for_cuda(noisy_labels), pin_for_cuda(noise_mask)
+
+
+def inject_instance_dependent_noise(
+    images: Tensor, clean_labels: Tensor, *, seed: int = SEED
+) -> tuple[Tensor, Tensor]:
+    """Generate Xia et al. instance-dependent label noise from raw CIFAR images."""
+    if images.ndim != 4 or images.shape[0] != clean_labels.numel():
+        raise ValueError("IDN images must have shape (N, C, H, W) and match clean_labels.")
+
+    labels = clean_labels.detach().cpu().to(torch.long).contiguous()
+    device = torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
+    features = images.detach().reshape(images.size(0), -1).to(device=device, dtype=torch.float32)
+    rng = np.random.RandomState(seed)
+    mean = CONFIG.data.noise_rate
+    std = CONFIG.data.idn_flip_rate_std
+    distribution = stats.truncnorm((0.0 - mean) / std, (1.0 - mean) / std, loc=mean, scale=std)
+    flip_rates = distribution.rvs(labels.numel(), random_state=rng).astype(np.float32, copy=False)
+    weights = torch.from_numpy(
+        rng.randn(NUM_CLASSES, features.size(1), NUM_CLASSES).astype(np.float32, copy=False)
+    ).to(device)
+    probabilities = torch.empty((labels.numel(), NUM_CLASSES), dtype=torch.float32)
+
+    for class_id in CLASSES:
+        indices = labels.eq(class_id).nonzero(as_tuple=False).flatten()
+        if indices.numel() == 0:
+            continue
+        device_indices = indices.to(device)
+        logits = features[device_indices].matmul(weights[class_id])
+        logits[:, class_id] = -torch.inf
+        class_probabilities = torch.softmax(logits, dim=1)
+        class_flip_rates = torch.from_numpy(flip_rates[indices.numpy()]).to(device)
+        class_probabilities.mul_(class_flip_rates[:, None])
+        class_probabilities[:, class_id] = 1.0 - class_flip_rates
+        probabilities[indices] = class_probabilities.cpu()
+
+    probability_array = probabilities.numpy().astype(np.float64, copy=False)
+    probability_array /= probability_array.sum(axis=1, keepdims=True)
+    noisy_array = np.fromiter(
+        (rng.choice(NUM_CLASSES, p=row) for row in probability_array),
+        dtype=np.int64,
+        count=labels.numel(),
+    )
+    noisy_labels = torch.from_numpy(noisy_array)
+    noise_mask = noisy_labels.ne(labels)
+    return pin_for_cuda(noisy_labels.contiguous()), pin_for_cuda(noise_mask.contiguous())
+
+
+def inject_configured_noise(
+    images: Tensor, clean_labels: Tensor, *, seed: int = SEED
+) -> tuple[Tensor, Tensor]:
+    if CONFIG.data.noise_type == "symmetric":
+        return inject_stratified_symmetric_noise(clean_labels, seed=seed)
+    return inject_instance_dependent_noise(images, clean_labels, seed=seed)
 
 
 def preprocess_cifar10(images: Tensor, device: torch.device, mean: Tensor, std: Tensor) -> Tensor:

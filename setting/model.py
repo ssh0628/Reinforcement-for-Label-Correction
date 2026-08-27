@@ -7,11 +7,11 @@ from torch import Tensor, nn
 from torchvision.models.resnet import BasicBlock, ResNet
 
 
-class CifarResNet18(ResNet):
-    def __init__(self, num_classes: int) -> None:
+class CifarResNet(ResNet):
+    def __init__(self, layers: tuple[int, int, int, int], num_classes: int) -> None:
         if num_classes <= 1:
             raise ValueError("num_classes must be greater than one.")
-        super().__init__(block=BasicBlock, layers=(2, 2, 2, 2), num_classes=num_classes)
+        super().__init__(block=BasicBlock, layers=layers, num_classes=num_classes)
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.maxpool = nn.Identity()
         self.feature_dim = self.fc.in_features
@@ -48,7 +48,24 @@ class CifarResNet18(ResNet):
         return self.forward_head(features)
 
 
-def build_cifar_resnet18(pretrained: bool, num_classes: int) -> CifarResNet18:
+class CifarResNet18(CifarResNet):
+    def __init__(self, num_classes: int) -> None:
+        super().__init__((2, 2, 2, 2), num_classes)
+
+
+class CifarResNet34(CifarResNet):
+    def __init__(self, num_classes: int) -> None:
+        super().__init__((3, 4, 6, 3), num_classes)
+
+
+def build_cifar_resnet(model_name: str, pretrained: bool, num_classes: int) -> CifarResNet:
     if pretrained:
-        raise ValueError("The paper-aligned CIFAR ResNet-18 uses no pretraining.")
-    return CifarResNet18(num_classes=num_classes)
+        raise ValueError("The paper-aligned CIFAR ResNet uses no pretraining.")
+    builders = {
+        "cifar_resnet18": CifarResNet18,
+        "cifar_resnet34": CifarResNet34,
+    }
+    try:
+        return builders[model_name](num_classes=num_classes)
+    except KeyError as error:
+        raise ValueError(f"Unsupported model name: {model_name!r}.") from error

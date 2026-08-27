@@ -7,6 +7,7 @@ and logging live in their stage-specific modules.
 
 from __future__ import annotations
 
+import math
 import random
 import time
 from pathlib import Path
@@ -31,7 +32,7 @@ from log.common import (
     write_csv,
 )
 from rl.actor import correct_from_embeddings, select_queries, update_actor
-from rl.critic import build_critic, build_critic_optimizer, encode_state_action, update_critic
+from rl.critic import StateActionCritic, build_critic_optimizer, encode_state_action, update_critic
 from log.rl import (
     RUN_LOG_FILENAME,
     RUN_SUMMARY_CSV_FILENAME,
@@ -56,16 +57,18 @@ from setting.data import (
     SEED,
     SUBSET_SEED,
     WARMUP_CHECKPOINT_PATH,
-    inject_stratified_symmetric_noise,
+    build_model,
+    inject_configured_noise,
     load_cifar10_evaluation_split,
     load_selected_cifar10_train,
+    move_model_to_device,
     pin_for_cuda,
     preprocess_cifar10 as preprocess,
 )
-from setting.model import build_cifar_resnet18
 
 
 NOISE_RATE = CONFIG.data.noise_rate
+NOISE_TYPE = CONFIG.data.noise_type
 USE_REMAINING_HORIZON = CONFIG.rl.use_remaining_horizon
 USE_TERMINAL_CRITIC_UPDATE = CONFIG.rl.use_terminal_critic_update
 ACTOR_BATCH_SIZE = CONFIG.rl.actor_batch_size
@@ -162,7 +165,7 @@ def load_noisy_label_artifacts(clean_labels: Tensor) -> tuple[Tensor, Tensor]:
     if not torch.equal(noisy_labels.ne(clean_labels), noise_mask):
         raise ValueError("Saved noise mask does not match clean/noisy label differences.")
     expected_noise_count = round(clean_labels.numel() * NOISE_RATE)
-    if int(noise_mask.sum()) != expected_noise_count:
+    if NOISE_TYPE == "symmetric" and int(noise_mask.sum()) != expected_noise_count:
         raise ValueError(
             f"Saved noise count does not match NOISE_RATE: {int(noise_mask.sum())} != {expected_noise_count}."
         )
@@ -186,11 +189,15 @@ def encode(model: nn.Module, images: Tensor) -> Tensor:
 
 
 def training_data_metadata() -> dict[str, object]:
-    return {
+    metadata: dict[str, object] = {
         "sample_count": EXPECTED_SAMPLES,
         "subset_seed": SUBSET_SEED,
         "selection": "deterministic_stratified_equal_per_class",
+        "noise_type": NOISE_TYPE,
     }
+    if NOISE_TYPE == "idn":
+        metadata["idn_flip_rate_std"] = CONFIG.data.idn_flip_rate_std
+    return metadata
 
 
 def validate_training_data_checkpoint(checkpoint: dict[str, object]) -> None:
@@ -204,7 +211,10 @@ def validate_training_data_checkpoint(checkpoint: dict[str, object]) -> None:
         "sample_count": int(metadata.get("sample_count", -1)),
         "subset_seed": int(metadata.get("subset_seed", -1)),
         "selection": str(metadata.get("selection", "")),
+        "noise_type": str(metadata.get("noise_type", "symmetric")),
     }
+    if NOISE_TYPE == "idn":
+        actual["idn_flip_rate_std"] = float(metadata.get("idn_flip_rate_std", -1.0))
     if actual != expected:
         raise ValueError(
             f"Checkpoint training data does not match the current config: {actual!r} != {expected!r}."
@@ -289,9 +299,7 @@ def load_warmup_checkpoint(
     if deployment_mode != "best":
         raise ValueError("CIFAR warmup checkpoint must use best selection.")
     model.load_state_dict(checkpoint["model"], strict=True)
-    model.to(
-        device=device, memory_format=(torch.channels_last if USE_CHANNELS_LAST else torch.contiguous_format)
-    )
+    move_model_to_device(model, device)
     model.eval()
     return {
         "best_epoch": int(checkpoint.get("best_epoch", checkpoint["epoch"])),
@@ -380,9 +388,7 @@ def restore_actor_checkpoint(
     validate_training_augmentation_checkpoint(checkpoint)
     validate_training_data_checkpoint(checkpoint)
     model.load_state_dict(checkpoint["model"], strict=True)
-    model.to(
-        device=device, memory_format=(torch.channels_last if USE_CHANNELS_LAST else torch.contiguous_format)
-    )
+    move_model_to_device(model, device)
     model.eval()
     return checkpoint
 
@@ -514,11 +520,12 @@ def evaluate_correction_split(
     return summary
 
 
-def print_configuration(device: torch.device, sample_count: int) -> None:
+def print_configuration(device: torch.device, sample_count: int, actual_noise_rate: float) -> None:
     properties = torch.cuda.get_device_properties(device)
     print(
         f"device={properties.name} memory={properties.total_memory / 1024**3:.1f}GiB "
-        f"samples={sample_count} noise={NOISE_RATE:.0%} seed={SEED}"
+        f"samples={sample_count} noise={NOISE_TYPE}:{NOISE_RATE:.0%} "
+        f"actual_noise={actual_noise_rate:.2%} seed={SEED}"
     )
     print(
         f"model={MODEL_NAME} warmup={CONFIG.warmup.epochs}epochs "
@@ -571,18 +578,19 @@ def main() -> None:
         "noise_load", device, timings, lambda: load_noisy_label_artifacts(clean_labels_cpu)
     )
     val_noisy_labels, val_noise_mask = measure(
-        "val_noise", device, timings, lambda: inject_stratified_symmetric_noise(val_clean_labels)
+        "val_noise",
+        device,
+        timings,
+        lambda: inject_configured_noise(val_images, val_clean_labels, seed=SEED),
     )
-    print_configuration(device, clean_labels_cpu.numel())
+    actual_noise_rate = float(noise_mask_cpu.float().mean())
+    print_configuration(device, clean_labels_cpu.numel(), actual_noise_rate)
     print(f"validation_samples={val_images.size(0)}")
     model = measure(
         "model_init",
         device,
         timings,
-        lambda: build_cifar_resnet18(PRETRAINED, NUM_CLASSES).to(
-            device=device,
-            memory_format=(torch.channels_last if USE_CHANNELS_LAST else torch.contiguous_format),
-        ),
+        lambda: build_model(device=device),
     )
     mean, std = normalization_tensors(device)
     measure(
@@ -609,7 +617,7 @@ def main() -> None:
         reference_chunk_size=KNN_REFERENCE_CHUNK_SIZE,
         state_chunk_size=CORRECTION_CHUNK_SIZE,
     ).to(device)
-    critic = build_critic(
+    critic = StateActionCritic(
         CRITIC_NUM_BINS,
         CRITIC_HIDDEN_DIMS,
         use_remaining_horizon=USE_REMAINING_HORIZON,
@@ -971,7 +979,12 @@ def main() -> None:
                 "dataset": "CIFAR-10",
                 "model": MODEL_NAME,
                 "samples": EXPECTED_SAMPLES,
+                "noise_type": NOISE_TYPE,
                 "noise_rate": NOISE_RATE,
+                "actual_noise_rate": actual_noise_rate,
+                "idn_flip_rate_std": (
+                    CONFIG.data.idn_flip_rate_std if NOISE_TYPE == "idn" else ""
+                ),
                 "seed": SEED,
                 "actor_batch_size": ACTOR_BATCH_SIZE,
                 "actor_optimizer_steps_per_rl_step": 1,

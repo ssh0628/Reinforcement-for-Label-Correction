@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import time
 
-import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -21,6 +20,7 @@ from log.common import (
     measure,
     print_timing_summary,
     run_with_log,
+    save_numpy,
     write_csv,
 )
 from rl import engine
@@ -165,14 +165,7 @@ def run_correction(
         seconds=time.perf_counter() - started,
     )
     validate_soft_labels(label_state, clean.numel(), engine.NUM_CLASSES)
-    CORRECTED_LABELS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = CORRECTED_LABELS_PATH.with_suffix(f"{CORRECTED_LABELS_PATH.suffix}.tmp")
-    try:
-        with temporary_path.open("wb") as handle:
-            np.save(handle, label_state.detach().float().cpu().numpy(), allow_pickle=False)
-        temporary_path.replace(CORRECTED_LABELS_PATH)
-    finally:
-        temporary_path.unlink(missing_ok=True)
+    save_numpy(CORRECTED_LABELS_PATH, label_state.detach().float().cpu().numpy())
 
     best = max(history, key=lambda row: float(row["accuracy"]))
     summary.update(best_step=int(best["step"]), best_accuracy=float(best["accuracy"]))
@@ -210,10 +203,7 @@ def main() -> None:
         "model_init",
         device,
         timings,
-        lambda: cifar.build_model().to(
-            device=device,
-            memory_format=(torch.channels_last if engine.USE_CHANNELS_LAST else torch.contiguous_format),
-        ),
+        lambda: cifar.build_model(device=device),
     )
     checkpoint = measure(
         "actor_load",

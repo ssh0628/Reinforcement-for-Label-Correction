@@ -1,4 +1,4 @@
-"""CIFAR-10 ResNet-18 experiment configuration."""
+"""CIFAR-10 RLNLC experiment configuration."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +15,9 @@ class DataConfig:
     classes: tuple[int, ...] = tuple(range(10))
     train_samples: int = 50_000  # 10_000, 20_000, 50_000; 10의 배수
     subset_seed: int = 0  # train_samples < 50_000일 때 균등 표본 추출 시드
-    noise_rate: float = 0.50  # 합성 대칭 노이즈 비율: 0.2, 0.4, 0.5
+    noise_type: str = "idn"  # "symmetric" 또는 "idn"
+    noise_rate: float = 0.50  # 목표 노이즈 비율: 0.2, 0.4, 0.5
+    idn_flip_rate_std: float = 0.10  # Xia et al. IDN truncated-normal 표준편차
 
     seed: int = 0  # 노이즈 생성 및 전체 실험 재현 시드
     mean: tuple[float, float, float] = (0.4914, 0.4822, 0.4465)
@@ -24,7 +26,7 @@ class DataConfig:
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    name: str = "cifar_resnet18"
+    name: str = "cifar_resnet34"  # "cifar_resnet18" 또는 "cifar_resnet34"
     pretrained: bool = False
 
 
@@ -37,7 +39,7 @@ class TrainingAugmentationConfig:
 
 @dataclass(frozen=True, slots=True)
 class WarmupConfig:
-    model_id: str = "exp1_warmup"
+    model_id: str = "exp12_warmup"
     epochs: int = 50  # warm-up 학습 길이
     batch_size: int = 1_024  # 메모리에 맞춰 128, 512, 1_024
     eval_batch_size: int = 1_024  # 성능에는 영향 없음; 메모리·속도 조절
@@ -126,8 +128,8 @@ class FineTuneConfig:
 @dataclass(frozen=True, slots=True)
 class OutputConfig:
     root: Path = PROJECT_ROOT / "cifar_output"
-    experiment_name: str = "exp11"
-    warmup_experiment_name: str = "exp1"
+    experiment_name: str = "exp12"
+    warmup_experiment_name: str = "exp12"
     warmup_checkpoint_name: str = "warmup.pt"
     actor_best_checkpoint_name: str = "actor_best.pt"
     actor_last_checkpoint_name: str = "actor_last.pt"
@@ -158,7 +160,7 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class ResNet18CIFARConfig:
+class CIFARConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     augmentation: TrainingAugmentationConfig = field(default_factory=TrainingAugmentationConfig)
@@ -185,9 +187,13 @@ class ResNet18CIFARConfig:
 
     @property
     def noise_output_dir(self) -> Path:
+        noise_name = f"noise{self.noise_tag}"
+        if self.data.noise_type == "idn":
+            std_tag = f"{self.data.idn_flip_rate_std:g}".replace(".", "p")
+            noise_name = f"noise_idn{self.noise_tag}_std{std_tag}"
         name = (
             f"cifar10_train{self.data.train_samples}_subsetseed{self.data.subset_seed}_"
-            f"noise{self.noise_tag}_seed{self.data.seed}"
+            f"{noise_name}_seed{self.data.seed}"
         )
         return self.data_root / name
 
@@ -320,8 +326,10 @@ class ResNet18CIFARConfig:
     def validate(self) -> None:
         if not self.data_root.is_absolute() or not self.output_root.is_absolute():
             raise ValueError("Data and output roots must be absolute paths.")
+        if self.model.name not in {"cifar_resnet18", "cifar_resnet34"}:
+            raise ValueError("model.name must be 'cifar_resnet18' or 'cifar_resnet34'.")
         if self.model.pretrained:
-            raise ValueError("The paper-style ResNet-18 must not be pretrained.")
+            raise ValueError("The paper-style CIFAR ResNet must not be pretrained.")
         sgd_optimizers = (self.warmup.optimizer, self.rl.actor_optimizer, self.finetune.optimizer)
         if any(name.lower() != "sgd" for name in sgd_optimizers):
             raise ValueError("CIFAR warm-up, actor, and fine-tuning optimizers must be SGD.")
@@ -333,6 +341,10 @@ class ResNet18CIFARConfig:
             raise ValueError("train_samples must be in [1, 50000] and divisible by 10.")
         if not 0 <= self.data.noise_rate < 1:
             raise ValueError("noise_rate must be in [0, 1).")
+        if self.data.noise_type not in {"symmetric", "idn"}:
+            raise ValueError("noise_type must be 'symmetric' or 'idn'.")
+        if self.data.idn_flip_rate_std <= 0:
+            raise ValueError("idn_flip_rate_std must be positive.")
         if not 0 < self.rl.actor_batch_size <= self.data.train_samples:
             raise ValueError("actor_batch_size must be in [1, train_samples].")
         if self.finetune.initialization not in {"warmup", "best_actor", "last_actor"}:
@@ -392,5 +404,5 @@ class ResNet18CIFARConfig:
             raise ValueError("UMAP min_dist must be in [0, 1].")
 
 
-CONFIG = ResNet18CIFARConfig()
+CONFIG = CIFARConfig()
 CONFIG.validate()

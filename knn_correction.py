@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
-import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -18,6 +16,7 @@ from log.common import (
     measure,
     print_timing_summary,
     run_with_log,
+    save_numpy,
     write_csv,
 )
 from rl import engine
@@ -73,17 +72,6 @@ def weighted_knn_labels(
     return labels
 
 
-def save_numpy(path: Path, array: np.ndarray) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-    try:
-        with temporary_path.open("wb") as handle:
-            np.save(handle, array, allow_pickle=False)
-        temporary_path.replace(path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
-
-
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     device = engine.resolve_local_device()
@@ -103,10 +91,7 @@ def main() -> None:
         "model_init",
         device,
         timings,
-        lambda: cifar.build_model().to(
-            device=device,
-            memory_format=(torch.channels_last if engine.USE_CHANNELS_LAST else torch.contiguous_format),
-        ),
+        lambda: cifar.build_model(device=device),
     )
     checkpoint = measure(
         "warmup_load",

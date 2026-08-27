@@ -12,7 +12,8 @@ SUMMARY_FIELDS = (
 )
 
 RUN_SUMMARY_FIELDS = (
-    "dataset", "model", "samples", "noise_rate", "seed", "actor_batch_size",
+    "dataset", "model", "samples", "noise_type", "noise_rate", "actual_noise_rate",
+    "idn_flip_rate_std", "seed", "actor_batch_size",
     "actor_optimizer_steps_per_rl_step", "remaining_horizon", "terminal_update",
     "warmup_epoch", "epochs", "steps", "k",
     "actor_lr", "critic_optimizer", "critic_lr", "critic_momentum", "critic_weight_decay",

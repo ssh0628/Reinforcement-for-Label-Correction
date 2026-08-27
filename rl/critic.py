@@ -61,19 +61,6 @@ class StateActionCritic(nn.Module):
         return self.value_from_encoding(self.encode(consistency_scores, remaining_horizon))
 
 
-def build_critic(
-    num_bins: int,
-    hidden_dims: tuple[int, ...],
-    *,
-    use_remaining_horizon: bool = True,
-) -> StateActionCritic:
-    return StateActionCritic(
-        num_bins,
-        hidden_dims,
-        use_remaining_horizon=use_remaining_horizon,
-    )
-
-
 def build_critic_optimizer(
     critic: StateActionCritic,
     *,
