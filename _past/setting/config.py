@@ -6,18 +6,17 @@ from pathlib import Path
 
 PROJECT_ROOT = Path("/root/project/rlnlc")
 
-
 @dataclass(frozen=True, slots=True)
 class DataConfig:
     root: Path = PROJECT_ROOT / "cifar10"
     download: bool = True
 
     classes: tuple[int, ...] = tuple(range(10))
-    train_samples: int = 50_000  # 10_000, 20_000, 50_000; 10의 배수
-    subset_seed: int = 0  # train_samples < 50_000일 때 균등 표본 추출 시드
-    noise_rate: float = 0.50  # 합성 대칭 노이즈 비율: 0.2, 0.4, 0.5
+    train_samples: int = 50_000
+    subset_seed: int = 0
+    noise_rate: float = 0.50
 
-    seed: int = 0  # 노이즈 생성 및 전체 실험 재현 시드
+    seed: int = 0
     mean: tuple[float, float, float] = (0.4914, 0.4822, 0.4465)
     std: tuple[float, float, float] = (0.2470, 0.2435, 0.2616)
 
@@ -31,61 +30,67 @@ class ModelConfig:
 @dataclass(frozen=True, slots=True)
 class TrainingAugmentationConfig:
     enabled: bool = True
-    random_crop_padding: int = 4  # CIFAR 표준값; 0이면 crop 증강 제거
-    horizontal_flip_probability: float = 0.5  # 0.0~1.0
+    random_crop_padding: int = 4
+    horizontal_flip_probability: float = 0.5
 
 
 @dataclass(frozen=True, slots=True)
 class WarmupConfig:
     model_id: str = "exp1_warmup"
-    epochs: int = 50  # warm-up 학습 길이
-    batch_size: int = 1_024  # 메모리에 맞춰 128, 512, 1_024
-    eval_batch_size: int = 1_024  # 성능에는 영향 없음; 메모리·속도 조절
+    epochs: int = 50
+    batch_size: int = 1_024 # 128
+    eval_batch_size: int = 1_024
     optimizer: str = "sgd"
-    learning_rate: float = 1e-2  # SGD 후보: 1e-3, 3e-3, 1e-2
-    momentum: float = 0.9  # SGD momentum: 보통 0.9
-    weight_decay: float = 5e-4  # L2 규제: 0, 1e-4, 5e-4
-    lr_decay_fraction: float = 0.5  # 전체 epoch 중 LR 감소 시점 비율
-    lr_decay_factor: float = 0.1  # 감소 시 LR에 곱할 값
-    min_noisy_validation_accuracy: float = 0.0  # checkpoint 허용 하한; 0이면 비활성
+    learning_rate: float = 1e-2
+    momentum: float = 0.9
+    weight_decay: float = 5e-4
+    lr_decay_fraction: float = 0.5
+    lr_decay_factor: float = 0.1
+    min_noisy_validation_accuracy: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
 class KNNConfig:
-    k: int = 10  # 이웃 수: 5, 10, 20
-    temperature: float = 0.5  # 거리 가중치 온도; 작을수록 가까운 이웃 강조
-    query_chunk_size: int = 8_192  # 결과에는 영향 없음; KNN 검색 메모리·속도 조절
-    reference_chunk_size: int = 65_536  # 결과에는 영향 없음; KNN 기준 청크 크기
-    correction_chunk_size: int = 50_000  # 결과에는 영향 없음; correction 메모리·속도 조절
+    k: int = 10
+    temperature: float = 0.5
+    query_chunk_size: int = 8_192 # 4_096, 8_192
+    reference_chunk_size: int = 65_536
+    correction_chunk_size: int = 50_000 # 16_382, 50_000
 
 
 @dataclass(frozen=True, slots=True)
 class RLConfig:
-    epochs: int = 100  # 빠른 검증 100, 중간 200, 최종 재현 500
-    trajectory_length: int = 10  # 한 epoch의 label-correction step 수
-    initial_state_randomization_rate: float = 0.10  # 매 trajectory 초기 라벨 교란 비율
-    feature_batch_size: int = 8_192  # 결과에는 영향 없음; feature 추출 메모리·속도 조절
-    actor_batch_size: int = 128  # step당 Actor optimizer 미니배치: 128, 256, 512
+    epochs: int = 100
+    trajectory_length: int = 10
+    initial_state_randomization_rate: float = 0.10
+    feature_batch_size: int = 8_192 # 8_192, 1_024
+    update_mode: str = "subset" # subset, full
+    subset_size: int = 128
     use_remaining_horizon: bool = True
     use_terminal_critic_update: bool = True
 
+    actor_step_mode: str = "minibatch" # trajectory, minibatch
+    update_batch_size: int = 128
+    record_change_diagnostics: bool = False
+    change_diagnostic_probe_size: int = 50_000
+
     actor_optimizer: str = "sgd"
-    actor_learning_rate: float = 1e-2  # SGD 후보: 1e-3, 3e-3, 1e-2
-    actor_momentum: float = 0.9  # SGD momentum: 보통 0.9
-    actor_weight_decay: float = 5e-4  # L2 규제: 0, 1e-4, 5e-4
+    actor_learning_rate: float = 1e-2
+    actor_momentum: float = 0.9
+    actor_weight_decay: float = 5e-4
 
-    critic_optimizer: str = "sgd"  # "sgd" 또는 "adam"
-    critic_learning_rate: float = 1e-2  # SGD일 때 사용: 1e-3, 3e-3, 1e-2
-    critic_adam_learning_rate: float = 1e-3  # Adam일 때 사용: 1e-4, 3e-4, 1e-3
-    critic_momentum: float = 0.9  # SGD에서만 사용
-    critic_weight_decay: float = 5e-4  # SGD에서만 사용; Adam 선택 시 자동으로 0
-    critic_num_bins: int = 100  # label-consistency histogram bin 수
-    critic_hidden_dims: tuple[int, ...] = (128, 64)  # 예: (128, 64), (256, 128, 64)
+    critic_optimizer: str = "sgd"  # sgd, adam: lr=1e-3, no momentum/weight decay/LR decay
+    critic_learning_rate: float = 1e-2
+    critic_adam_learning_rate: float = 1e-3
+    critic_momentum: float = 0.9
+    critic_weight_decay: float = 5e-4
+    critic_num_bins: int = 100
+    critic_hidden_dims: tuple[int, ...] = (128, 64)
 
-    discount_factor: float = 0.9  # TD discount gamma: 0.0~1.0
-    reward_nla_weight: float = 0.5  # log_reward에서 NLA 항의 가중치
-    lr_decay_fraction: float = 0.5  # SGD Actor/Critic LR 감소 시점 비율
-    lr_decay_factor: float = 0.1  # SGD LR 감소 배율; Adam Critic에는 미적용
+    discount_factor: float = 0.9
+    reward_nla_weight: float = 0.5
+    lr_decay_fraction: float = 0.5
+    lr_decay_factor: float = 0.1
 
     @property
     def effective_critic_options(self) -> tuple[float, float, float, bool]:
@@ -96,31 +101,31 @@ class RLConfig:
 
 @dataclass(frozen=True, slots=True)
 class CorrectionConfig:
-    trajectory_length: int = 25  # 최종 Actor로 반복 correction할 step 수
+    trajectory_length: int = 25
 
 
 @dataclass(frozen=True, slots=True)
 class KNNQualityConfig:
-    visualization_samples: int = 10_000  # 시각화 표본 수; 클래스 수로 나누어져야 함
-    pca_dimensions: int = 50  # UMAP 전 PCA 차원
-    umap_neighbors: int = 15  # 지역 구조 범위: 5, 15, 30
-    umap_min_dist: float = 0.1  # 군집 압축도: 0.0~1.0
-    seed: int = 0  # 시각화 재현 시드
+    visualization_samples: int = 10_000
+    pca_dimensions: int = 50
+    umap_neighbors: int = 15
+    umap_min_dist: float = 0.1
+    seed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class FineTuneConfig:
-    corrected_label_source: str = "rl"
-    initialization: str = "last_actor"
+    corrected_label_source: str = "rl" # knn, rl
+    initialization: str = "last_actor" # warmup, best_actor, last_actor
     evaluation_checkpoint: str = "accuracy"
-    epochs: int = 100  # corrected label fine-tuning 길이
-    batch_size: int = 1_024  # 메모리에 맞춰 128, 512, 1_024
+    epochs: int = 100
+    batch_size: int = 1_024 # 128, 1_024
     optimizer: str = "sgd"
-    learning_rate: float = 1e-2  # SGD 후보: 1e-3, 3e-3, 1e-2
-    momentum: float = 0.9  # SGD momentum: 보통 0.9
-    weight_decay: float = 5e-4  # L2 규제: 0, 1e-4, 5e-4
-    lr_decay_fraction: float = 0.5  # 전체 epoch 중 LR 감소 시점 비율
-    lr_decay_factor: float = 0.1  # 감소 시 LR에 곱할 값
+    learning_rate: float = 1e-2
+    momentum: float = 0.9
+    weight_decay: float = 5e-4
+    lr_decay_fraction: float = 0.5
+    lr_decay_factor: float = 0.1
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +151,7 @@ class RuntimeConfig:
     amp_dtype: str = "bfloat16"
     use_channels_last: bool = True
     cudnn_benchmark: bool = True
-    evaluate_batch_size: int = 1_024  # 성능에는 영향 없음; 평가 메모리·속도 조절
+    evaluate_batch_size: int = 1_024
     overwrite_noise: bool = False
     overwrite_warmup: bool = False
     overwrite_rl: bool = False
@@ -216,8 +221,12 @@ class ResNet18CIFARConfig:
         return min(self.knn_quality.visualization_samples, self.data.train_samples)
 
     @property
+    def mode_output_dir(self) -> Path:
+        return self.experiment_output_dir / self.rl.update_mode
+
+    @property
     def log_output_dir(self) -> Path:
-        return self.experiment_output_dir / "logs"
+        return self.mode_output_dir / "logs"
 
     @property
     def rl_output_dir(self) -> Path:
@@ -225,7 +234,19 @@ class ResNet18CIFARConfig:
 
     @property
     def rl_model_dir(self) -> Path:
-        return self.experiment_output_dir / "model_rl"
+        return self.mode_output_dir / "model_rl"
+
+    @property
+    def actor_update_samples(self) -> int:
+        return self.data.train_samples if self.rl.update_mode == "full" else self.rl.subset_size
+
+    @property
+    def actor_update_batch_size(self) -> int:
+        return min(self.rl.update_batch_size, self.actor_update_samples)
+
+    @property
+    def change_diagnostic_probe_size(self) -> int:
+        return min(self.rl.change_diagnostic_probe_size, self.data.train_samples)
 
     @property
     def actor_best_checkpoint_path(self) -> Path:
@@ -276,7 +297,7 @@ class ResNet18CIFARConfig:
 
     @property
     def finetune_source_output_dir(self) -> Path:
-        return self.experiment_output_dir if self.finetune.corrected_label_source == "rl" else self.knn_output_dir
+        return self.mode_output_dir if self.finetune.corrected_label_source == "rl" else self.knn_output_dir
 
     @property
     def finetune_initial_checkpoint_path(self) -> Path:
@@ -333,8 +354,12 @@ class ResNet18CIFARConfig:
             raise ValueError("train_samples must be in [1, 50000] and divisible by 10.")
         if not 0 <= self.data.noise_rate < 1:
             raise ValueError("noise_rate must be in [0, 1).")
-        if not 0 < self.rl.actor_batch_size <= self.data.train_samples:
-            raise ValueError("actor_batch_size must be in [1, train_samples].")
+        if self.rl.update_mode not in {"full", "subset"}:
+            raise ValueError("update_mode must be 'full' or 'subset'.")
+        if self.rl.actor_step_mode not in {"trajectory", "minibatch"}:
+            raise ValueError("actor_step_mode must be 'trajectory' or 'minibatch'.")
+        if self.rl.update_mode == "subset" and not 0 < self.rl.subset_size <= self.data.train_samples:
+            raise ValueError("subset_size must be in [1, train_samples].")
         if self.finetune.initialization not in {"warmup", "best_actor", "last_actor"}:
             raise ValueError("Invalid fine-tuning initialization.")
         if self.finetune.corrected_label_source not in {"rl", "knn"}:
@@ -359,7 +384,8 @@ class ResNet18CIFARConfig:
             self.rl.epochs,
             self.rl.trajectory_length,
             self.rl.feature_batch_size,
-            self.rl.actor_batch_size,
+            self.rl.update_batch_size,
+            self.rl.change_diagnostic_probe_size,
             self.correction.trajectory_length,
             self.knn_quality.visualization_samples,
             self.knn_quality.pca_dimensions,
@@ -386,7 +412,5 @@ class ResNet18CIFARConfig:
             raise ValueError("UMAP neighbors must be smaller than visualization samples.")
         if not 0 <= self.knn_quality.umap_min_dist <= 1:
             raise ValueError("UMAP min_dist must be in [0, 1].")
-
-
 CONFIG = ResNet18CIFARConfig()
 CONFIG.validate()

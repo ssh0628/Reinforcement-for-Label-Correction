@@ -1,1 +1,1 @@
-"""Warmup data and configuration components."""
+"""CIFAR data, model, noise, warm-up, and configuration stages."""

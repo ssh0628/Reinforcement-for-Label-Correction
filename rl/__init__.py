@@ -1,1 +1,1 @@
-"""Reinforcement-learning noisy-label correction package."""
+"""CIFAR-10 RLNLC training components."""
