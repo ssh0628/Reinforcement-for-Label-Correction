@@ -16,6 +16,32 @@ def _validate(embeddings: Tensor, k: int, query_chunk_size: int, reference_chunk
         raise ValueError("KNN sizes must be positive.")
 
 
+def _squared_distances(
+    queries: Tensor,
+    references: Tensor,
+    query_squared_norms: Tensor,
+    reference_squared_norms: Tensor,
+) -> Tensor:
+    return (
+        query_squared_norms.unsqueeze(1)
+        + reference_squared_norms.unsqueeze(0)
+        - 2.0 * queries @ references.T
+    ).clamp_min_(0)
+
+
+def _merge_nearest(
+    best_distances: Tensor,
+    best_indices: Tensor,
+    local_distances: Tensor,
+    local_indices: Tensor,
+    k: int,
+) -> tuple[Tensor, Tensor]:
+    candidate_distances = torch.cat((best_distances, local_distances), dim=1)
+    candidate_indices = torch.cat((best_indices, local_indices), dim=1)
+    next_distances, keep = candidate_distances.topk(k, dim=1, largest=False, sorted=True)
+    return next_distances, candidate_indices.gather(1, keep)
+
+
 @torch.inference_mode()
 def build_exact_policy_knn(
     embeddings: Tensor, *, k: int, query_chunk_size: int, reference_chunk_size: int
@@ -30,16 +56,18 @@ def build_exact_policy_knn(
     for query_start in range(0, sample_count, query_chunk_size):
         query_end = min(query_start + query_chunk_size, sample_count)
         queries = features[query_start:query_end]
-        query_norms = squared_norms[query_start:query_end].unsqueeze(1)
+        query_norms = squared_norms[query_start:query_end]
         best_distances = torch.full((queries.size(0), k), float("inf"), device=device)
         best_indices = torch.full((queries.size(0), k), -1, dtype=torch.long, device=device)
         for reference_start in range(0, sample_count, reference_chunk_size):
             reference_end = min(reference_start + reference_chunk_size, sample_count)
             references = features[reference_start:reference_end]
-            distances = (
-                query_norms + squared_norms[reference_start:reference_end].unsqueeze(0)
-                - 2.0 * queries @ references.T
-            ).clamp_min_(0)
+            distances = _squared_distances(
+                queries,
+                references,
+                query_norms,
+                squared_norms[reference_start:reference_end],
+            )
             overlap_start, overlap_end = max(query_start, reference_start), min(query_end, reference_end)
             if overlap_start < overlap_end:
                 rows = torch.arange(overlap_start - query_start, overlap_end - query_start, device=device)
@@ -49,10 +77,13 @@ def build_exact_policy_knn(
                 distances[rows, columns] = float("inf")
             local_k = min(k, references.size(0))
             local_distances, local_positions = distances.topk(local_k, dim=1, largest=False, sorted=False)
-            candidate_distances = torch.cat((best_distances, local_distances), dim=1)
-            candidate_indices = torch.cat((best_indices, local_positions + reference_start), dim=1)
-            best_distances, keep = candidate_distances.topk(k, dim=1, largest=False, sorted=True)
-            best_indices = candidate_indices.gather(1, keep)
+            best_distances, best_indices = _merge_nearest(
+                best_distances,
+                best_indices,
+                local_distances,
+                local_positions + reference_start,
+                k,
+            )
         neighbors[query_start:query_end] = best_indices
     return neighbors
 
@@ -100,21 +131,23 @@ def build_exact_clean_knn(
         best_indices = torch.full_like(best_distances, -1, dtype=torch.long)
         for reference_start in range(0, clean_indices.numel(), reference_chunk_size):
             reference_ids = clean_indices[reference_start : reference_start + reference_chunk_size]
-            distances = (
-                squared_norms[query_ids].unsqueeze(1) + squared_norms[reference_ids].unsqueeze(0)
-                - 2.0 * queries @ features[reference_ids].T
-            ).clamp_min_(0)
+            distances = _squared_distances(
+                queries,
+                features[reference_ids],
+                squared_norms[query_ids],
+                squared_norms[reference_ids],
+            )
             local_k = min(effective_k, reference_ids.numel())
             local_distances, positions = distances.topk(local_k, dim=1, largest=False, sorted=False)
-            candidate_distances = torch.cat((best_distances, local_distances), dim=1)
-            candidate_indices = torch.cat((best_indices, reference_ids[positions]), dim=1)
-            best_distances, keep = candidate_distances.topk(
-                effective_k, dim=1, largest=False, sorted=True
+            best_distances, best_indices = _merge_nearest(
+                best_distances,
+                best_indices,
+                local_distances,
+                reference_ids[positions],
+                effective_k,
             )
-            best_indices = candidate_indices.gather(1, keep)
         neighbor_indices[query_start:query_end] = best_indices
         neighbor_cosines[query_start:query_end] = (
             normalized[query_ids].unsqueeze(1) * normalized[best_indices]
         ).sum(dim=2)
     return CleanKNNResult(noisy_indices, neighbor_indices, neighbor_cosines)
-

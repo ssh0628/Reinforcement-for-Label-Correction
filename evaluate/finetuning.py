@@ -17,7 +17,7 @@ from torch import Tensor, nn
 from torch.optim import SGD
 from torch.optim.lr_scheduler import MultiStepLR
 
-from evaluate.metrics import validate_soft_labels
+from evaluate.metrics import evaluate_classifier, validate_soft_labels
 from log.common import append_csv, run_with_log, save_torch, write_csv
 from rl import engine
 from setting import data as cifar
@@ -83,8 +83,11 @@ def _load_initial_model(device: torch.device) -> nn.Module:
         raise ValueError("Initial checkpoint model name does not match config.")
     if "num_classes" in checkpoint and int(checkpoint["num_classes"]) != cifar.NUM_CLASSES:
         raise ValueError("Initial checkpoint class count does not match CIFAR-10.")
-    if INITIALIZATION == "warmup" and (checkpoint.get("warmup_model_id") != CONFIG.warmup.model_id):
-        raise ValueError("Warmup checkpoint model ID does not match config.")
+    if INITIALIZATION == "warmup":
+        if checkpoint.get("warmup_model_id") != CONFIG.warmup.model_id:
+            raise ValueError("Warmup checkpoint model ID does not match config.")
+        if checkpoint.get("selection", "best") != CONFIG.warmup.checkpoint_selection:
+            raise ValueError("Warmup checkpoint selection does not match config.")
     engine.validate_training_augmentation_checkpoint(checkpoint)
     engine.validate_training_data_checkpoint(checkpoint)
     if INITIALIZATION == "last_actor" and int(checkpoint["epoch"]) != CONFIG.rl.epochs:
@@ -133,35 +136,11 @@ def _save_checkpoint(
     save_torch(path, payload)
 
 
-@torch.inference_mode()
-def _evaluate_validation(
-    model: nn.Module, images: Tensor, labels: Tensor, device: torch.device, mean: Tensor, std: Tensor
-) -> dict[str, float]:
-    model.eval()
-    loss_sum = torch.zeros((), dtype=torch.float64, device=device)
-    correct_count = torch.zeros((), dtype=torch.long, device=device)
-
-    for start in range(0, labels.numel(), VALIDATION_BATCH_SIZE):
-        end = min(start + VALIDATION_BATCH_SIZE, labels.numel())
-        batch_images = cifar.preprocess_cifar10(images[start:end], device, mean, std)
-        targets = labels[start:end].to(device, non_blocking=True)
-        with torch.autocast(device_type="cuda", dtype=engine.AMP_DTYPE, enabled=engine.USE_AMP):
-            logits = model(batch_images)
-            loss = nn.functional.cross_entropy(logits, targets, reduction="sum")
-        correct_count += logits.argmax(dim=1).eq(targets).sum()
-        loss_sum += loss.to(torch.float64)
-
-    return {"loss": float(loss_sum / labels.numel()), "accuracy": float(correct_count / labels.numel())}
-
-
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     BEST_ACCURACY_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    device = engine.resolve_local_device()
-    engine.seed_everything(SEED)
-    torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
-    torch.cuda.reset_peak_memory_stats()
+    device = engine.initialize_cuda_runtime(SEED, reset_peak_memory=True)
 
     train_images, clean_train_labels = cifar.load_selected_cifar10_train()
     validation_images, validation_labels = cifar.load_cifar10_evaluation_split("val")
@@ -224,7 +203,18 @@ def main() -> None:
             clean_count += predictions.eq(clean_targets).sum()
 
         engine.synchronize(device)
-        validation = _evaluate_validation(model, validation_images, validation_labels, device, mean, std)
+        validation = evaluate_classifier(
+            model,
+            validation_images,
+            validation_labels,
+            device,
+            mean,
+            std,
+            batch_size=VALIDATION_BATCH_SIZE,
+            use_amp=engine.USE_AMP,
+            amp_dtype=engine.AMP_DTYPE,
+            preprocess=cifar.preprocess_cifar10,
+        )
         engine.synchronize(device)
         improved = {
             "accuracy": validation["accuracy"] > best_values["accuracy"],
@@ -304,7 +294,3 @@ def run_with_file_logging() -> None:
         stage="Fine-tuning",
     )
     run_with_log(RUN_LOG_PATH, main)
-
-
-if __name__ == "__main__":
-    run_with_file_logging()

@@ -5,8 +5,9 @@ from __future__ import annotations
 import time
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 
+from evaluate.metrics import evaluate_classifier
 from log.common import run_with_log, write_csv
 from rl import engine
 from setting import data as cifar
@@ -64,36 +65,14 @@ def _load_model(device: torch.device) -> tuple[nn.Module, dict[str, object]]:
     return model, metadata
 
 
-@torch.inference_mode()
-def _evaluate(model: nn.Module, images: Tensor, labels: Tensor, device: torch.device) -> dict[str, object]:
-    model.eval()
-    mean, std = engine.normalization_tensors(device)
-    criterion = nn.CrossEntropyLoss(reduction="sum")
-    loss_sum = torch.zeros((), dtype=torch.float64, device=device)
-    correct_count = torch.zeros((), dtype=torch.long, device=device)
-
-    for start in range(0, labels.numel(), TEST_BATCH_SIZE):
-        end = min(start + TEST_BATCH_SIZE, labels.numel())
-        batch_images = cifar.preprocess_cifar10(images[start:end], device, mean, std)
-        targets = labels[start:end].to(device, non_blocking=True)
-        with torch.autocast(device_type="cuda", dtype=engine.AMP_DTYPE, enabled=engine.USE_AMP):
-            logits = model(batch_images)
-            loss = criterion(logits, targets)
-        correct_count += logits.argmax(dim=1).eq(targets).sum()
-        loss_sum += loss.to(torch.float64)
-
-    return {"loss": float(loss_sum / labels.numel()), "accuracy": float(correct_count / labels.numel())}
-
-
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    device = engine.resolve_local_device()
-    engine.seed_everything(SEED)
-    torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
+    device = engine.initialize_cuda_runtime(SEED)
 
     test_images, test_labels = cifar.load_cifar10_evaluation_split("all")
     model, checkpoint = _load_model(device)
+    mean, std = engine.normalization_tensors(device)
 
     print(
         f"device={torch.cuda.get_device_name(device)} initialization={INITIALIZATION} "
@@ -101,7 +80,18 @@ def main() -> None:
     )
     engine.synchronize(device)
     started = time.perf_counter()
-    summary = _evaluate(model, test_images, test_labels, device)
+    summary = evaluate_classifier(
+        model,
+        test_images,
+        test_labels,
+        device,
+        mean,
+        std,
+        batch_size=TEST_BATCH_SIZE,
+        use_amp=engine.USE_AMP,
+        amp_dtype=engine.AMP_DTYPE,
+        preprocess=cifar.preprocess_cifar10,
+    )
     engine.synchronize(device)
     elapsed = time.perf_counter() - started
     summary = {
@@ -125,7 +115,3 @@ def run_with_file_logging() -> None:
     cifar.require_files((FINETUNE_CHECKPOINT_PATH,), stage="Evaluation")
     cifar.require_available_outputs([TEST_CSV_PATH, RUN_LOG_PATH], overwrite=OVERWRITE, stage="Evaluation")
     run_with_log(RUN_LOG_PATH, main)
-
-
-if __name__ == "__main__":
-    run_with_file_logging()

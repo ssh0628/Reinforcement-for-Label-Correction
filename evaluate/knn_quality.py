@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 from torch import Tensor
 from torch.nn import functional as F
 
-from log.common import run_with_log, write_csv
+from log.common import atomic_path, run_with_log, write_csv
 from rl import engine
 from setting import data as cifar
 
@@ -255,16 +255,12 @@ def render_projection_png(
         rgb = palette[class_id]
         draw.ellipse((x - 5, legend_y - 5, x + 5, legend_y + 5), fill=rgb)
         draw.text((x + 11, legend_y), f"class {class_id}", fill="#202124", font=legend_font, anchor="lm")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-    image.save(temporary_path, format="PNG", optimize=True)
-    temporary_path.replace(path)
+    with atomic_path(path) as temporary_path:
+        image.save(temporary_path, format="PNG", optimize=True)
 
 
 def main() -> None:
-    device = engine.resolve_local_device()
-    engine.seed_everything(CONFIG.knn_quality.seed)
-    torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
+    device = engine.initialize_cuda_runtime(CONFIG.knn_quality.seed)
     started = time.perf_counter()
 
     raw_images, clean_labels_cpu = cifar.load_selected_cifar10_train()
@@ -333,7 +329,3 @@ def run_with_file_logging() -> None:
         OUTPUT_PATHS, overwrite=CONFIG.runtime.overwrite_knn_quality, stage="KNN quality"
     )
     run_with_log(RUN_LOG_PATH, main)
-
-
-if __name__ == "__main__":
-    run_with_file_logging()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -31,8 +32,6 @@ from log.common import (
     save_torch,
     write_csv,
 )
-from rl.actor import correct_from_embeddings, update_actor
-from rl.critic import StateActionCritic, build_critic_optimizer, encode_state_action, update_critic
 from log.rl import (
     RUN_LOG_FILENAME,
     RUN_SUMMARY_CSV_FILENAME,
@@ -41,6 +40,8 @@ from log.rl import (
     TIMING_CSV_FILENAME,
     TRAIN_CSV_FILENAME,
 )
+from rl.actor import correct_from_embeddings, select_actor_queries, update_actor
+from rl.critic import StateActionCritic, build_critic_optimizer, encode_state_action, update_critic
 from rl.knn import build_exact_policy_knn
 from rl.policy import LabelCorrectionPolicy
 from rl.reward import RLNLCReward
@@ -71,10 +72,13 @@ NOISE_RATE = CONFIG.data.noise_rate
 NOISE_TYPE = CONFIG.data.noise_type
 USE_REMAINING_HORIZON = CONFIG.rl.use_remaining_horizon
 USE_TERMINAL_CRITIC_UPDATE = CONFIG.rl.use_terminal_critic_update
+ACTOR_UPDATE_MODE = CONFIG.actor_update_mode
+ACTOR_UPDATE_SAMPLES = CONFIG.actor_update_samples
 ACTOR_MICROBATCH_SIZE = CONFIG.rl.actor_microbatch_size
 OUTPUT_DIR = CONFIG.rl_output_dir
 TRAIN_AUGMENTATION_ENABLED = CONFIG.augmentation.enabled
 RL_EPOCHS = CONFIG.rl.epochs
+CHECKPOINT_INTERVAL = CONFIG.rl.checkpoint_interval
 TRAJECTORY_LENGTH = CONFIG.rl.trajectory_length
 FEATURE_BATCH_SIZE = CONFIG.rl.feature_batch_size
 K = CONFIG.knn.k
@@ -97,6 +101,48 @@ USE_AMP = CONFIG.runtime.use_amp
 AMP_DTYPE = getattr(torch, CONFIG.runtime.amp_dtype)
 USE_CHANNELS_LAST = CONFIG.runtime.use_channels_last
 CUDNN_BENCHMARK = CONFIG.runtime.cudnn_benchmark
+
+
+@dataclass(slots=True)
+class RLData:
+    raw_images: Tensor
+    clean_labels_cpu: Tensor
+    noisy_labels_cpu: Tensor
+    noise_mask_cpu: Tensor
+    val_images: Tensor
+    val_clean_labels: Tensor
+    val_noisy_labels: Tensor
+    val_noise_mask: Tensor
+    clean_labels: Tensor
+    initial_noisy_labels: Tensor
+    noise_mask: Tensor
+
+
+@dataclass(slots=True)
+class RLComponents:
+    model: nn.Module
+    policy: LabelCorrectionPolicy
+    reward_function: RLNLCReward
+    critic: StateActionCritic
+    critic_optimizer: torch.optim.Optimizer
+    actor_optimizer: torch.optim.Optimizer
+    actor_scheduler: MultiStepLR
+    critic_scheduler: MultiStepLR | None
+    scaler: torch.amp.GradScaler
+    mean: Tensor
+    std: Tensor
+    fixed_embeddings: Tensor
+    global_neighbors: Tensor
+    global_cosines: Tensor
+
+
+@dataclass(slots=True)
+class TrajectoryResult:
+    label_state: Tensor
+    action_count: int
+    rewards: list[float]
+    actor_losses: list[float]
+    critic_losses: list[float]
 
 
 def seed_everything(seed: int) -> None:
@@ -127,12 +173,17 @@ def initialize_randomized_label_state(
 
 def resolve_local_device() -> torch.device:
     if not torch.cuda.is_available():
-        raise RuntimeError(
-            "The CIFAR-10 experiment requires CUDA, but "
-            "torch.cuda.is_available() "
-            "is False. Check the NVIDIA driver and CUDA-enabled PyTorch build."
-        )
+        raise RuntimeError("CUDA is unavailable. Check the NVIDIA driver and PyTorch build.")
     return torch.device("cuda", 0)
+
+
+def initialize_cuda_runtime(seed: int, *, reset_peak_memory: bool = False) -> torch.device:
+    device = resolve_local_device()
+    seed_everything(seed)
+    torch.backends.cudnn.benchmark = CUDNN_BENCHMARK
+    if reset_peak_memory:
+        torch.cuda.reset_peak_memory_stats()
+    return device
 
 
 def synchronize(device: torch.device) -> None:
@@ -296,8 +347,15 @@ def load_warmup_checkpoint(
     validate_training_augmentation_checkpoint(checkpoint)
     validate_training_data_checkpoint(checkpoint)
     deployment_mode = str(checkpoint.get("selection", "best"))
-    if deployment_mode != "best":
-        raise ValueError("CIFAR warmup checkpoint must use best selection.")
+    if deployment_mode not in {"best", "last"}:
+        raise ValueError("CIFAR warmup checkpoint selection must be best or last.")
+    if deployment_mode != CONFIG.warmup.checkpoint_selection:
+        raise ValueError(
+            "Warmup checkpoint selection does not match config: "
+            f"{deployment_mode!r} != {CONFIG.warmup.checkpoint_selection!r}."
+        )
+    if deployment_mode == "last" and int(checkpoint["epoch"]) != CONFIG.warmup.epochs:
+        raise ValueError("Warmup last checkpoint must come from the configured final epoch.")
     model.load_state_dict(checkpoint["model"], strict=True)
     move_model_to_device(model, device)
     model.eval()
@@ -345,10 +403,11 @@ def _save_rl_checkpoints(
         "validation": validation_metrics,
         "training_augmentation": training_augmentation_metadata(),
         "training_data": training_data_metadata(),
-        "actor_update_samples": EXPECTED_SAMPLES,
+        "actor_update_mode": ACTOR_UPDATE_MODE,
+        "actor_update_samples": ACTOR_UPDATE_SAMPLES,
         "actor_microbatch_size": ACTOR_MICROBATCH_SIZE,
         "actor_microbatches_per_rl_step": math.ceil(
-            EXPECTED_SAMPLES / ACTOR_MICROBATCH_SIZE
+            ACTOR_UPDATE_SAMPLES / ACTOR_MICROBATCH_SIZE
         ),
         "actor_optimizer_steps_per_rl_step": 1,
         "remaining_horizon": USE_REMAINING_HORIZON,
@@ -473,7 +532,6 @@ def evaluate_correction_split(
     std: Tensor,
     timings: Timings,
 ) -> dict[str, object]:
-    timing_prefix = "val" if split == "val" else split
     synchronize(device)
     started = time.perf_counter()
     device_index = device.index if device.index is not None else 0
@@ -481,13 +539,13 @@ def evaluate_correction_split(
         torch.manual_seed(SEED)
         torch.cuda.manual_seed_all(SEED)
         embeddings = measure(
-            f"{timing_prefix}_features",
+            f"{split}_features",
             device,
             timings,
             lambda: extract_all_embeddings(model, raw_images, device, mean, std),
         )
         neighbors = measure(
-            f"{timing_prefix}_knn", device, timings, lambda: build_neighbor_indices(embeddings)
+            f"{split}_knn", device, timings, lambda: build_neighbor_indices(embeddings)
         )
         clean_labels = clean_labels_cpu.to(device, non_blocking=True)
         initial_noisy_labels = noisy_labels_cpu.to(device, non_blocking=True)
@@ -496,7 +554,7 @@ def evaluate_correction_split(
         action_count = torch.zeros((), dtype=torch.long, device=device)
         for evaluation_step in range(1, TRAJECTORY_LENGTH + 1):
             correction = measure(
-                f"{timing_prefix}_correction",
+                f"{split}_correction",
                 device,
                 timings,
                 lambda: policy.correct_all(embeddings, label_state, neighbors),
@@ -532,15 +590,18 @@ def print_configuration(device: torch.device, sample_count: int, actual_noise_ra
         f"actual_noise={actual_noise_rate:.2%} seed={SEED}"
     )
     print(
-        f"model={MODEL_NAME} warmup={CONFIG.warmup.epochs}epochs "
+        f"model={MODEL_NAME} warmup={CONFIG.warmup.epochs}epochs:"
+        f"{CONFIG.warmup.checkpoint_selection} "
         f"augmentation={TRAIN_AUGMENTATION_ENABLED} pretrained={PRETRAINED}"
     )
     print(
-        f"rl={RL_EPOCHS}x{TRAJECTORY_LENGTH} actor_update={sample_count} "
+        f"rl={RL_EPOCHS}x{TRAJECTORY_LENGTH} "
+        f"actor_update={ACTOR_UPDATE_MODE}:{ACTOR_UPDATE_SAMPLES} "
         f"microbatch={ACTOR_MICROBATCH_SIZE} "
-        f"microbatches={math.ceil(sample_count / ACTOR_MICROBATCH_SIZE)} "
+        f"query_microbatches={math.ceil(ACTOR_UPDATE_SAMPLES / ACTOR_MICROBATCH_SIZE)} "
         f"optimizer_steps_per_rl_step=1 actor_lr={ACTOR_LR} "
-        f"lr_decay={LR_DECAY_EPOCH}:{LR_DECAY_FACTOR}"
+        f"lr_decay={LR_DECAY_EPOCH}:{LR_DECAY_FACTOR} "
+        f"checkpoint_interval={CHECKPOINT_INTERVAL}"
     )
     critic_input = CRITIC_NUM_BINS + int(USE_REMAINING_HORIZON)
     print(
@@ -554,26 +615,7 @@ def print_configuration(device: torch.device, sample_count: int, actual_noise_ra
     )
 
 
-def main() -> None:
-    run_started = time.perf_counter()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG.rl_model_dir.mkdir(parents=True, exist_ok=True)
-    actor_best_checkpoint_path = CONFIG.actor_best_checkpoint_path
-    actor_last_checkpoint_path = CONFIG.actor_last_checkpoint_path
-    critic_best_checkpoint_path = CONFIG.critic_best_checkpoint_path
-    critic_last_checkpoint_path = CONFIG.critic_last_checkpoint_path
-    train_csv_path = OUTPUT_DIR / TRAIN_CSV_FILENAME
-    timing_csv_path = OUTPUT_DIR / TIMING_CSV_FILENAME
-    run_summary_path = OUTPUT_DIR / RUN_SUMMARY_CSV_FILENAME
-    write_csv(train_csv_path, [], SUMMARY_FIELDS)
-
-    device = resolve_local_device()
-    seed_everything(SEED)
-    torch.backends.cudnn.benchmark = CONFIG.runtime.cudnn_benchmark
-    torch.cuda.reset_peak_memory_stats()
-    timings: Timings = {}
-    print(f"output_dir={OUTPUT_DIR}")
-
+def load_rl_data(device: torch.device, timings: Timings) -> RLData:
     raw_images, clean_labels_cpu = measure(
         "data_load", device, timings, load_selected_cifar10_train
     )
@@ -589,31 +631,29 @@ def main() -> None:
         timings,
         lambda: inject_configured_noise(val_images, val_clean_labels, seed=SEED),
     )
-    actual_noise_rate = float(noise_mask_cpu.float().mean())
-    print_configuration(device, clean_labels_cpu.numel(), actual_noise_rate)
-    print(f"validation_samples={val_images.size(0)}")
-    model = measure(
-        "model_init",
-        device,
-        timings,
-        lambda: build_model(device=device),
-    )
-    mean, std = normalization_tensors(device)
-    measure(
-        "gpu_warmup",
-        device,
-        timings,
-        lambda: warm_device_kernels(
-            model, raw_images, device, mean, std, update_batch_size=ACTOR_MICROBATCH_SIZE
-        ),
+    return RLData(
+        raw_images=raw_images,
+        clean_labels_cpu=clean_labels_cpu,
+        noisy_labels_cpu=noisy_labels_cpu,
+        noise_mask_cpu=noise_mask_cpu,
+        val_images=val_images,
+        val_clean_labels=val_clean_labels,
+        val_noisy_labels=val_noisy_labels,
+        val_noise_mask=val_noise_mask,
+        clean_labels=clean_labels_cpu.to(device, non_blocking=True),
+        initial_noisy_labels=noisy_labels_cpu.to(device, non_blocking=True),
+        noise_mask=noise_mask_cpu.to(device, non_blocking=True),
     )
 
-    warmup_result = measure(
-        "warmup_load",
-        device,
-        timings,
-        lambda: load_warmup_checkpoint(model, WARMUP_CHECKPOINT_PATH, device),
-    )
+
+def build_rl_components(
+    model: nn.Module,
+    raw_images: Tensor,
+    device: torch.device,
+    mean: Tensor,
+    std: Tensor,
+    timings: Timings,
+) -> RLComponents:
     policy = LabelCorrectionPolicy(TEMPERATURE, CORRECTION_CHUNK_SIZE).to(device)
     reward_function = RLNLCReward(
         nla_weight=NLA_WEIGHT,
@@ -649,7 +689,6 @@ def main() -> None:
         if CRITIC_LR_DECAY
         else None
     )
-    scaler = build_grad_scaler()
     fixed_embeddings = measure(
         "reward_features",
         device,
@@ -659,10 +698,275 @@ def main() -> None:
     global_neighbors, global_cosines = measure(
         "reward_knn", device, timings, lambda: build_global_graph(fixed_embeddings)
     )
+    return RLComponents(
+        model=model,
+        policy=policy,
+        reward_function=reward_function,
+        critic=critic,
+        critic_optimizer=critic_optimizer,
+        actor_optimizer=actor_optimizer,
+        actor_scheduler=actor_scheduler,
+        critic_scheduler=critic_scheduler,
+        scaler=build_grad_scaler(),
+        mean=mean,
+        std=std,
+        fixed_embeddings=fixed_embeddings,
+        global_neighbors=global_neighbors,
+        global_cosines=global_cosines,
+    )
 
-    clean_labels = clean_labels_cpu.to(device, non_blocking=True)
-    initial_noisy_labels = noisy_labels_cpu.to(device, non_blocking=True)
-    noise_mask = noise_mask_cpu.to(device, non_blocking=True)
+
+def run_training_trajectory(
+    epoch: int,
+    data: RLData,
+    components: RLComponents,
+    device: torch.device,
+    timings: Timings,
+) -> TrajectoryResult:
+    label_state, _ = measure(
+        "state_randomize",
+        device,
+        timings,
+        lambda: initialize_randomized_label_state(
+            data.initial_noisy_labels,
+            num_classes=NUM_CLASSES,
+            randomization_rate=CONFIG.rl.initial_state_randomization_rate,
+            epoch=epoch,
+        ),
+        step=epoch,
+    )
+    previous_encoding: Tensor | None = None
+    previous_reward: Tensor | None = None
+    action_count = 0
+    rewards: list[float] = []
+    actor_losses: list[float] = []
+    critic_losses: list[float] = []
+
+    for step in range(1, TRAJECTORY_LENGTH + 1):
+        global_step = (epoch - 1) * TRAJECTORY_LENGTH + step
+        policy_embeddings = measure(
+            "policy_features",
+            device,
+            timings,
+            lambda: extract_all_embeddings(
+                components.model,
+                data.raw_images,
+                device,
+                components.mean,
+                components.std,
+            ),
+            step=global_step,
+        )
+        policy_neighbors = measure(
+            "policy_knn",
+            device,
+            timings,
+            lambda: build_neighbor_indices(policy_embeddings),
+            step=global_step,
+        )
+        correction = measure(
+            "label_correction",
+            device,
+            timings,
+            lambda: correct_from_embeddings(
+                components.policy, policy_embeddings, label_state, policy_neighbors
+            ),
+            step=global_step,
+        )
+        reward_output = measure(
+            "reward",
+            device,
+            timings,
+            lambda: components.reward_function(
+                correction.corrected_labels,
+                correction.actions,
+                components.fixed_embeddings,
+                components.global_neighbors,
+                components.global_cosines,
+            ),
+            step=global_step,
+        )
+        encoding, q_value = measure(
+            "critic_encode",
+            device,
+            timings,
+            lambda: encode_state_action(
+                components.critic,
+                reward_output.per_sample_consistency,
+                (TRAJECTORY_LENGTH - step) / TRAJECTORY_LENGTH,
+            ),
+            step=global_step,
+        )
+        actor_queries = select_actor_queries(
+            EXPECTED_SAMPLES,
+            ACTOR_UPDATE_SAMPLES,
+            seed=SEED,
+            step=global_step,
+        )
+        actor_loss = measure(
+            "actor_update",
+            device,
+            timings,
+            lambda: update_actor(
+                components.model,
+                components.policy,
+                components.actor_optimizer,
+                components.scaler,
+                data.raw_images,
+                label_state,
+                policy_embeddings,
+                policy_neighbors,
+                correction.actions,
+                q_value,
+                device,
+                components.mean,
+                components.std,
+                microbatch_size=ACTOR_MICROBATCH_SIZE,
+                query_indices=actor_queries,
+                use_amp=USE_AMP,
+                amp_dtype=AMP_DTYPE,
+                preprocess=preprocess,
+                encode=encode,
+            ),
+            step=global_step,
+        )
+        del policy_embeddings, policy_neighbors
+
+        critic_update = None
+        if previous_encoding is not None and previous_reward is not None:
+            critic_update = measure(
+                "critic_update",
+                device,
+                timings,
+                lambda: update_critic(
+                    components.critic,
+                    components.critic_optimizer,
+                    previous_encoding,
+                    previous_reward,
+                    encoding,
+                    discount_factor=DISCOUNT_FACTOR,
+                ),
+                step=global_step,
+            )
+            critic_losses.append(critic_update.loss)
+
+        terminal_update = None
+        if USE_TERMINAL_CRITIC_UPDATE and step == TRAJECTORY_LENGTH:
+            terminal_update = measure(
+                "critic_update",
+                device,
+                timings,
+                lambda: update_critic(
+                    components.critic,
+                    components.critic_optimizer,
+                    encoding,
+                    reward_output.total_reward.detach(),
+                    None,
+                    discount_factor=DISCOUNT_FACTOR,
+                    terminal=True,
+                ),
+                step=global_step,
+            )
+            critic_losses.append(terminal_update.loss)
+
+        label_state = correction.corrected_labels
+        (
+            step_action_count_value,
+            reward_value,
+            clean_accuracy,
+            label_consistency_value,
+            noisy_alignment_value,
+            q_value_value,
+        ) = (
+            torch.stack(
+                (
+                    correction.actions.sum(),
+                    reward_output.total_reward.reshape(()),
+                    label_state.argmax(dim=1).eq(data.clean_labels).float().mean(),
+                    reward_output.label_consistency.reshape(()),
+                    reward_output.noisy_label_alignment.reshape(()),
+                    q_value.reshape(()),
+                )
+            )
+            .to(torch.float64)
+            .cpu()
+            .tolist()
+        )
+        log_reward_value = label_consistency_value + NLA_WEIGHT * noisy_alignment_value
+        step_action_count = int(step_action_count_value)
+        action_count += step_action_count
+        rewards.append(reward_value)
+        actor_losses.append(actor_loss)
+        td_log = "td=none" if critic_update is None else (
+            f"prev_q={critic_update.current_q:.6f} next_q={critic_update.next_q:.6f} "
+            f"td_target={critic_update.target:.6f} td_error={critic_update.error:.6f}"
+        )
+        terminal_log = "" if terminal_update is None else (
+            f" terminal_q={terminal_update.current_q:.6f} "
+            f"terminal_target={terminal_update.target:.6f} "
+            f"terminal_error={terminal_update.error:.6f}"
+        )
+        print(
+            f"[RL] e={epoch}/{RL_EPOCHS} s={step}/{TRAJECTORY_LENGTH} "
+            f"acc={clean_accuracy:.4f} reward={reward_value:.8e} "
+            f"lcr={label_consistency_value:.6f} nla={noisy_alignment_value:.6f} "
+            f"log_reward={log_reward_value:.6f} reward_zero={reward_value == 0.0} "
+            f"q={q_value_value:.6f} {td_log}{terminal_log} actor={actor_loss:.4f} "
+            f"action={step_action_count / EXPECTED_SAMPLES:.4f} "
+        )
+
+        if step < TRAJECTORY_LENGTH:
+            previous_encoding = encoding
+            previous_reward = reward_output.total_reward.detach()
+        del correction, reward_output
+
+    return TrajectoryResult(label_state, action_count, rewards, actor_losses, critic_losses)
+
+
+def main() -> None:
+    run_started = time.perf_counter()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG.rl_model_dir.mkdir(parents=True, exist_ok=True)
+    actor_best_checkpoint_path = CONFIG.actor_best_checkpoint_path
+    actor_last_checkpoint_path = CONFIG.actor_last_checkpoint_path
+    critic_best_checkpoint_path = CONFIG.critic_best_checkpoint_path
+    critic_last_checkpoint_path = CONFIG.critic_last_checkpoint_path
+    train_csv_path = OUTPUT_DIR / TRAIN_CSV_FILENAME
+    timing_csv_path = OUTPUT_DIR / TIMING_CSV_FILENAME
+    run_summary_path = OUTPUT_DIR / RUN_SUMMARY_CSV_FILENAME
+    write_csv(train_csv_path, [], SUMMARY_FIELDS)
+
+    device = initialize_cuda_runtime(SEED, reset_peak_memory=True)
+    timings: Timings = {}
+    print(f"output_dir={OUTPUT_DIR}")
+
+    data = load_rl_data(device, timings)
+    actual_noise_rate = float(data.noise_mask_cpu.float().mean())
+    print_configuration(device, data.clean_labels_cpu.numel(), actual_noise_rate)
+    print(f"validation_samples={data.val_images.size(0)}")
+    model = measure(
+        "model_init",
+        device,
+        timings,
+        lambda: build_model(device=device),
+    )
+    mean, std = normalization_tensors(device)
+    measure(
+        "gpu_warmup",
+        device,
+        timings,
+        lambda: warm_device_kernels(
+            model, data.raw_images, device, mean, std, update_batch_size=ACTOR_MICROBATCH_SIZE
+        ),
+    )
+
+    warmup_result = measure(
+        "warmup_load",
+        device,
+        timings,
+        lambda: load_warmup_checkpoint(model, WARMUP_CHECKPOINT_PATH, device),
+    )
+    components = build_rl_components(model, data.raw_images, device, mean, std, timings)
     epoch_seconds: list[float] = []
     best_rl_epoch = 0
     best_rl_key: tuple[float, float] | None = None
@@ -670,15 +974,15 @@ def main() -> None:
     epoch_zero_summary = evaluate_correction_split(
         split="val",
         epoch=0,
-        model=model,
-        policy=policy,
-        raw_images=val_images,
-        clean_labels_cpu=val_clean_labels,
-        noisy_labels_cpu=val_noisy_labels,
-        noise_mask_cpu=val_noise_mask,
+        model=components.model,
+        policy=components.policy,
+        raw_images=data.val_images,
+        clean_labels_cpu=data.val_clean_labels,
+        noisy_labels_cpu=data.val_noisy_labels,
+        noise_mask_cpu=data.val_noise_mask,
         device=device,
-        mean=mean,
-        std=std,
+        mean=components.mean,
+        std=components.std,
         timings=timings,
     )
     append_csv(train_csv_path, [epoch_zero_summary], SUMMARY_FIELDS)
@@ -692,223 +996,44 @@ def main() -> None:
     for epoch in range(1, RL_EPOCHS + 1):
         synchronize(device)
         epoch_started = time.perf_counter()
-        label_state, _ = measure(
-            "state_randomize",
-            device,
-            timings,
-            lambda current_epoch=epoch: initialize_randomized_label_state(
-                initial_noisy_labels,
-                num_classes=NUM_CLASSES,
-                randomization_rate=CONFIG.rl.initial_state_randomization_rate,
-                epoch=current_epoch,
-            ),
-            step=epoch,
-        )
-        previous_encoding: Tensor | None = None
-        previous_reward: Tensor | None = None
-        epoch_action_count = 0
-        epoch_rewards: list[float] = []
-        epoch_actor_losses: list[float] = []
-        epoch_critic_losses: list[float] = []
-        for step in range(1, TRAJECTORY_LENGTH + 1):
-            global_step = (epoch - 1) * TRAJECTORY_LENGTH + step
-            policy_embeddings = measure(
-                "policy_features",
-                device,
-                timings,
-                lambda: extract_all_embeddings(model, raw_images, device, mean, std),
-                step=global_step,
-            )
-            policy_neighbors = measure(
-                "policy_knn",
-                device,
-                timings,
-                lambda: build_neighbor_indices(policy_embeddings),
-                step=global_step,
-            )
-            correction = measure(
-                "label_correction",
-                device,
-                timings,
-                lambda: correct_from_embeddings(policy, policy_embeddings, label_state, policy_neighbors),
-                step=global_step,
-            )
-            reward_output = measure(
-                "reward",
-                device,
-                timings,
-                lambda: reward_function(
-                    correction.corrected_labels,
-                    correction.actions,
-                    fixed_embeddings,
-                    global_neighbors,
-                    global_cosines,
-                ),
-                step=global_step,
-            )
-
-            encoding, q_value = measure(
-                "critic_encode",
-                device,
-                timings,
-                lambda: encode_state_action(
-                    critic,
-                    reward_output.per_sample_consistency,
-                    (TRAJECTORY_LENGTH - step) / TRAJECTORY_LENGTH,
-                ),
-                step=global_step,
-            )
-            actor_loss = measure(
-                "actor_update",
-                device,
-                timings,
-                lambda: update_actor(
-                    model,
-                    policy,
-                    actor_optimizer,
-                    scaler,
-                    raw_images,
-                    label_state,
-                    policy_embeddings,
-                    policy_neighbors,
-                    correction.actions,
-                    q_value,
-                    device,
-                    mean,
-                    std,
-                    microbatch_size=ACTOR_MICROBATCH_SIZE,
-                    use_amp=USE_AMP,
-                    amp_dtype=AMP_DTYPE,
-                    preprocess=preprocess,
-                    encode=encode,
-                ),
-                step=global_step,
-            )
-            del policy_embeddings, policy_neighbors
-
-            critic_update = None
-            if previous_encoding is not None and previous_reward is not None:
-                critic_update = measure(
-                    "critic_update",
-                    device,
-                    timings,
-                    lambda: update_critic(
-                        critic,
-                        critic_optimizer,
-                        previous_encoding,
-                        previous_reward,
-                        encoding,
-                        discount_factor=DISCOUNT_FACTOR,
-                    ),
-                    step=global_step,
-                )
-                epoch_critic_losses.append(critic_update.loss)
-
-            terminal_update = None
-            if USE_TERMINAL_CRITIC_UPDATE and step == TRAJECTORY_LENGTH:
-                terminal_update = measure(
-                    "critic_update",
-                    device,
-                    timings,
-                    lambda: update_critic(
-                        critic,
-                        critic_optimizer,
-                        encoding,
-                        reward_output.total_reward.detach(),
-                        None,
-                        discount_factor=DISCOUNT_FACTOR,
-                        terminal=True,
-                    ),
-                    step=global_step,
-                )
-                epoch_critic_losses.append(terminal_update.loss)
-
-            label_state = correction.corrected_labels
-            (
-                step_action_count_value,
-                reward_value,
-                clean_accuracy,
-                label_consistency_value,
-                noisy_alignment_value,
-                q_value_value,
-            ) = (
-                torch.stack(
-                    (
-                        correction.actions.sum(),
-                        reward_output.total_reward.reshape(()),
-                        label_state.argmax(dim=1).eq(clean_labels).float().mean(),
-                        reward_output.label_consistency.reshape(()),
-                        reward_output.noisy_label_alignment.reshape(()),
-                        q_value.reshape(()),
-                    )
-                )
-                .to(torch.float64)
-                .cpu()
-                .tolist()
-            )
-            log_reward_value = label_consistency_value + NLA_WEIGHT * noisy_alignment_value
-            step_action_count = int(step_action_count_value)
-            epoch_action_count += step_action_count
-            epoch_rewards.append(reward_value)
-            epoch_actor_losses.append(actor_loss)
-            td_log = "td=none" if critic_update is None else (
-                f"prev_q={critic_update.current_q:.6f} next_q={critic_update.next_q:.6f} "
-                f"td_target={critic_update.target:.6f} td_error={critic_update.error:.6f}"
-            )
-            terminal_log = "" if terminal_update is None else (
-                f" terminal_q={terminal_update.current_q:.6f} "
-                f"terminal_target={terminal_update.target:.6f} "
-                f"terminal_error={terminal_update.error:.6f}"
-            )
-            print(
-                f"[RL] e={epoch}/{RL_EPOCHS} s={step}/{TRAJECTORY_LENGTH} "
-                f"acc={clean_accuracy:.4f} reward={reward_value:.8e} "
-                f"lcr={label_consistency_value:.6f} nla={noisy_alignment_value:.6f} "
-                f"log_reward={log_reward_value:.6f} reward_zero={reward_value == 0.0} "
-                f"q={q_value_value:.6f} {td_log}{terminal_log} actor={actor_loss:.4f} "
-                f"action={step_action_count / EXPECTED_SAMPLES:.4f} "
-            )
-
-            if step < TRAJECTORY_LENGTH:
-                previous_encoding = encoding
-                previous_reward = reward_output.total_reward.detach()
-            del correction, reward_output
-
+        trajectory = run_training_trajectory(epoch, data, components, device, timings)
         synchronize(device)
         train_elapsed = time.perf_counter() - epoch_started
         epoch_seconds.append(train_elapsed)
-        actor_scheduler.step()
-        if critic_scheduler is not None:
-            critic_scheduler.step()
+        components.actor_scheduler.step()
+        if components.critic_scheduler is not None:
+            components.critic_scheduler.step()
         mean_critic_loss = (
-            sum(epoch_critic_losses) / len(epoch_critic_losses) if epoch_critic_losses else None
+            sum(trajectory.critic_losses) / len(trajectory.critic_losses)
+            if trajectory.critic_losses
+            else None
         )
         train_summary = correction_summary(
-            label_state,
-            clean_labels,
-            initial_noisy_labels,
-            noise_mask,
+            trajectory.label_state,
+            data.clean_labels,
+            data.initial_noisy_labels,
+            data.noise_mask,
             num_classes=NUM_CLASSES,
             epoch=epoch,
             split="train",
-            action_rate=epoch_action_count / (EXPECTED_SAMPLES * TRAJECTORY_LENGTH),
-            reward=sum(epoch_rewards) / len(epoch_rewards),
-            actor_loss=sum(epoch_actor_losses) / len(epoch_actor_losses),
+            action_rate=trajectory.action_count / (EXPECTED_SAMPLES * TRAJECTORY_LENGTH),
+            reward=sum(trajectory.rewards) / len(trajectory.rewards),
+            actor_loss=sum(trajectory.actor_losses) / len(trajectory.actor_losses),
             critic_loss=mean_critic_loss,
             seconds=train_elapsed,
         )
         val_summary = evaluate_correction_split(
             split="val",
             epoch=epoch,
-            model=model,
-            policy=policy,
-            raw_images=val_images,
-            clean_labels_cpu=val_clean_labels,
-            noisy_labels_cpu=val_noisy_labels,
-            noise_mask_cpu=val_noise_mask,
+            model=components.model,
+            policy=components.policy,
+            raw_images=data.val_images,
+            clean_labels_cpu=data.val_clean_labels,
+            noisy_labels_cpu=data.val_noisy_labels,
+            noise_mask_cpu=data.val_noise_mask,
             device=device,
-            mean=mean,
-            std=std,
+            mean=components.mean,
+            std=components.std,
             timings=timings,
         )
         append_csv(train_csv_path, [train_summary, val_summary], SUMMARY_FIELDS)
@@ -918,8 +1043,8 @@ def main() -> None:
                 actor_path,
                 critic_path,
                 epoch=epoch,
-                model=model,
-                critic=critic,
+                model=components.model,
+                critic=components.critic,
                 validation_summary=val_summary,
             )
 
@@ -930,6 +1055,20 @@ def main() -> None:
             lambda: save_epoch_checkpoints(actor_last_checkpoint_path, critic_last_checkpoint_path),
             step=epoch,
         )
+        if epoch % CHECKPOINT_INTERVAL == 0:
+            periodic_actor_path = CONFIG.actor_epoch_checkpoint_path(epoch)
+            periodic_critic_path = CONFIG.critic_epoch_checkpoint_path(epoch)
+            measure(
+                "periodic_save",
+                device,
+                timings,
+                lambda: save_epoch_checkpoints(periodic_actor_path, periodic_critic_path),
+                step=epoch,
+            )
+            print(
+                f"[RL CHECKPOINT] epoch={epoch} "
+                f"actor={periodic_actor_path.name} critic={periodic_critic_path.name}"
+            )
         validation_key = _rl_selection_key(val_summary)
         if best_rl_key is None or validation_key > best_rl_key:
             measure(
@@ -977,17 +1116,22 @@ def main() -> None:
                     CONFIG.data.idn_flip_rate_std if NOISE_TYPE == "idn" else ""
                 ),
                 "seed": SEED,
-                "actor_update_samples": EXPECTED_SAMPLES,
+                "actor_update_mode": ACTOR_UPDATE_MODE,
+                "actor_update_samples": ACTOR_UPDATE_SAMPLES,
                 "actor_microbatch_size": ACTOR_MICROBATCH_SIZE,
                 "actor_microbatches_per_rl_step": math.ceil(
-                    EXPECTED_SAMPLES / ACTOR_MICROBATCH_SIZE
+                    ACTOR_UPDATE_SAMPLES / ACTOR_MICROBATCH_SIZE
                 ),
                 "actor_optimizer_steps_per_rl_step": 1,
                 "remaining_horizon": USE_REMAINING_HORIZON,
                 "terminal_update": USE_TERMINAL_CRITIC_UPDATE,
-                "warmup_epoch": warmup_result["best_epoch"],
+                "warmup_selection": warmup_result["deployment_mode"],
+                "warmup_epoch": warmup_result["deployment_epoch"],
+                "warmup_best_epoch": warmup_result["best_epoch"],
                 "epochs": RL_EPOCHS,
                 "steps": TRAJECTORY_LENGTH,
+                "checkpoint_interval": CHECKPOINT_INTERVAL,
+                "periodic_checkpoint_epochs": ",".join(map(str, CONFIG.rl_checkpoint_epochs)),
                 "k": K,
                 "actor_lr": ACTOR_LR,
                 "critic_optimizer": CRITIC_OPTIMIZER,

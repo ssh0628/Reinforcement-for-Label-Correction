@@ -5,9 +5,9 @@ from __future__ import annotations
 import csv
 import sys
 import time
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Callable, TextIO, TypeVar
+from typing import Callable, Iterator, TextIO, TypeVar
 
 import numpy as np
 import torch
@@ -43,17 +43,23 @@ def run_with_log(log_path: Path, operation: Callable[[], None]) -> None:
             operation()
 
 
-def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: tuple[str, ...]) -> None:
+@contextmanager
+def atomic_path(path: Path) -> Iterator[Path]:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     try:
+        yield temporary_path
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: tuple[str, ...]) -> None:
+    with atomic_path(path) as temporary_path:
         with temporary_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
-        temporary_path.replace(path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
 
 
 def append_csv(path: Path, rows: list[dict[str, object]], fieldnames: tuple[str, ...]) -> None:
@@ -67,24 +73,14 @@ def append_csv(path: Path, rows: list[dict[str, object]], fieldnames: tuple[str,
 
 
 def save_torch(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-    try:
+    with atomic_path(path) as temporary_path:
         torch.save(payload, temporary_path)
-        temporary_path.replace(path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
 
 
 def save_numpy(path: Path, array: np.ndarray) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-    try:
+    with atomic_path(path) as temporary_path:
         with temporary_path.open("wb") as handle:
             np.save(handle, array, allow_pickle=False)
-        temporary_path.replace(path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
 
 
 def measure(

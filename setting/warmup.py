@@ -92,6 +92,11 @@ def save_checkpoint(
     epoch: int,
     noisy_accuracy: float,
     clean_accuracy: float,
+    *,
+    selection: str,
+    best_epoch: int,
+    best_noisy_accuracy: float,
+    best_clean_accuracy: float,
 ) -> None:
     save_torch(
         path,
@@ -107,10 +112,10 @@ def save_checkpoint(
             "warmup_model_id": WARMUP.model_id,
             "training_data": engine.training_data_metadata(),
             "training_augmentation": engine.training_augmentation_metadata(),
-            "selection": "best",
-            "best_epoch": epoch,
-            "best_noisy_validation_accuracy": noisy_accuracy,
-            "best_clean_validation_accuracy": clean_accuracy,
+            "selection": selection,
+            "best_epoch": best_epoch,
+            "best_noisy_validation_accuracy": best_noisy_accuracy,
+            "best_clean_validation_accuracy": best_clean_accuracy,
         },
     )
 
@@ -193,28 +198,58 @@ def train_warmup(
             best_noisy_accuracy = noisy_accuracy
             best_clean_accuracy = float(validation["clean_accuracy"])
             best_epoch = epoch
-            save_checkpoint(model, WARMUP_CHECKPOINT_PATH, epoch, best_noisy_accuracy, best_clean_accuracy)
+            if WARMUP.checkpoint_selection == "best":
+                save_checkpoint(
+                    model,
+                    WARMUP_CHECKPOINT_PATH,
+                    epoch,
+                    best_noisy_accuracy,
+                    best_clean_accuracy,
+                    selection="best",
+                    best_epoch=best_epoch,
+                    best_noisy_accuracy=best_noisy_accuracy,
+                    best_clean_accuracy=best_clean_accuracy,
+                )
         scheduler.step()
+
+    if WARMUP.checkpoint_selection == "last":
+        save_checkpoint(
+            model,
+            WARMUP_CHECKPOINT_PATH,
+            WARMUP.epochs,
+            float(validation["noisy_accuracy"]),
+            float(validation["clean_accuracy"]),
+            selection="last",
+            best_epoch=best_epoch,
+            best_noisy_accuracy=best_noisy_accuracy,
+            best_clean_accuracy=best_clean_accuracy,
+        )
 
     checkpoint = torch.load(WARMUP_CHECKPOINT_PATH, map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device).eval()
     deployed_epoch = int(checkpoint["epoch"])
+    deployment_mode = str(checkpoint["selection"])
+    deployed_noisy_accuracy = float(checkpoint["noisy_validation_accuracy"])
+    deployed_clean_accuracy = float(checkpoint["clean_validation_accuracy"])
     print(
-        f"[WARMUP] deployment=best deployment_epoch={deployed_epoch} best_epoch={best_epoch} "
-        f"val_noisy_acc={best_noisy_accuracy:.4f} val_clean_acc={best_clean_accuracy:.4f}"
+        f"[WARMUP] deployment={deployment_mode} deployment_epoch={deployed_epoch} "
+        f"best_epoch={best_epoch} val_noisy_acc={deployed_noisy_accuracy:.4f} "
+        f"val_clean_acc={deployed_clean_accuracy:.4f}"
     )
-    if best_noisy_accuracy < WARMUP.min_noisy_validation_accuracy:
+    if deployed_noisy_accuracy < WARMUP.min_noisy_validation_accuracy:
         raise RuntimeError(
             "Warmup quality is too low to build a semantic RL reward graph: "
-            f"{best_noisy_accuracy:.4f} < {WARMUP.min_noisy_validation_accuracy:.4f}."
+            f"{deployed_noisy_accuracy:.4f} < {WARMUP.min_noisy_validation_accuracy:.4f}."
         )
     return {
         "best_epoch": best_epoch,
         "best_noisy_validation_accuracy": best_noisy_accuracy,
         "best_clean_validation_accuracy": best_clean_accuracy,
-        "deployment_mode": "best",
+        "deployment_mode": deployment_mode,
         "deployment_epoch": deployed_epoch,
+        "deployment_noisy_validation_accuracy": deployed_noisy_accuracy,
+        "deployment_clean_validation_accuracy": deployed_clean_accuracy,
     }
 
 
@@ -222,10 +257,7 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     WARMUP_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    device = engine.resolve_local_device()
-    engine.seed_everything(cifar.SEED)
-    torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
-    torch.cuda.reset_peak_memory_stats()
+    device = engine.initialize_cuda_runtime(cifar.SEED, reset_peak_memory=True)
     timings: Timings = {}
 
     raw_images, clean_labels = measure("data_load", device, timings, cifar.load_selected_cifar10_train)
@@ -279,8 +311,10 @@ def main() -> None:
     write_csv(TIMING_CSV_PATH, build_timing_rows(timings), TIMING_FIELDS)
     print_timing_summary(timings)
     print(
-        f"[RESULT] best_epoch={result['best_epoch']} "
-        f"val_acc={float(result['best_noisy_validation_accuracy']):.4f}"
+        f"[RESULT] deployment={result['deployment_mode']} "
+        f"deployment_epoch={result['deployment_epoch']} "
+        f"val_acc={float(result['deployment_noisy_validation_accuracy']):.4f} "
+        f"best_epoch={result['best_epoch']}"
     )
 
 
@@ -292,7 +326,3 @@ def run_with_file_logging() -> None:
         stage="Warmup",
     )
     run_with_log(RUN_LOG_PATH, main)
-
-
-if __name__ == "__main__":
-    run_with_file_logging()

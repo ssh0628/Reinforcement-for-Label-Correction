@@ -74,10 +74,7 @@ def weighted_knn_labels(
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    device = engine.resolve_local_device()
-    engine.seed_everything(cifar.SEED)
-    torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
-    torch.cuda.reset_peak_memory_stats()
+    device = engine.initialize_cuda_runtime(cifar.SEED, reset_peak_memory=True)
     timings: Timings = {}
     started = time.perf_counter()
 

@@ -46,8 +46,6 @@ RUN_SUMMARY_FIELDS = (
     "actor_epoch",
     "steps",
     "noisy_accuracy",
-    "best_step",
-    "best_accuracy",
     "final_accuracy",
     "correction_rate",
     "correction_precision",
@@ -60,8 +58,6 @@ RUN_SUMMARY_FIELDS = (
 
 CLEANING_FIELDS = ("step", "action_rate", "changed_rate", "accuracy")
 CLEANING_SUMMARY_FIELDS = (
-    "best_step",
-    "best_accuracy",
     "final_accuracy",
     "correction_rate",
     "correction_precision",
@@ -167,17 +163,13 @@ def run_correction(
     validate_soft_labels(label_state, clean.numel(), engine.NUM_CLASSES)
     save_numpy(CORRECTED_LABELS_PATH, label_state.detach().float().cpu().numpy())
 
-    best = max(history, key=lambda row: float(row["accuracy"]))
-    summary.update(best_step=int(best["step"]), best_accuracy=float(best["accuracy"]))
     write_csv(CLEANING_CSV_PATH, history, CLEANING_FIELDS)
     write_csv(
         CLEANING_SUMMARY_PATH,
         [
             {
-                "best_step": summary["best_step"],
-                "best_accuracy": summary["best_accuracy"],
                 "final_accuracy": summary["accuracy"],
-                **{field: summary[field] for field in CLEANING_SUMMARY_FIELDS[3:]},
+                **{field: summary[field] for field in CLEANING_SUMMARY_FIELDS[1:]},
             }
         ],
         CLEANING_SUMMARY_FIELDS,
@@ -189,10 +181,7 @@ def run_correction(
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    device = engine.resolve_local_device()
-    engine.seed_everything(cifar.SEED)
-    torch.backends.cudnn.benchmark = engine.CUDNN_BENCHMARK
-    torch.cuda.reset_peak_memory_stats()
+    device = engine.initialize_cuda_runtime(cifar.SEED, reset_peak_memory=True)
     timings: Timings = {}
 
     raw_images, clean_labels = measure("data_load", device, timings, cifar.load_selected_cifar10_train)
@@ -251,8 +240,6 @@ def main() -> None:
                 "actor_epoch": actor_epoch,
                 "steps": TRAJECTORY_LENGTH,
                 "noisy_accuracy": initial_accuracy,
-                "best_step": summary["best_step"],
-                "best_accuracy": summary["best_accuracy"],
                 "final_accuracy": summary["accuracy"],
                 "correction_rate": summary["correction_rate"],
                 "correction_precision": summary["correction_precision"],
@@ -266,11 +253,7 @@ def main() -> None:
         RUN_SUMMARY_FIELDS,
     )
     print_timing_summary(timings)
-    print(
-        f"[RESULT] best_step={summary['best_step']} "
-        f"best_accuracy={float(summary['best_accuracy']):.6f} "
-        f"final_accuracy={float(summary['accuracy']):.6f}"
-    )
+    print(f"[RESULT] final_accuracy={float(summary['accuracy']):.6f}")
     print(f"output={OUTPUT_DIR}")
     print("next=cifar_finetuning.py")
 
@@ -279,7 +262,3 @@ def run_with_file_logging() -> None:
     cifar.require_files((ACTOR_CHECKPOINT_PATH, *cifar.NOISE_ARTIFACT_PATHS), stage="Correction")
     cifar.require_available_outputs(OUTPUT_PATHS, overwrite=OVERWRITE, stage="Correction")
     run_with_log(RUN_LOG_PATH, main)
-
-
-if __name__ == "__main__":
-    run_with_file_logging()

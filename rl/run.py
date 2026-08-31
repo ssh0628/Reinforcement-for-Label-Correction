@@ -24,6 +24,7 @@ RL_OUTPUT_PATHS = (
     CONFIG.actor_last_checkpoint_path,
     CONFIG.critic_best_checkpoint_path,
     CONFIG.critic_last_checkpoint_path,
+    *CONFIG.rl_periodic_checkpoint_paths,
 )
 
 
@@ -31,7 +32,3 @@ def main() -> None:
     cifar.require_files((*cifar.NOISE_ARTIFACT_PATHS, cifar.WARMUP_CHECKPOINT_PATH), stage="RL")
     cifar.require_available_outputs(RL_OUTPUT_PATHS, overwrite=CONFIG.runtime.overwrite_rl, stage="RL")
     run_with_file_logging()
-
-
-if __name__ == "__main__":
-    main()

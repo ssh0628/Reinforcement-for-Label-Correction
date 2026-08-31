@@ -1,6 +1,7 @@
 """CIFAR-10 RLNLC experiment configuration."""
 
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 
@@ -32,14 +33,15 @@ class ModelConfig:
 
 @dataclass(frozen=True, slots=True)
 class TrainingAugmentationConfig:
-    enabled: bool = False
-    random_crop_padding: int = 0  # CIFAR 표준값; 0이면 crop 증강 제거
-    horizontal_flip_probability: float = 0  # 0.0~1.0
+    enabled: bool = True
+    random_crop_padding: int = 4  # CIFAR 표준값; 0이면 crop 증강 제거
+    horizontal_flip_probability: float = 0.5  # 0.0~1.0
 
 
 @dataclass(frozen=True, slots=True)
 class WarmupConfig:
-    model_id: str = "exp12_warmup"
+    model_id: str = "exp15_warmup"
+    checkpoint_selection: str = "best"  # "best" 또는 논문 해석용 "last"
     epochs: int = 50  # warm-up 학습 길이
     batch_size: int = 128  # 학습 hyperparameter; 변경 시 LR과 함께 재검토, 1_024, 128
     eval_batch_size: int = 4_096  # H100 93GB 평가 전용값; 성능에는 영향 없음
@@ -63,13 +65,15 @@ class KNNConfig:
 
 @dataclass(frozen=True, slots=True)
 class RLConfig:
-    epochs: int = 500  # 빠른 검증 100, 중간 200, 최종 재현 500
+    epochs: int = 100  # 128-query Actor update의 빠른 검증; 최종 재현은 500
+    checkpoint_interval: int = 50  # 전체 epoch 수와 무관하게 Actor/Critic을 저장할 주기
     trajectory_length: int = 10  # 한 epoch의 label-correction step 수
     initial_state_randomization_rate: float = 0.10  # 매 trajectory 초기 라벨 교란 비율
     feature_batch_size: int = 16_384  # H100 93GB inference feature batch
-    actor_microbatch_size: int = 4_096  # H100 93GB 전체 gradient 누적용 메모리 배치
+    actor_samples_per_optimizer_step: int = 128  # 매 RL step에서 Actor mean gradient를 추정할 query 수
+    actor_microbatch_size: int = 4_096  # 선택 query와 이웃의 역전파를 나누는 메모리 배치
     use_remaining_horizon: bool = False
-    use_terminal_critic_update: bool = False
+    use_terminal_critic_update: bool = True
 
     actor_optimizer: str = "sgd"
     actor_learning_rate: float = 1e-2  # SGD 후보: 1e-3, 3e-3, 1e-2
@@ -86,7 +90,7 @@ class RLConfig:
 
     discount_factor: float = 0.9  # TD discount gamma: 0.0~1.0
     reward_nla_weight: float = 0.5  # log_reward에서 NLA 항의 가중치
-    lr_decay_epoch: int = 250  # 총 epoch와 무관한 SGD Actor/Critic LR 감소 epoch
+    lr_decay_epoch: int = 100  # 마지막 update 이후 감소하므로 100-epoch ablation에는 영향 없음
     lr_decay_factor: float = 0.1  # SGD LR 감소 배율; Adam Critic에는 미적용
 
     @property
@@ -114,7 +118,7 @@ class KNNQualityConfig:
 class FineTuneConfig:
     corrected_label_source: str = "rl"
     initialization: str = "last_actor"
-    evaluation_checkpoint: str = "last"
+    evaluation_checkpoint: str = "accuracy"
     epochs: int = 100  # corrected label fine-tuning 길이
     batch_size: int = 128  # 학습 hyperparameter; 변경 시 LR과 함께 재검토 1_024, 128
     optimizer: str = "sgd"
@@ -128,8 +132,8 @@ class FineTuneConfig:
 @dataclass(frozen=True, slots=True)
 class OutputConfig:
     root: Path = PROJECT_ROOT / "cifar_output"
-    experiment_name: str = "exp13"
-    warmup_experiment_name: str = "exp13"
+    experiment_name: str = "exp18"
+    warmup_experiment_name: str = "exp15"
     warmup_checkpoint_name: str = "warmup.pt"
     actor_best_checkpoint_name: str = "actor_best.pt"
     actor_last_checkpoint_name: str = "actor_last.pt"
@@ -222,6 +226,14 @@ class CIFARConfig:
         return min(self.knn_quality.visualization_samples, self.data.train_samples)
 
     @property
+    def actor_update_samples(self) -> int:
+        return self.rl.actor_samples_per_optimizer_step
+
+    @property
+    def actor_update_mode(self) -> str:
+        return "full" if self.actor_update_samples == self.data.train_samples else "sampled"
+
+    @property
     def log_output_dir(self) -> Path:
         return self.experiment_output_dir / "logs"
 
@@ -248,6 +260,28 @@ class CIFARConfig:
     @property
     def critic_last_checkpoint_path(self) -> Path:
         return self.rl_model_dir / self.output.critic_last_checkpoint_name
+
+    def actor_epoch_checkpoint_path(self, epoch: int) -> Path:
+        return self.rl_model_dir / f"actor_epoch_{epoch:04d}.pt"
+
+    def critic_epoch_checkpoint_path(self, epoch: int) -> Path:
+        return self.rl_model_dir / f"critic_epoch_{epoch:04d}.pt"
+
+    @property
+    def rl_checkpoint_epochs(self) -> tuple[int, ...]:
+        interval = self.rl.checkpoint_interval
+        return tuple(range(interval, self.rl.epochs + 1, interval))
+
+    @property
+    def rl_periodic_checkpoint_paths(self) -> tuple[Path, ...]:
+        return tuple(
+            path
+            for epoch in self.rl_checkpoint_epochs
+            for path in (
+                self.actor_epoch_checkpoint_path(epoch),
+                self.critic_epoch_checkpoint_path(epoch),
+            )
+        )
 
     @property
     def correction_actor_checkpoint_path(self) -> Path:
@@ -282,7 +316,9 @@ class CIFARConfig:
 
     @property
     def finetune_source_output_dir(self) -> Path:
-        return self.experiment_output_dir if self.finetune.corrected_label_source == "rl" else self.knn_output_dir
+        if self.finetune.corrected_label_source == "rl":
+            return self.experiment_output_dir
+        return self.knn_output_dir
 
     @property
     def finetune_initial_checkpoint_path(self) -> Path:
@@ -336,6 +372,8 @@ class CIFARConfig:
             raise ValueError("CIFAR warm-up, actor, and fine-tuning optimizers must be SGD.")
         if self.rl.critic_optimizer not in {"sgd", "adam"}:
             raise ValueError("critic_optimizer must be 'sgd' or 'adam'.")
+        if self.warmup.checkpoint_selection not in {"best", "last"}:
+            raise ValueError("warmup.checkpoint_selection must be 'best' or 'last'.")
         if self.data.classes != tuple(range(10)):
             raise ValueError("CIFAR-10 classes must be 0 through 9.")
         if not 0 < self.data.train_samples <= 50_000 or self.data.train_samples % 10:
@@ -346,8 +384,12 @@ class CIFARConfig:
             raise ValueError("noise_type must be 'symmetric' or 'idn'.")
         if self.data.idn_flip_rate_std <= 0:
             raise ValueError("idn_flip_rate_std must be positive.")
+        if not 0 < self.rl.actor_samples_per_optimizer_step <= self.data.train_samples:
+            raise ValueError("actor_samples_per_optimizer_step must be in [1, train_samples].")
         if not 0 < self.rl.actor_microbatch_size <= self.data.train_samples:
             raise ValueError("actor_microbatch_size must be in [1, train_samples].")
+        if self.rl.checkpoint_interval <= 0:
+            raise ValueError("rl.checkpoint_interval must be positive.")
         if self.finetune.initialization not in {"warmup", "best_actor", "last_actor"}:
             raise ValueError("Invalid fine-tuning initialization.")
         if self.finetune.corrected_label_source not in {"rl", "knn"}:
@@ -376,7 +418,6 @@ class CIFARConfig:
             self.rl.epochs,
             self.rl.trajectory_length,
             self.rl.feature_batch_size,
-            self.rl.actor_microbatch_size,
             self.correction.trajectory_length,
             self.knn_quality.visualization_samples,
             self.knn_quality.pca_dimensions,
@@ -405,5 +446,38 @@ class CIFARConfig:
             raise ValueError("UMAP min_dist must be in [0, 1].")
 
 
-CONFIG = CIFARConfig()
+def build_config() -> CIFARConfig:
+    config = CIFARConfig()
+    experiment_name = os.environ.get("RLNLC_EXPERIMENT_NAME")
+    rl_epochs = os.environ.get("RLNLC_RL_EPOCHS")
+    terminal_update = os.environ.get("RLNLC_TERMINAL_UPDATE")
+    remaining_horizon = os.environ.get("RLNLC_REMAINING_HORIZON")
+    if experiment_name:
+        config = replace(config, output=replace(config.output, experiment_name=experiment_name))
+    if rl_epochs is not None:
+        try:
+            parsed_rl_epochs = int(rl_epochs)
+        except ValueError as error:
+            raise ValueError("RLNLC_RL_EPOCHS must be a positive integer.") from error
+        if parsed_rl_epochs <= 0:
+            raise ValueError("RLNLC_RL_EPOCHS must be a positive integer.")
+        config = replace(config, rl=replace(config.rl, epochs=parsed_rl_epochs))
+    if terminal_update is not None:
+        if terminal_update not in {"0", "1"}:
+            raise ValueError("RLNLC_TERMINAL_UPDATE must be 0 or 1.")
+        config = replace(
+            config,
+            rl=replace(config.rl, use_terminal_critic_update=terminal_update == "1"),
+        )
+    if remaining_horizon is not None:
+        if remaining_horizon not in {"0", "1"}:
+            raise ValueError("RLNLC_REMAINING_HORIZON must be 0 or 1.")
+        config = replace(
+            config,
+            rl=replace(config.rl, use_remaining_horizon=remaining_horizon == "1"),
+        )
+    return config
+
+
+CONFIG = build_config()
 CONFIG.validate()

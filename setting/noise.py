@@ -7,10 +7,10 @@ independently.
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 from torchvision.datasets import CIFAR10
 
+from log.common import save_numpy
 from setting import data as cifar
 
 
@@ -44,14 +44,9 @@ def main() -> None:
         noise_mask = full_noise_mask[training_indices].contiguous()
     else:
         noisy_labels, noise_mask = cifar.inject_stratified_symmetric_noise(clean_labels, seed=SEED)
-    indices_array = training_indices.numpy().astype(np.int64, copy=False)
-    noisy_array = noisy_labels.numpy().astype(np.int64, copy=False)
-    mask_array = noise_mask.numpy().astype(np.bool_, copy=False)
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    np.save(cifar.TRAIN_INDICES_PATH, indices_array, allow_pickle=False)
-    np.save(cifar.NOISY_LABELS_PATH, noisy_array, allow_pickle=False)
-    np.save(cifar.NOISE_MASK_PATH, mask_array, allow_pickle=False)
+    save_numpy(cifar.TRAIN_INDICES_PATH, training_indices.numpy())
+    save_numpy(cifar.NOISY_LABELS_PATH, noisy_labels.numpy())
+    save_numpy(cifar.NOISE_MASK_PATH, noise_mask.numpy())
 
     print(f"output_dir={OUTPUT_DIR}")
     print(
@@ -61,13 +56,10 @@ def main() -> None:
     )
     print(
         f"noise_type={NOISE_TYPE} target_noise_rate={NOISE_RATE:.4f} "
-        f"actual_noise_rate={mask_array.mean():.6f} noise_count={int(mask_array.sum())} seed={SEED}"
+        f"actual_noise_rate={float(noise_mask.float().mean()):.6f} "
+        f"noise_count={int(noise_mask.sum())} seed={SEED}"
     )
     if NOISE_TYPE == "idn":
         print(f"idn_flip_rate_std={CONFIG.data.idn_flip_rate_std}")
     for path in cifar.NOISE_ARTIFACT_PATHS:
         print(f"saved={path}")
-
-
-if __name__ == "__main__":
-    main()

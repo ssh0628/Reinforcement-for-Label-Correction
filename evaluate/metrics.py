@@ -2,8 +2,48 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
-from torch import Tensor
+from torch import Tensor, nn
+
+
+Preprocess = Callable[[Tensor, torch.device, Tensor, Tensor], Tensor]
+
+
+def evaluate_classifier(
+    model: nn.Module,
+    images: Tensor,
+    labels: Tensor,
+    device: torch.device,
+    mean: Tensor,
+    std: Tensor,
+    *,
+    batch_size: int,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    preprocess: Preprocess,
+) -> dict[str, float]:
+    if batch_size <= 0 or labels.numel() == 0 or images.size(0) != labels.numel():
+        raise ValueError("Classifier evaluation requires aligned non-empty inputs and a positive batch size.")
+    model.eval()
+    loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+    correct_count = torch.zeros((), dtype=torch.long, device=device)
+    with torch.inference_mode():
+        for start in range(0, labels.numel(), batch_size):
+            end = min(start + batch_size, labels.numel())
+            batch_images = preprocess(images[start:end], device, mean, std)
+            targets = labels[start:end].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                logits = model(batch_images)
+                loss = nn.functional.cross_entropy(logits, targets, reduction="sum")
+            correct_count += logits.argmax(dim=1).eq(targets).sum()
+            loss_sum += loss.to(torch.float64)
+    sample_count = labels.numel()
+    return {
+        "loss": float(loss_sum / sample_count),
+        "accuracy": float(correct_count / sample_count),
+    }
 
 
 def _safe_ratio(numerator: Tensor, denominator: Tensor) -> Tensor:

@@ -48,24 +48,14 @@ class CifarResNet(ResNet):
         return self.forward_head(features)
 
 
-class CifarResNet18(CifarResNet):
-    def __init__(self, num_classes: int) -> None:
-        super().__init__((2, 2, 2, 2), num_classes)
-
-
-class CifarResNet34(CifarResNet):
-    def __init__(self, num_classes: int) -> None:
-        super().__init__((3, 4, 6, 3), num_classes)
-
-
 def build_cifar_resnet(model_name: str, pretrained: bool, num_classes: int) -> CifarResNet:
     if pretrained:
         raise ValueError("The paper-aligned CIFAR ResNet uses no pretraining.")
-    builders = {
-        "cifar_resnet18": CifarResNet18,
-        "cifar_resnet34": CifarResNet34,
+    layer_layouts = {
+        "cifar_resnet18": (2, 2, 2, 2),
+        "cifar_resnet34": (3, 4, 6, 3),
     }
     try:
-        return builders[model_name](num_classes=num_classes)
+        return CifarResNet(layer_layouts[model_name], num_classes)
     except KeyError as error:
         raise ValueError(f"Unsupported model name: {model_name!r}.") from error
