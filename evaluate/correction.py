@@ -184,7 +184,7 @@ def main() -> None:
     device = engine.initialize_cuda_runtime(cifar.SEED, reset_peak_memory=True)
     timings: Timings = {}
 
-    raw_images, clean_labels = measure("data_load", device, timings, cifar.load_selected_cifar10_train)
+    raw_images, clean_labels = measure("data_load", device, timings, cifar.load_cifar10_train)
     noisy_labels, noise_mask = measure(
         "noise_load", device, timings, lambda: engine.load_noisy_label_artifacts(clean_labels)
     )

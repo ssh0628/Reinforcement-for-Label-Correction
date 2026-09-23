@@ -13,7 +13,6 @@ from setting.config import CONFIG
 ROOT = Path(__file__).resolve().parent
 STAGES = (
     "cifar_warmup.py",
-    "cifar_knn_quality.py",
     "cifar_rl.py",
     "cifar_correction.py",
     "cifar_finetuning.py",

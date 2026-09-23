@@ -13,6 +13,7 @@ from rl.policy import CorrectionResult, LabelCorrectionPolicy
 
 Preprocess = Callable[[Tensor, torch.device, Tensor, Tensor], Tensor]
 Encode = Callable[[nn.Module, Tensor], Tensor]
+ACTOR_LOSS_REDUCTION = "sum_microbatch_means"
 
 
 def select_actor_queries(sample_count: int, update_samples: int, *, seed: int, step: int) -> Tensor:
@@ -68,7 +69,9 @@ def _policy_embedding_gradients(
             label_state[neighbor_indices],
             actions=actions[batch_queries],
         )
-        loss = -detached_q * policy_step.log_probabilities.sum() / query_count
+        # Normalize this microbatch by its actual query count, including a short final batch.
+        # Accumulation therefore sums microbatch means; it is not a global query mean.
+        loss = -detached_q * policy_step.log_probabilities.sum() / batch_queries.numel()
         loss.backward()
         total_loss += float(loss.detach())
 
@@ -110,7 +113,11 @@ def _backpropagate_embedding_gradients(
             images = preprocess(batch, device, mean, std)
             encoded = encode(model, images)
             gradient_indices = batch_indices.to(device=embedding_gradients.device, non_blocking=True)
-            surrogate = (encoded.float() * embedding_gradients[gradient_indices]).sum()
+            cached_gradient = embedding_gradients[gradient_indices].detach()
+            # encoded = f_theta(images); model parameters remain in this autograd graph.
+            # With cached g = dL/dz fixed, d(sum(f_theta * g))/dtheta = J_f_theta.T @ g.
+            # g already includes Q and microbatch normalization; do not divide again here.
+            surrogate = (encoded.float() * cached_gradient).sum()
         scaler.scale(surrogate).backward()
     scaler.step(optimizer)
     scaler.update()

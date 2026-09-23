@@ -5,7 +5,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 
-PROJECT_ROOT = Path("/root/project/rlnlc")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CIFAR10_TRAIN_SAMPLES = 50_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,8 +15,6 @@ class DataConfig:
     download: bool = True
 
     classes: tuple[int, ...] = tuple(range(10))
-    train_samples: int = 50_000  # 10_000, 20_000, 50_000; 10의 배수
-    subset_seed: int = 0  # train_samples < 50_000일 때 균등 표본 추출 시드
     noise_type: str = "idn"  # "symmetric" 또는 "idn"
     noise_rate: float = 0.50  # 목표 노이즈 비율: 0.2, 0.4, 0.5
     idn_flip_rate_std: float = 0.10  # Xia et al. IDN truncated-normal 표준편차
@@ -40,7 +39,7 @@ class TrainingAugmentationConfig:
 
 @dataclass(frozen=True, slots=True)
 class WarmupConfig:
-    model_id: str = "exp15_warmup"
+    model_id: str = "cifar10_warmup"
     checkpoint_selection: str = "best"  # "best" 또는 논문 해석용 "last"
     epochs: int = 50  # warm-up 학습 길이
     batch_size: int = 128  # 학습 hyperparameter; 변경 시 LR과 함께 재검토, 1_024, 128
@@ -70,8 +69,8 @@ class RLConfig:
     trajectory_length: int = 10  # 한 epoch의 label-correction step 수
     initial_state_randomization_rate: float = 0.10  # 매 trajectory 초기 라벨 교란 비율
     feature_batch_size: int = 16_384  # H100 93GB inference feature batch
-    actor_samples_per_optimizer_step: int = 128  # 매 RL step에서 Actor mean gradient를 추정할 query 수
-    actor_microbatch_size: int = 4_096  # 선택 query와 이웃의 역전파를 나누는 메모리 배치
+    actor_samples_per_optimizer_step: int = 128  # 매 RL step에서 Actor gradient 계산에 사용할 query 수
+    actor_microbatch_size: int = 4_096  # query 평균 및 이웃 역전파 배치; 여러 query 배치의 mean gradient를 합산
     use_remaining_horizon: bool = False
     use_terminal_critic_update: bool = True
 
@@ -106,17 +105,7 @@ class CorrectionConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class KNNQualityConfig:
-    visualization_samples: int = 10_000  # 시각화 표본 수; 클래스 수로 나누어져야 함
-    pca_dimensions: int = 50  # UMAP 전 PCA 차원
-    umap_neighbors: int = 15  # 지역 구조 범위: 5, 15, 30
-    umap_min_dist: float = 0.1  # 군집 압축도: 0.0~1.0
-    seed: int = 0  # 시각화 재현 시드
-
-
-@dataclass(frozen=True, slots=True)
 class FineTuneConfig:
-    corrected_label_source: str = "rl"
     initialization: str = "last_actor"
     evaluation_checkpoint: str = "accuracy"
     epochs: int = 100  # corrected label fine-tuning 길이
@@ -132,15 +121,14 @@ class FineTuneConfig:
 @dataclass(frozen=True, slots=True)
 class OutputConfig:
     root: Path = PROJECT_ROOT / "cifar_output"
-    experiment_name: str = "exp18"
-    warmup_experiment_name: str = "exp15"
+    experiment_name: str = "baseline"
+    warmup_experiment_name: str = "baseline"
     warmup_checkpoint_name: str = "warmup.pt"
     actor_best_checkpoint_name: str = "actor_best.pt"
     actor_last_checkpoint_name: str = "actor_last.pt"
     critic_best_checkpoint_name: str = "critic_best.pt"
     critic_last_checkpoint_name: str = "critic_last.pt"
     corrected_labels_name: str = "train_corrected_soft_labels.npy"
-    knn_corrected_labels_name: str = "train_knn_corrected_soft_labels.npy"
     finetune_best_accuracy_checkpoint_name: str = "finetune_best_accuracy.pt"
     finetune_best_loss_checkpoint_name: str = "finetune_best_loss.pt"
     finetune_last_checkpoint_name: str = "finetune_last.pt"
@@ -157,10 +145,8 @@ class RuntimeConfig:
     overwrite_warmup: bool = False
     overwrite_rl: bool = False
     overwrite_correction: bool = False
-    overwrite_knn_correction: bool = False
     overwrite_finetune: bool = False
     overwrite_evaluate: bool = False
-    overwrite_knn_quality: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,7 +158,6 @@ class CIFARConfig:
     knn: KNNConfig = field(default_factory=KNNConfig)
     rl: RLConfig = field(default_factory=RLConfig)
     correction: CorrectionConfig = field(default_factory=CorrectionConfig)
-    knn_quality: KNNQualityConfig = field(default_factory=KNNQualityConfig)
     finetune: FineTuneConfig = field(default_factory=FineTuneConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -195,10 +180,7 @@ class CIFARConfig:
         if self.data.noise_type == "idn":
             std_tag = f"{self.data.idn_flip_rate_std:g}".replace(".", "p")
             noise_name = f"noise_idn{self.noise_tag}_std{std_tag}"
-        name = (
-            f"cifar10_train{self.data.train_samples}_subsetseed{self.data.subset_seed}_"
-            f"{noise_name}_seed{self.data.seed}"
-        )
+        name = f"cifar10_{noise_name}_seed{self.data.seed}"
         return self.data_root / name
 
     @property
@@ -222,16 +204,12 @@ class CIFARConfig:
         return self.warmup_model_dir / self.output.warmup_checkpoint_name
 
     @property
-    def knn_quality_visualization_samples(self) -> int:
-        return min(self.knn_quality.visualization_samples, self.data.train_samples)
-
-    @property
     def actor_update_samples(self) -> int:
         return self.rl.actor_samples_per_optimizer_step
 
     @property
     def actor_update_mode(self) -> str:
-        return "full" if self.actor_update_samples == self.data.train_samples else "sampled"
+        return "full" if self.actor_update_samples == CIFAR10_TRAIN_SAMPLES else "sampled"
 
     @property
     def log_output_dir(self) -> Path:
@@ -296,29 +274,8 @@ class CIFARConfig:
         return self.rl_model_dir / self.output.corrected_labels_name
 
     @property
-    def knn_output_dir(self) -> Path:
-        return self.experiment_output_dir / "knn"
-
-    @property
-    def knn_correction_output_dir(self) -> Path:
-        return self.knn_output_dir / "logs" / "correction"
-
-    @property
-    def knn_corrected_labels_path(self) -> Path:
-        return self.knn_output_dir / "model" / self.output.knn_corrected_labels_name
-
-    @property
     def finetune_corrected_labels_path(self) -> Path:
-        return {
-            "rl": self.corrected_labels_path,
-            "knn": self.knn_corrected_labels_path,
-        }[self.finetune.corrected_label_source]
-
-    @property
-    def finetune_source_output_dir(self) -> Path:
-        if self.finetune.corrected_label_source == "rl":
-            return self.experiment_output_dir
-        return self.knn_output_dir
+        return self.corrected_labels_path
 
     @property
     def finetune_initial_checkpoint_path(self) -> Path:
@@ -330,15 +287,15 @@ class CIFARConfig:
 
     @property
     def finetune_output_dir(self) -> Path:
-        return self.finetune_source_output_dir / "logs" / "finetune"
+        return self.log_output_dir / "finetune"
 
     @property
     def finetune_model_dir(self) -> Path:
-        return self.finetune_source_output_dir / "model_finetune"
+        return self.experiment_output_dir / "model_finetune"
 
     @property
     def evaluate_output_dir(self) -> Path:
-        return self.finetune_source_output_dir / "logs" / "evaluate"
+        return self.log_output_dir / "evaluate"
 
     @property
     def finetune_best_accuracy_checkpoint_path(self) -> Path:
@@ -376,28 +333,24 @@ class CIFARConfig:
             raise ValueError("warmup.checkpoint_selection must be 'best' or 'last'.")
         if self.data.classes != tuple(range(10)):
             raise ValueError("CIFAR-10 classes must be 0 through 9.")
-        if not 0 < self.data.train_samples <= 50_000 or self.data.train_samples % 10:
-            raise ValueError("train_samples must be in [1, 50000] and divisible by 10.")
         if not 0 <= self.data.noise_rate < 1:
             raise ValueError("noise_rate must be in [0, 1).")
         if self.data.noise_type not in {"symmetric", "idn"}:
             raise ValueError("noise_type must be 'symmetric' or 'idn'.")
         if self.data.idn_flip_rate_std <= 0:
             raise ValueError("idn_flip_rate_std must be positive.")
-        if not 0 < self.rl.actor_samples_per_optimizer_step <= self.data.train_samples:
-            raise ValueError("actor_samples_per_optimizer_step must be in [1, train_samples].")
-        if not 0 < self.rl.actor_microbatch_size <= self.data.train_samples:
-            raise ValueError("actor_microbatch_size must be in [1, train_samples].")
+        if not 0 < self.rl.actor_samples_per_optimizer_step <= CIFAR10_TRAIN_SAMPLES:
+            raise ValueError("actor_samples_per_optimizer_step must be in [1, 50000].")
+        if not 0 < self.rl.actor_microbatch_size <= CIFAR10_TRAIN_SAMPLES:
+            raise ValueError("actor_microbatch_size must be in [1, 50000].")
         if self.rl.checkpoint_interval <= 0:
             raise ValueError("rl.checkpoint_interval must be positive.")
         if self.finetune.initialization not in {"warmup", "best_actor", "last_actor"}:
             raise ValueError("Invalid fine-tuning initialization.")
-        if self.finetune.corrected_label_source not in {"rl", "knn"}:
-            raise ValueError("corrected_label_source must be 'rl' or 'knn'.")
         if self.finetune.evaluation_checkpoint not in {"accuracy", "loss", "last"}:
             raise ValueError("evaluation_checkpoint must be accuracy, loss, or last.")
-        if self.knn.k >= self.data.train_samples:
-            raise ValueError("k must be smaller than train_samples.")
+        if self.knn.k >= CIFAR10_TRAIN_SAMPLES:
+            raise ValueError("k must be smaller than the CIFAR-10 training set.")
         if not 0 < self.rl.initial_state_randomization_rate < 1:
             raise ValueError("initial_state_randomization_rate must be in (0, 1).")
         if not 0 <= self.rl.discount_factor <= 1:
@@ -419,9 +372,6 @@ class CIFARConfig:
             self.rl.trajectory_length,
             self.rl.feature_batch_size,
             self.correction.trajectory_length,
-            self.knn_quality.visualization_samples,
-            self.knn_quality.pca_dimensions,
-            self.knn_quality.umap_neighbors,
             self.finetune.epochs,
             self.finetune.batch_size,
             self.runtime.evaluate_batch_size,
@@ -438,12 +388,6 @@ class CIFARConfig:
         )
         if any(value <= 0 for value in positive):
             raise ValueError("Epochs, batch sizes, chunk sizes, and learning rates must be positive.")
-        if self.knn_quality_visualization_samples % len(self.data.classes):
-            raise ValueError("KNN visualization samples must be divisible by the number of classes.")
-        if self.knn_quality.umap_neighbors >= self.knn_quality_visualization_samples:
-            raise ValueError("UMAP neighbors must be smaller than visualization samples.")
-        if not 0 <= self.knn_quality.umap_min_dist <= 1:
-            raise ValueError("UMAP min_dist must be in [0, 1].")
 
 
 def build_config() -> CIFARConfig:

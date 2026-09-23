@@ -40,7 +40,7 @@ from log.rl import (
     TIMING_CSV_FILENAME,
     TRAIN_CSV_FILENAME,
 )
-from rl.actor import correct_from_embeddings, select_actor_queries, update_actor
+from rl.actor import ACTOR_LOSS_REDUCTION, correct_from_embeddings, select_actor_queries, update_actor
 from rl.critic import StateActionCritic, build_critic_optimizer, encode_state_action, update_critic
 from rl.knn import build_exact_policy_knn
 from rl.policy import LabelCorrectionPolicy
@@ -56,12 +56,11 @@ from setting.data import (
     NUM_CLASSES,
     PRETRAINED,
     SEED,
-    SUBSET_SEED,
     WARMUP_CHECKPOINT_PATH,
     build_model,
     inject_configured_noise,
     load_cifar10_evaluation_split,
-    load_selected_cifar10_train,
+    load_cifar10_train,
     move_model_to_device,
     pin_for_cuda,
     preprocess_cifar10 as preprocess,
@@ -242,8 +241,7 @@ def encode(model: nn.Module, images: Tensor) -> Tensor:
 def training_data_metadata() -> dict[str, object]:
     metadata: dict[str, object] = {
         "sample_count": EXPECTED_SAMPLES,
-        "subset_seed": SUBSET_SEED,
-        "selection": "deterministic_stratified_equal_per_class",
+        "selection": "full_cifar10_train",
         "noise_type": NOISE_TYPE,
     }
     if NOISE_TYPE == "idn":
@@ -255,12 +253,11 @@ def validate_training_data_checkpoint(checkpoint: dict[str, object]) -> None:
     metadata = checkpoint.get("training_data")
     if not isinstance(metadata, dict):
         raise ValueError(
-            "Checkpoint is missing the balanced training-data contract. Regenerate it with the current code."
+            "Checkpoint is missing the CIFAR-10 training-data contract. Regenerate it with the current code."
         )
     expected = training_data_metadata()
     actual = {
         "sample_count": int(metadata.get("sample_count", -1)),
-        "subset_seed": int(metadata.get("subset_seed", -1)),
         "selection": str(metadata.get("selection", "")),
         "noise_type": str(metadata.get("noise_type", "symmetric")),
     }
@@ -406,6 +403,7 @@ def _save_rl_checkpoints(
         "actor_update_mode": ACTOR_UPDATE_MODE,
         "actor_update_samples": ACTOR_UPDATE_SAMPLES,
         "actor_microbatch_size": ACTOR_MICROBATCH_SIZE,
+        "actor_loss_reduction": ACTOR_LOSS_REDUCTION,
         "actor_microbatches_per_rl_step": math.ceil(
             ACTOR_UPDATE_SAMPLES / ACTOR_MICROBATCH_SIZE
         ),
@@ -598,6 +596,7 @@ def print_configuration(device: torch.device, sample_count: int, actual_noise_ra
         f"rl={RL_EPOCHS}x{TRAJECTORY_LENGTH} "
         f"actor_update={ACTOR_UPDATE_MODE}:{ACTOR_UPDATE_SAMPLES} "
         f"microbatch={ACTOR_MICROBATCH_SIZE} "
+        f"actor_loss_reduction={ACTOR_LOSS_REDUCTION} "
         f"query_microbatches={math.ceil(ACTOR_UPDATE_SAMPLES / ACTOR_MICROBATCH_SIZE)} "
         f"optimizer_steps_per_rl_step=1 actor_lr={ACTOR_LR} "
         f"lr_decay={LR_DECAY_EPOCH}:{LR_DECAY_FACTOR} "
@@ -617,7 +616,7 @@ def print_configuration(device: torch.device, sample_count: int, actual_noise_ra
 
 def load_rl_data(device: torch.device, timings: Timings) -> RLData:
     raw_images, clean_labels_cpu = measure(
-        "data_load", device, timings, load_selected_cifar10_train
+        "data_load", device, timings, load_cifar10_train
     )
     val_images, val_clean_labels = measure(
         "val_load", device, timings, lambda: load_cifar10_evaluation_split("val")
@@ -1119,6 +1118,7 @@ def main() -> None:
                 "actor_update_mode": ACTOR_UPDATE_MODE,
                 "actor_update_samples": ACTOR_UPDATE_SAMPLES,
                 "actor_microbatch_size": ACTOR_MICROBATCH_SIZE,
+                "actor_loss_reduction": ACTOR_LOSS_REDUCTION,
                 "actor_microbatches_per_rl_step": math.ceil(
                     ACTOR_UPDATE_SAMPLES / ACTOR_MICROBATCH_SIZE
                 ),

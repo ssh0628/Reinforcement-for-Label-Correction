@@ -26,7 +26,6 @@ from setting import data as cifar
 CONFIG = cifar.CONFIG
 INITIALIZATION = CONFIG.finetune.initialization
 INITIAL_CHECKPOINT_PATH = CONFIG.finetune_initial_checkpoint_path
-LABEL_SOURCE = CONFIG.finetune.corrected_label_source
 CORRECTED_LABELS_PATH = CONFIG.finetune_corrected_labels_path
 OUTPUT_DIR = CONFIG.finetune_output_dir
 
@@ -122,7 +121,7 @@ def _save_checkpoint(
         "model_name": cifar.MODEL_NAME,
         "num_classes": cifar.NUM_CLASSES,
         "initialization": INITIALIZATION,
-        "corrected_label_source": LABEL_SOURCE,
+        "corrected_label_source": "rl",
         "source_checkpoint": str(INITIAL_CHECKPOINT_PATH),
         "corrected_labels": str(CORRECTED_LABELS_PATH),
         "optimizer": CONFIG.finetune.optimizer,
@@ -142,7 +141,7 @@ def main() -> None:
 
     device = engine.initialize_cuda_runtime(SEED, reset_peak_memory=True)
 
-    train_images, clean_train_labels = cifar.load_selected_cifar10_train()
+    train_images, clean_train_labels = cifar.load_cifar10_train()
     validation_images, validation_labels = cifar.load_cifar10_evaluation_split("val")
     corrected_labels = _load_corrected_soft_labels(clean_train_labels)
     training_sample_count = clean_train_labels.numel()
@@ -156,7 +155,7 @@ def main() -> None:
 
     print(
         f"device={torch.cuda.get_device_name(device)} initialization={INITIALIZATION} "
-        f"label_source={LABEL_SOURCE}"
+        "label_source=rl"
     )
     print(
         f"epochs={FINETUNE_EPOCHS} batch={TRAIN_BATCH_SIZE} lr={LEARNING_RATE} decay_epoch={LR_DECAY_EPOCH}"
@@ -280,7 +279,7 @@ def main() -> None:
 
 def run_with_file_logging() -> None:
     cifar.require_files(
-        (cifar.TRAIN_INDICES_PATH, INITIAL_CHECKPOINT_PATH, CORRECTED_LABELS_PATH), stage="Fine-tuning"
+        (INITIAL_CHECKPOINT_PATH, CORRECTED_LABELS_PATH), stage="Fine-tuning"
     )
     cifar.require_available_outputs(
         [

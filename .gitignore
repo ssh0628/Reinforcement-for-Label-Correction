@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+wheels/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local artifacts
+.DS_Store
+cifar10/
+cifar_output/
+experiment_folder/

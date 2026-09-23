@@ -14,22 +14,20 @@ from scipy import stats
 from torch import Tensor, nn
 from torchvision.datasets import CIFAR10
 
-from setting.config import CONFIG
+from setting.config import CIFAR10_TRAIN_SAMPLES, CONFIG
 from setting.model import build_cifar_resnet
 
 
 CIFAR10_ROOT = CONFIG.data_root
 DOWNLOAD_CIFAR10 = CONFIG.data.download
-TRAIN_INDICES_PATH = CONFIG.noise_output_dir / "train_indices.npy"
 NOISY_LABELS_PATH = CONFIG.noise_output_dir / "train_noisy_labels.npy"
 NOISE_MASK_PATH = CONFIG.noise_output_dir / "train_noise_mask.npy"
-NOISE_ARTIFACT_PATHS = (TRAIN_INDICES_PATH, NOISY_LABELS_PATH, NOISE_MASK_PATH)
+NOISE_ARTIFACT_PATHS = (NOISY_LABELS_PATH, NOISE_MASK_PATH)
 WARMUP_CHECKPOINT_PATH = CONFIG.warmup_checkpoint_path
 
 CLASSES = CONFIG.data.classes
 NUM_CLASSES = len(CLASSES)
-EXPECTED_SAMPLES = CONFIG.data.train_samples
-SUBSET_SEED = CONFIG.data.subset_seed
+EXPECTED_SAMPLES = CIFAR10_TRAIN_SAMPLES
 SEED = CONFIG.data.seed
 
 MODEL_NAME = CONFIG.model.name
@@ -58,45 +56,14 @@ def require_available_outputs(paths: list[Path] | tuple[Path, ...], *, overwrite
         )
 
 
-def build_balanced_training_indices(labels: Tensor) -> Tensor:
-    samples_per_class = EXPECTED_SAMPLES // NUM_CLASSES
-    if EXPECTED_SAMPLES == 50_000:
-        return torch.arange(50_000, dtype=torch.long)
-
-    generator = torch.Generator().manual_seed(SUBSET_SEED)
-    selected = []
-    for class_id in CLASSES:
-        class_indices = torch.where(labels == class_id)[0]
-        order = torch.randperm(class_indices.numel(), generator=generator)
-        selected.append(class_indices[order[:samples_per_class]])
-    return torch.cat(selected).sort().values.to(torch.long).contiguous()
-
-
-def load_training_indices(source_labels: Tensor) -> Tensor:
-    if not TRAIN_INDICES_PATH.is_file():
-        raise FileNotFoundError(
-            f"Training-index artifact not found: {TRAIN_INDICES_PATH}. Run cifar_noise.py first."
-        )
-    indices = torch.from_numpy(np.load(TRAIN_INDICES_PATH, allow_pickle=False)).to(torch.long).contiguous()
-    if indices.shape != (EXPECTED_SAMPLES,):
-        raise ValueError(
-            f"Training indices must have shape ({EXPECTED_SAMPLES},), got {tuple(indices.shape)}."
-        )
-    if not torch.equal(indices, build_balanced_training_indices(source_labels)):
-        raise ValueError(
-            "Training-index artifact does not match train_samples/subset_seed. "
-            "Regenerate the noise artifacts with cifar_noise.py."
-        )
-    return indices
-
-
-def load_selected_cifar10_train() -> tuple[Tensor, Tensor]:
+def load_cifar10_train() -> tuple[Tensor, Tensor]:
     dataset = CIFAR10(root=CIFAR10_ROOT, train=True, download=DOWNLOAD_CIFAR10)
-    source_labels = torch.tensor(dataset.targets, dtype=torch.long)
-    indices = load_training_indices(source_labels)
-    source_images = torch.from_numpy(dataset.data).permute(0, 3, 1, 2)
-    images = pin_for_cuda(source_images[indices].contiguous())
-    labels = pin_for_cuda(source_labels[indices].contiguous())
+    images = torch.from_numpy(dataset.data).permute(0, 3, 1, 2).contiguous()
+    labels = torch.tensor(dataset.targets, dtype=torch.long)
+    if images.size(0) != EXPECTED_SAMPLES or labels.numel() != EXPECTED_SAMPLES:
+        raise ValueError(f"Expected {EXPECTED_SAMPLES} CIFAR-10 training samples.")
+    images = pin_for_cuda(images)
+    labels = pin_for_cuda(labels)
     return images, labels
 
 
