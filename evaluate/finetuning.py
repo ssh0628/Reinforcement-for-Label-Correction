@@ -1,6 +1,6 @@
-"""Fine-tune a CIFAR-10 model on RL or weighted-KNN soft labels.
+"""Fine-tune a CIFAR-10 model on RL-corrected soft labels.
 
-The label source and initial model are selected in ``setting.config``.
+The initial model is selected in ``setting.config``.
 Separate best checkpoints are saved for clean-validation accuracy and loss,
 along with the final-epoch model.
 """
